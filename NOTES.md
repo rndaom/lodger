@@ -190,6 +190,24 @@ this PC loads models onto the card and lodger uses it freely.
 - Two-drive striping for any model too big for RAM (from ds41-local).
 - Auto-setup: a one-time benchmark that writes the PC's profile.
 
+## Open-source release (user's decisions, 2026-10-28)
+For anybody's everyday Linux PC. **Linux first** (the user's daily OS and dev machine); other OSes, cards and
+setups come from contributors by PR, so the job here is a clean, vendor-neutral base. Lives on the user's own
+GitHub: https://github.com/rndaom/lodger (public since 2026-10-28). **MIT.** Research: `docs/research-2026-10-28.md`.
+
+Roadmap, in order:
+1. **Open the base** - done 2026-10-28 (next section). NVIDIA, Intel and APUs written but untested on real
+   hardware; Intel Arc free memory not read yet; the stock Vulkan build not yet run on the card.
+2. **Lock the front door** - done 2026-10-28 (see Server): Host allowlist, Origin check, optional API key,
+   the engine with its own key.
+3. **Repo for contributors** - done 2026-10-28: README, LICENSE, CONTRIBUTING, SECURITY, conduct, issue forms
+   (hardware report from `lodger doctor`), CI (ruff + unittest on 3.11-3.13), pyproject. Left: claim `lodger`
+   on PyPI (needs the user's login), then `uv tool install lodger` works.
+4. **Model picker**: a small built-in list of Apache-2.0 models per memory size, checked download, license shown.
+   The Sybil registry could be an optional extra source later.
+5. **Ollama-compatible shim** on 11434 (Raycast, Home Assistant).
+6. AUR package; test on other people's machines (8 GB card, NVIDIA, APU laptop).
+
 ## Any Linux PC (vendor-neutral base, 2026-10-28; roadmap item 1 of the open-source release)
 Branch `rndaom/vendor-neutral-core-ebe78d`. The AMD-only, this-PC-only core made general; this PC's plans
 are unchanged (all 42 model x memory cases compared before/after).
