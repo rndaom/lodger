@@ -1,38 +1,12 @@
 #!/usr/bin/env python3
-"""lodger: local AI that lives on your PC as a guest. Your apps come first.
-
-  lodger plan MODEL ...     what would go where, and why
-  lodger run MODEL ...      run it, fenced in and watched
-  lodger measure ...        log what each app uses (read-only)
-  lodger stress MODEL ...   check nothing crashes while sharing the PC
-  lodger serve MODEL ...    keep a model ready for apps on this PC (steps aside, grows back)
-  lodger ask "question"     ask the model lodger is serving
-  lodger pi [pi options]    talk to it in pi (your pi setup, untouched)
-  lodger unpause            start again any service lodger paused (after a crash)
-  lodger stress-serve MODEL check serve steps aside and grows back without crashing anything
-
-`lodger <command> --help` for the options."""
+"""Run lodger straight from a checkout (no install needed): `bin/lodger --help`.
+The same command is installed as `lodger` by pip, pipx and uv; both call lodger/cli.py."""
 import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 
+from lodger.cli import main  # noqa: E402
+
 if __name__ == "__main__":
-    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
-    if cmd in ("plan", "run"):
-        from lodger import launch
-        sys.exit(launch.main(sys.argv[1:]))
-    if cmd == "measure":
-        from lodger import measure
-        sys.exit(measure.main(sys.argv[2:]))
-    if cmd == "stress":
-        from lodger import stress
-        sys.exit(stress.main(sys.argv[2:]))
-    if cmd == "stress-serve":
-        from lodger import servetest
-        sys.exit(servetest.main(sys.argv[2:]))
-    if cmd in ("serve", "ask", "pi", "unpause"):
-        from lodger import serve
-        sys.exit(getattr(serve, {"unpause": "unpause_all"}.get(cmd, cmd))(sys.argv[2:]))
-    print(__doc__)
-    sys.exit(0 if cmd in ("", "-h", "--help", "help") else 2)
+    sys.exit(main())

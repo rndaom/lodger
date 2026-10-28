@@ -1,0 +1,72 @@
+name: Hardware report
+description: Tell us how lodger did on your graphics card and PC, whether it worked or not.
+title: "Hardware report: "
+labels: ["hardware"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        lodger has only been tested on one AMD RX 7800 XT. Reports from other machines are the most useful thing
+        you can give the project, and "it didn't work" is as welcome as "it worked".
+        Please follow the [safety rules](https://github.com/rndaom/lodger/blob/main/CONTRIBUTING.md#safety-rules-for-contributors)
+        when you test.
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`lodger doctor` output"
+      description: |
+        Paste the full output. (`lodger doctor` is coming; until it exists, write "not available yet" and fill in
+        the GPU, driver and kernel fields below by hand.) Remove anything private.
+      render: text
+  - type: input
+    id: gpu
+    attributes:
+      label: Graphics card(s)
+      description: Model and memory, and whether you have two (a laptop with built-in and separate graphics, say).
+      placeholder: "NVIDIA RTX 3070 Laptop, 8 GB, plus AMD integrated"
+    validations:
+      required: true
+  - type: input
+    id: driver
+    attributes:
+      label: Driver and version
+      placeholder: "nvidia 580.82 (proprietary), or Mesa 25.2 amdgpu"
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Distro, kernel and desktop
+      placeholder: "CachyOS, kernel 6.17, KDE Plasma on Wayland"
+    validations:
+      required: true
+  - type: input
+    id: ram
+    attributes:
+      label: RAM
+      placeholder: "16 GB"
+    validations:
+      required: true
+  - type: dropdown
+    id: result
+    attributes:
+      label: How did it go?
+      options:
+        - Worked on the card, and stepped aside and grew back
+        - Worked on the card, but I didn't test sharing
+        - Worked on the processor only
+        - lodger refused to start (and said why)
+        - lodger started but something went wrong
+        - Something crashed or froze
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: |
+        The model, the commands you ran, what other apps were open, and anything surprising. If it didn't work,
+        paste the error and what lodger said. If something crashed, say what, and what the kernel log
+        (`journalctl -k -b`) showed around that time.
+    validations:
+      required: true

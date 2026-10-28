@@ -1,3 +1,7 @@
 runs/
 build/
 __pycache__/
+dist/
+*.egg-info/
+.venv/
+.ruff_cache/

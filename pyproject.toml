@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lodger"
+version = "0.1.0"
+description = "Local AI that lives on your PC as a guest: it steps aside when your apps need the graphics card, then grows back."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Random" }]
+requires-python = ">=3.11"
+dependencies = ["gguf"]
+keywords = ["llm", "llama.cpp", "gpu", "vram", "local-ai", "linux"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/rndaom/lodger"
+Issues = "https://github.com/rndaom/lodger/issues"
+Changelog = "https://github.com/rndaom/lodger/blob/main/CHANGELOG.md"
+
+[project.scripts]
+lodger = "lodger.cli:main"
+
+[tool.setuptools]
+packages = ["lodger"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 160
+extend-exclude = ["build", "dist", "runs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+# Short names like `l` for a line are the style here; the other two are harmless leftovers.
+ignore = ["E741", "F541", "F841"]

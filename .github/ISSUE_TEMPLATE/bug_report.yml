@@ -1,0 +1,49 @@
+name: Bug report
+description: Something in lodger doesn't work as it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. If lodger **took the graphics card or memory from one of your apps, or crashed
+        something**, say so clearly in "What happened": that is the most serious kind of bug here.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The exact command(s) you ran. Include `--allow-gpu` or `--cpu-only` if you used them.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output and logs
+      description: |
+        What lodger printed, and `curl http://127.0.0.1:8181/lodger/status` if the server was running.
+        Remove anything private.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: lodger version
+      description: Output of `pip show lodger` (or the commit, if you run from a checkout).
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Graphics card, driver, distro
+      description: For example "RX 7800 XT, Mesa 25.2, Arch". For hardware problems, please use the hardware report form instead.
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: File name and size of the model you were using.
