@@ -118,12 +118,23 @@ nothing is lost.
   New requests for the current model queue behind a waiting switch, so nobody waits forever. Each model
   gets its own context (decided at start, as if lodger's own loaded model weren't on the card) and plan.
   A model that can't be read or fails to start twice is marked and left out.
-- **Front door**: `lodger serve [--allow-gpu]` listens on `127.0.0.1:8181` (only this PC, no key).
+- **Front door**: `lodger serve [--allow-gpu]` listens on `127.0.0.1:8181` (only this PC; no key unless you set one).
   Apps use the usual OpenAI-style API: `/v1/chat/completions` (streaming or not), `/v1/models`, `/health`.
   Lodger's own: `GET /lodger/status` (where the model is, why, recent events), `POST /lodger/move` (move
   off the card now; it grows back later as usual). `lodger ask "question"` is a small client for it.
+- **Who may use it** (2026-10-28, against Ollama's CVE-2024-28224): `127.0.0.1` alone doesn't stop web
+  pages in your browser. Every request is checked first (`serve.check()`, tests in `tests/`):
+  `Host` must be `127.0.0.1`, `localhost` or `[::1]` (any port), else 403 (DNS rebinding); an `Origin` must be
+  a page on this PC (`http(s)://` one of those) or a desktop app's own scheme (`app:`, `file:`, `tauri:`,
+  `vscode-webview:`, `vscode-file:`, as Ollama), else 403 (`null` too). Preflight (`OPTIONS`) is answered only
+  for those, and only they get `Access-Control-Allow-Origin`. No `Origin` (curl, pi, apps) passes. Optional key:
+  `--api-key-file PATH` or `LODGER_API_KEY` makes every path but `/health` need `Authorization: Bearer KEY`
+  (401). `lodger ask --api-key-file`/`LODGER_API_KEY` send it; the pi provider gets `!cat PATH` (pi reads the
+  file) or the key itself, and `models.json` is written 0600.
 - **Engine**: our build's `llama-server` on a random private port (127.0.0.1), one at a time, in the same
-  fenced unit with the same plan and watchdog as `lodger run`.
+  fenced unit with the same plan and watchdog as `lodger run`. Each engine gets its own random key through
+  `--api-key-file` in `$XDG_RUNTIME_DIR` (0600, removed once it's up; never on the command line), and lodger
+  sends it on every request, so other programs can't use the engine's port.
 - **Steps aside**: when the watchdog stops the card engine (an app needs the card, memory low, router
   coming), a processor engine starts at once (~5 s). An answer being written continues where it stopped:
   lodger resends the conversation with the partial answer as the last assistant message, and

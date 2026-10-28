@@ -1,11 +1,12 @@
 """lodger serve: keep your local models ready for apps on this PC, and move them out of your way and back.
 
-  lodger serve [MODEL.gguf ...] [--allow-gpu] [--port 8181] [--idle MIN]
-  lodger ask "question" [--model NAME] [--port 8181]
+  lodger serve [MODEL.gguf ...] [--allow-gpu] [--port 8181] [--idle MIN] [--api-key-file PATH]
+  lodger ask "question" [--model NAME] [--port 8181] [--api-key-file PATH]
   lodger pi [pi options]
 
 Apps talk to lodger at http://127.0.0.1:8181/v1/chat/completions (the usual OpenAI-style API); only
-this PC can reach it. It serves every model in ~/.config/lodger/models.toml (or the files given), one at
+this PC can reach it, and web pages in your browser can't use it (only pages served from this PC can).
+With --api-key-file or LODGER_API_KEY, apps must also send the key (Authorization: Bearer KEY). It serves every model in ~/.config/lodger/models.toml (or the files given), one at
 a time: a request naming another model switches to it once nothing is being written. Behind it, lodger
 runs our llama.cpp build's server on a private port, with the same plan, fence and watchdog as `lodger run`.
 pi lists all of them: `lodger serve` writes a "lodger" provider into pi's models.json.
@@ -22,6 +23,9 @@ import http.client
 import json
 import os
 import contextlib
+import hmac
+import secrets
+import shlex
 import signal
 import socket
 import subprocess
@@ -40,6 +44,8 @@ QUIET_SECONDS = 60          # the card must be quiet this long before the model 
 MOVE_WAIT = 600             # how long a request waits for its model (a switch may wait for an answer)
 PAUSE_IDLE_VRAM = 128 * MiB  # a --pause service holding less graphics memory than this counts as idle
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+LOCAL_NAMES = ("127.0.0.1", "localhost", "[::1]")
+APP_SCHEMES = ("app", "file", "tauri", "vscode-webview", "vscode-file")
 
 
 def unit_active(unit):
@@ -97,10 +103,17 @@ class Engine:
         self.port = free_port()
         self.unit = f"lodger-{os.getpid()}-{Engine.count}"
         self.where = "card" if plan["ngl"] else "processor"
+        # its own key, so other programs on this PC can't use its private port; handed over in a file only
+        # we can read (a command line is visible to every user), removed once the engine has read it
+        self.key = secrets.token_urlsafe(32)
+        self.keyfile = os.path.join(RUNTIME_DIR, self.unit + ".key")
+        fd = os.open(self.keyfile, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(self.key + "\n")
         p = plan
         cmd = [os.path.join(planner.BIN, "llama-server"), "-m", p["model"], "-c", str(p["ctx"]),
                "-t", str(p["threads"]), "--fit", "off", "-np", "1", "--host", HOST, "--port", str(self.port),
-               "--no-webui", "-a", entry.name] + entry.args()
+               "--api-key-file", self.keyfile, "--no-webui", "-a", entry.name] + entry.args()
         if p["ngl"]:
             cmd += ["--device", "ROCm0", "-ngl", str(p["ngl"])] + (["-ncmoe", str(p["n_cpu_moe"])] if p["n_cpu_moe"] else [])
             env = {"HIP_VISIBLE_DEVICES": "0"}
@@ -124,12 +137,20 @@ class Engine:
     def alive(self):
         return self.proc.poll() is None
 
+    def auth(self):
+        return {"Authorization": f"Bearer {self.key}"}
+
+    def forget_keyfile(self):
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(self.keyfile)
+
     def wait_ready(self, limit=600):
         while time.time() - self.started < limit and self.alive():
             try:
                 c = http.client.HTTPConnection(HOST, self.port, timeout=2)
-                c.request("GET", "/health")
+                c.request("GET", "/health", headers=self.auth())
                 if c.getresponse().status == 200:
+                    self.forget_keyfile()
                     return True
             except OSError:
                 pass
@@ -149,6 +170,7 @@ class Engine:
         self.finish()
 
     def finish(self):
+        self.forget_keyfile()
         if self.logf.closed:
             return
         self.wd.stop_flag.set()
@@ -241,7 +263,8 @@ class Lodger:
             if e.skip:
                 log(f"not served: {e.name}: {e.skip}")
         if self.a.port == 8181:
-            write_pi_config(self.a.port, [model_info(e) for e in ok], self.default)
+            write_pi_config(self.a.port, [model_info(e) for e in ok], self.default,
+                            pi_key(self.a.api_key, self.a.api_key_file))
 
     def make_plan(self, on_card):
         e = self.cur
@@ -519,22 +542,105 @@ def model_info(e):
             "reasoning": e.reasoning, "meta": {"n_ctx": e.ctx}}
 
 
-def make_handler(lodger):
+def local_host(value):
+    """Is this Host header this PC (127.0.0.1, localhost or [::1], with or without a port)? A web page that
+    points its own name at 127.0.0.1 (DNS rebinding) still sends its own name here."""
+    v = (value or "").strip().lower()
+    if v.startswith("["):
+        name, _, rest = v.partition("]")
+        name += "]"
+        if rest and not rest.startswith(":"):
+            return False
+        port = rest[1:] if rest else None
+    else:
+        name, colon, port = v.partition(":")
+        port = port if colon else None
+    return name in LOCAL_NAMES and (port is None or (port.isascii() and port.isdigit()))
+
+
+def local_origin(value):
+    """Is this Origin header a page served from this PC (http(s)://localhost etc.) or a desktop app's own
+    page (app://, file://, tauri://, vscode-webview://, as Ollama allows; a browser never sends these)?
+    "null" (a file opened in a browser, a sandboxed frame) is not."""
+    scheme, sep, rest = (value or "").strip().partition("://")
+    scheme = scheme.lower()
+    return bool(sep) and (scheme in APP_SCHEMES or scheme in ("http", "https") and local_host(rest))
+
+
+def check(method, path, headers, key=None):
+    """May this request reach lodger? None if so, else (HTTP status, why in plain words). `headers` is any
+    mapping with .get(); `key` is the API key apps must send (None: no key needed)."""
+    host = headers.get("Host")
+    if not local_host(host):
+        return 403, (f"lodger only answers requests addressed to 127.0.0.1, localhost or [::1], not {host!r} "
+                     "(a web page may be trying to reach it through its own name)")
+    origin = headers.get("Origin")
+    if origin is not None and not local_origin(origin):
+        return 403, f"lodger doesn't answer web pages from other sites (this request came from {origin!r})"
+    if method == "OPTIONS":                     # a browser asking first; it never sends the key with that
+        return None
+    if key and path.split("?")[0] != "/health":
+        scheme, _, given = (headers.get("Authorization") or "").strip().partition(" ")
+        if scheme.lower() != "bearer" or not hmac.compare_digest(given.strip().encode(), key.encode()):
+            return 401, ("lodger wants its API key: send the header 'Authorization: Bearer KEY' "
+                         "(the key in lodger's --api-key-file or LODGER_API_KEY)")
+    return None
+
+
+def make_handler(lodger, key=None):
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        cors = None                              # the local page's origin to allow in the answer, if any
 
         def log_message(self, *args):
             pass
 
-        def send_json(self, code, obj):
+        def send_json(self, code, obj, headers=()):
             body = json.dumps(obj).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            for k, v in headers:
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
 
+        def end_headers(self):
+            if self.cors:
+                self.send_header("Access-Control-Allow-Origin", self.cors)
+                self.send_header("Vary", "Origin")
+            super().end_headers()
+
+        def refused(self):
+            """Answer a request that may not reach lodger (see check()); True if it was refused."""
+            origin = self.headers.get("Origin")
+            self.cors = origin if origin and local_origin(origin) else None
+            why = check(self.command, self.path, self.headers, key)
+            if not why:
+                return False
+            code, msg = why
+            extra = [("Connection", "close")]   # its body (if any) is left unread
+            if code == 401:
+                extra.append(("WWW-Authenticate", 'Bearer realm="lodger"'))
+            self.send_json(code, {"error": {"message": msg, "type": "forbidden" if code == 403 else "unauthorized"}},
+                           extra)
+            return True
+
+        def do_OPTIONS(self):
+            if self.refused():
+                return
+            self.send_response(204)
+            self.send_header("Allow", "GET, POST, OPTIONS")
+            if self.cors:
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+                self.send_header("Access-Control-Max-Age", "600")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def do_GET(self):
+            if self.refused():
+                return
             if self.path == "/health":
                 if lodger.asleep:                     # a request wakes it, so apps may go ahead
                     return self.send_json(200, {"status": "ok", "asleep": True})
@@ -546,6 +652,8 @@ def make_handler(lodger):
             self.send_json(404, {"error": "not found"})
 
         def do_POST(self):
+            if self.refused():
+                return
             n = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(n) if n else b"{}"
             if self.path == "/lodger/move":
@@ -577,7 +685,7 @@ def make_handler(lodger):
 
         def upstream(self, e, body):
             c = http.client.HTTPConnection(HOST, e.port, timeout=600)
-            c.request("POST", "/v1/chat/completions", json.dumps(body), {"Content-Type": "application/json"})
+            c.request("POST", "/v1/chat/completions", json.dumps(body), {"Content-Type": "application/json", **e.auth()})
             return c, c.getresponse()
 
         def unavailable(self, entry):
@@ -706,19 +814,23 @@ def serve(argv):
                     help="a systemd user service running another AI server (e.g. llama-router): while it is idle, "
                          "lodger stops it before using the graphics card and starts it again when it leaves the "
                          "card; while it has a model loaded, lodger stays off the card. Repeatable.")
+    ap.add_argument("--api-key-file", metavar="PATH",
+                    help="apps must send the key in this file (Authorization: Bearer KEY); LODGER_API_KEY does the "
+                         "same. Default: no key (web pages still can't use lodger; other programs on this PC can)")
     a = ap.parse_args(argv)
+    a.api_key = read_key(a.api_key_file)
     models, default = catalog.load(a.files or None)
     if not models:
         sys.exit(f"no models found: add folders or files to {catalog.CONFIG}")
     default = a.default or (default if default in models else None) or next(iter(models))
     lodger = Lodger(a, models, default)
     unpause_all()                                # left over from a crash
-    httpd = ThreadingHTTPServer((HOST, a.port), make_handler(lodger))
+    httpd = ThreadingHTTPServer((HOST, a.port), make_handler(lodger, a.api_key))
     httpd.daemon_threads = True
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
     signal.signal(signal.SIGINT, signal.default_int_handler)   # also when started in the background of a script
-    log(f"lodger serving {len(models)} models at http://{HOST}:{a.port}/v1 (only this PC); default {default}; "
-        f"logs in {lodger.out}")
+    log(f"lodger serving {len(models)} models at http://{HOST}:{a.port}/v1 (only this PC"
+        + (", API key required" if a.api_key else "") + f"); default {default}; logs in {lodger.out}")
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
         lodger.decide_ctx(lodger.cur)
@@ -748,14 +860,19 @@ def ask(argv):
     ap.add_argument("--port", type=int, default=8181)
     ap.add_argument("--model", default="", help="which model (default: the one loaded)")
     ap.add_argument("-n", type=int, default=512, help="most words in the answer")
+    ap.add_argument("--api-key-file", metavar="PATH", help="the key lodger serve wants, if any (or LODGER_API_KEY)")
     a = ap.parse_args(argv)
     body = {"model": a.model, "stream": True, "max_tokens": a.n,
             "messages": [{"role": "user", "content": a.question}]}
     c = http.client.HTTPConnection(HOST, a.port, timeout=900)
-    c.request("POST", "/v1/chat/completions", json.dumps(body), {"Content-Type": "application/json"})
+    c.request("POST", "/v1/chat/completions", json.dumps(body),
+              {"Content-Type": "application/json", **auth_header(read_key(a.api_key_file))})
     r = c.getresponse()
     if r.status != 200:
         print(f"error {r.status}: {r.read().decode(errors='replace')}", file=sys.stderr)
+        if r.status == 401:
+            print("lodger serve was started with an API key: pass --api-key-file PATH or set LODGER_API_KEY",
+                  file=sys.stderr)
         return 1
     t0, words, timings = time.time(), 0, None
     for line in r:
@@ -779,14 +896,43 @@ def ask(argv):
         print(f"[{timings.get('predicted_per_second', 0):.1f} words/s writing, {time.time() - t0:.0f} s total]", file=sys.stderr)
     return 0
 
+def read_key(path=None):
+    """The API key: the first line of `path` that isn't empty or a #comment, else $LODGER_API_KEY, else None."""
+    if path:
+        try:
+            with open(os.path.expanduser(path)) as f:
+                lines = [l.strip() for l in f if l.strip() and not l.lstrip().startswith("#")]
+        except OSError as ex:
+            sys.exit(f"can't read the API key file: {ex}")
+        if not lines:
+            sys.exit(f"the API key file {path} is empty")
+        return lines[0]
+    return os.environ.get("LODGER_API_KEY", "").strip() or None
+
+
+def auth_header(key):
+    return {"Authorization": f"Bearer {key}"} if key else {}
 
 
 PI_DIR = os.environ.get("PI_CODING_AGENT_DIR") or os.path.expanduser("~/.pi/agent")
 
 
-def write_pi_config(port, models, default):
+def pi_key(key, path=None):
+    """What to put as the lodger provider's apiKey in pi's models.json: a key from a file is read by pi itself
+    (`!cat FILE`, so the key isn't copied); one from LODGER_API_KEY is written as is (escaped for pi);
+    no key: a placeholder, which lodger ignores."""
+    if not key:
+        return "lodger"
+    if path:
+        return "!cat " + shlex.quote(os.path.abspath(os.path.expanduser(path)))
+    k = key.replace("$", "$$")
+    return "$" + k if k.startswith("!") else k
+
+
+def write_pi_config(port, models, default, api_key="lodger"):
     """Tell pi about lodger's models: a "lodger" provider in pi's models.json (other providers are kept),
-    and lodger's default model as pi's default unless you chose another one in pi's settings."""
+    and lodger's default model as pi's default unless you chose another one in pi's settings.
+    `api_key`: see pi_key()."""
     path = os.path.join(PI_DIR, "models.json")
     try:
         with open(path) as f:
@@ -794,13 +940,14 @@ def write_pi_config(port, models, default):
     except (OSError, ValueError):
         cfg = {}
     cfg.setdefault("providers", {})["lodger"] = {
-        "baseUrl": f"http://{HOST}:{port}/v1", "apiKey": "lodger", "api": "openai-completions",
+        "baseUrl": f"http://{HOST}:{port}/v1", "apiKey": api_key, "api": "openai-completions",
         "models": [{"id": m["id"], "name": f"{m['id']} (local)", "reasoning": bool(m.get("reasoning")),
                     "contextWindow": m["context_window"], "maxTokens": min(32768, m["context_window"] // 4),
                     "input": ["text"], "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
                     "compat": {"supportsDeveloperRole": False}} for m in models if m.get("context_window")]}
     os.makedirs(PI_DIR, exist_ok=True)
-    with open(path + ".tmp", "w") as f:
+    # only you may read it (it can hold API keys, lodger's and other providers')
+    with os.fdopen(os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
         json.dump(cfg, f, indent=2)
     os.replace(path + ".tmp", path)
     spath = os.path.join(PI_DIR, "settings.json")
@@ -818,17 +965,27 @@ def write_pi_config(port, models, default):
 
 def pi(argv):
     """`lodger pi [pi options]`: pi with lodger's models (refreshes pi's list of them first). Plain `pi`
-    works too: `lodger serve` writes the same list when it starts."""
+    works too: `lodger serve` writes the same list when it starts. With an API key, set LODGER_API_KEY
+    (or rely on the list `lodger serve` wrote)."""
+    key = read_key()
     try:
         c = http.client.HTTPConnection(HOST, 8181, timeout=5)
-        c.request("GET", "/v1/models")
-        models = json.loads(c.getresponse().read())["data"]
-        c.request("GET", "/lodger/status")
-        default = json.loads(c.getresponse().read())["default"]
+        c.request("GET", "/v1/models", headers=auth_header(key))
+        r = c.getresponse()
+        data = r.read()
+        if r.status == 401:
+            data = None
+            print("lodger wants an API key (set LODGER_API_KEY to refresh the model list); "
+                  "using the list lodger serve wrote", file=sys.stderr)
+        else:
+            models = json.loads(data)["data"]
+            c.request("GET", "/lodger/status", headers=auth_header(key))
+            default = json.loads(c.getresponse().read())["default"]
     except (OSError, ValueError, KeyError):
         print("lodger isn't running. Start it:  systemctl --user start lodger", file=sys.stderr)
         return 1
-    write_pi_config(8181, models, default)
+    if data is not None:
+        write_pi_config(8181, models, default, pi_key(key))
     try:
         os.execvp("pi", ["pi"] + argv)
     except FileNotFoundError:
