@@ -27,22 +27,23 @@ CTX_CAP = 131072
 CTX_SHARE = 0.25
 
 
-def probe(model, ctx, gpu=None):
+def probe(model, ctx, gpu=None, extra=()):
     """Ask llama.cpp what this model needs, without loading it (llama-fit-params --fit-print).
     gpu=None: processor only, in a unit with no device files, so the graphics card is never touched.
     gpu=(ngl, n_cpu_moe): llama.cpp's own estimate for the RX 7800 XT with that placement. This starts the
     card's driver briefly (no big allocations), so only when the graphics card is allowed.
+    extra: llama.cpp options that change memory use (e.g. --cache-type-k q8_0).
     Returns {model, context, compute} in bytes for the device. Cached."""
     os.makedirs(CACHE, exist_ok=True)
     st = os.stat(model.files[0])
-    key = hashlib.sha1(f"{model.path}:{st.st_size}:{st.st_mtime}:{ctx}:{gpu}".encode()).hexdigest()[:16]
+    key = hashlib.sha1((f"{model.path}:{st.st_size}:{st.st_mtime}:{ctx}:{gpu}" + (f":{list(extra)}" if extra else "")).encode()).hexdigest()[:16]
     cf = os.path.join(CACHE, key + ".json")
     if os.path.exists(cf):
         with open(cf) as f:
             return json.load(f)
     unit = ["systemd-run", "--user", "--quiet", "--collect", "--wait", "--pipe",
             "-p", "MemoryMax=4G", "-p", "MemorySwapMax=0", "-p", "LimitCORE=0"]
-    args = [os.path.join(BIN, "llama-fit-params"), "-m", model.files[0], "-c", str(ctx), "--fit-print", "on"]
+    args = [os.path.join(BIN, "llama-fit-params"), "-m", model.files[0], "-c", str(ctx), "--fit-print", "on"] + list(extra)
     if gpu is None:
         unit += ["-p", "PrivateDevices=yes", "--setenv=HIP_VISIBLE_DEVICES=-1", "--setenv=ROCR_VISIBLE_DEVICES=-1"]
         args += ["--device", "none", "-ngl", "0"]
@@ -85,8 +86,8 @@ class Costs:
     """Context memory grows in a straight line with the context length (plus a fixed part, e.g. the
     state of recurrent layers), so two probes give it for any length."""
 
-    def __init__(self, model, lo, hi):
-        a, b = probe(model, lo), probe(model, hi)
+    def __init__(self, model, lo, hi, extra=()):
+        a, b = probe(model, lo, extra=extra), probe(model, hi, extra=extra)
         self.per_tok = max(0.0, (b["context"] - a["context"]) / (hi - lo)) if hi > lo else 0.0
         self.base = a["context"] - self.per_tok * lo
         self.compute = max(a["compute"], b["compute"])
@@ -123,7 +124,7 @@ def with_margin(x):
 
 
 def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu=0,
-         vram_free=None, ram_avail=None, threads=None, why_gpu_off=None, device_check=False):
+         vram_free=None, ram_avail=None, threads=None, why_gpu_off=None, device_check=False, extra=()):
     """Return a plan dict, or one with plan["refuse"] set to the reason.
     target_ctx: context to aim for; None = automatic (see CTX_CAP, CTX_SHARE).
     device_check: also ask llama.cpp for its own estimate on the card (starts the card's driver briefly)."""
@@ -140,7 +141,7 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
 
     auto = target_ctx is None
     ctxs = ladder(CTX_CAP if auto else target_ctx, min(min_ctx, CTX_CAP if auto else target_ctx), m.meta.get("ctx_train"))
-    costs = Costs(m, ctxs[-1], ctxs[0])
+    costs = Costs(m, ctxs[-1], ctxs[0], extra)
 
     def fair(budget):
         """Automatic context: the lengths that cost at most CTX_SHARE of `budget` (at least the shortest)."""
@@ -174,18 +175,18 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
         for _ in range(3):
             if not (gpu and device_check):
                 break
-            d = probe(m, gpu["ctx"], (gpu["ngl"], gpu["n_cpu_moe"]))
+            d = probe(m, gpu["ctx"], (gpu["ngl"], gpu["n_cpu_moe"]), extra)
             llama = d["model"] + d["context"] + d["compute"]
             plan["llama_gpu_est"] = llama
             if llama + overhead <= gpu["gpu_est"]:
                 break                                   # our own estimate is the higher one: keep it
             short = with_margin(llama + overhead) - gpu["gpu_bytes"]
-            if with_margin(llama + overhead) <= budget:
+            if with_margin(llama + overhead) <= vram_budget:   # the real limit, not the shrunk working budget
                 gpu.update(gpu_est=llama + overhead, gpu_bytes=with_margin(llama + overhead))
                 break
             budget -= short                             # llama.cpp says more than we thought: plan smaller
             w = [f"llama.cpp's own estimate for the card was {short // MiB} MiB higher than ours; planned smaller."]
-            gpu = place_on_gpu(m, costs, fair(budget), budget, w, overhead)
+            gpu = place_on_gpu(m, costs, fair(vram_budget), budget, w, overhead)
         else:
             if gpu and device_check:
                 w.append("Couldn't get our plan and llama.cpp's estimate to agree; not using the graphics card.")

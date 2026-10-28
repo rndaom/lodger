@@ -1,0 +1,72 @@
+# lodger's models: every .gguf file in these folders is served (one at a time) at http://127.0.0.1:8181/v1,
+# and pi lists them all. A [models.NAME] section names a file and gives it settings; files without one
+# get a name from their file name. Settings are llama-server options (temp = 0.7 -> --temp 0.7).
+# After editing: systemctl --user restart lodger
+# (This example is the one used on the PC lodger was built on; the live copy is ~/.config/lodger/models.toml.)
+
+folders = ["~/models", "~/LocalAI/llama/models", "~/.cache/omarchy/local-ai/models"]
+# files in those folders that aren't models to serve on their own
+ignore = ["*Engram*", "*mmproj*", "*/maya-ds4/*", "*/stripes/*"]
+default = "qwen3.6-35b"
+
+# Used by every model unless its own section says otherwise. q8_0 KV cache halves the context's memory
+# (more context, or more of the model on the graphics card) for a quality loss too small to measure.
+[defaults]
+flash-attn = "on"
+cache-type-k = "q8_0"
+cache-type-v = "q8_0"
+no-warmup = true
+
+[models."qwen3.6-35b"]
+file = "~/models/qwen3.6-35b-a3b/Qwen3.6-35B-A3B-UD-IQ4_XS.gguf"
+reasoning = "off"
+temp = 0.7
+top-p = 0.8
+top-k = 20
+min-p = 0
+presence-penalty = 1.5
+
+# Qwen card sampling for non-thinking mode (from the old router presets).
+[models."qwen3.5-9b"]
+file = "~/LocalAI/llama/models/Qwen3.5-9B/Qwen3.5-9B-UD-Q4_K_XL.gguf"
+reasoning = "off"
+temp = 0.7
+top-p = 0.8
+top-k = 20
+min-p = 0
+presence-penalty = 1.5
+
+# Thinking models: card sampling for thinking mode (from the old router presets).
+[models."saluki-27b"]
+file = "~/LocalAI/llama/models/Underdog-Saluki-27B-1.0/Underdog-Saluki-27B-1.0-IQ2-mix.gguf"
+temp = 0.6
+top-p = 0.95
+top-k = 20
+min-p = 0
+
+[models."qwen3.8-27b-heretic"]
+file = "~/LocalAI/llama/models/Qwen3.8-27B-Heretic-RVN/RVN-custom-13.0-mtp-headq4.gguf"
+temp = 1.0
+top-p = 0.95
+top-k = 20
+min-p = 0
+presence-penalty = 0
+
+[models."swift-1.5-27b"]
+file = "~/models/swift-1.5/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf"
+temp = 1.0
+top-p = 0.95
+top-k = 20
+min-p = 0
+
+[models."bonsai-27b-heretic"]
+file = "~/LocalAI/llama/models/Ternary-Bonsai-2-27B-Heretic/Ternary-Bonsai-2-27B-Uncensored-Heretic-PQ2_0-MTP-graft.gguf"
+
+# 763B mixture of experts, 248 GB in 6 parts plus a 103 GB Engram file: needs the ds41-local project's own
+# loading setup (Engram on disk, files striped over two drives). Not served by lodger yet.
+[models."deepseek-v4.1-flash"]
+file = "~/models/ds41-1017-iq2xs/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00006.gguf"
+skip = "needs the ds41-local project's own setup (248 GB + Engram file); not served by lodger yet"
+
+[models."lfm2.5-2.6b"]
+file = "~/.cache/omarchy/local-ai/models/LiquidAI--LFM2.5-2.6B-GGUF@84022ce711b2/LFM2.5-2.6B-QAD-Q4_0.gguf"

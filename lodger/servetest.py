@@ -73,7 +73,7 @@ class Server:
         res = {} if res is None else res
         res.update({"text": "", "moves": [], "error": None, "started": None})
         t0 = time.time()
-        body = {"model": "x", "stream": True, "max_tokens": n, "messages": [{"role": "user", "content": question}]}
+        body = {"model": "", "stream": True, "max_tokens": n, "messages": [{"role": "user", "content": question}]}
         try:
             c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=900)
             c.request("POST", "/v1/chat/completions", json.dumps(body), {"Content-Type": "application/json"})

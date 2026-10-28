@@ -111,7 +111,14 @@ The idle desktop uses under 0.1%. Lodger's own model never counts. One check cos
 Why: grow-back needs the conversation to survive moving the model between card and processor. With a
 server, every request carries the whole conversation, so lodger can restart the engine anywhere and
 nothing is lost.
-- **Front door**: `lodger serve MODEL [--allow-gpu]` listens on `127.0.0.1:8181` (only this PC, no key).
+- **All your models** (since 2026-10-28 14:00): `lodger serve` serves every model in
+  `~/.config/lodger/models.toml` (folders to scan, names, per-model llama-server settings, `skip` with a
+  reason; `LODGER_MODELS` points elsewhere for tests), one at a time. A request naming another model
+  waits until nothing is being written, then lodger unloads the current one and loads that one (~5-20 s).
+  New requests for the current model queue behind a waiting switch, so nobody waits forever. Each model
+  gets its own context (decided at start, as if lodger's own loaded model weren't on the card) and plan.
+  A model that can't be read or fails to start twice is marked and left out.
+- **Front door**: `lodger serve [--allow-gpu]` listens on `127.0.0.1:8181` (only this PC, no key).
   Apps use the usual OpenAI-style API: `/v1/chat/completions` (streaming or not), `/v1/models`, `/health`.
   Lodger's own: `GET /lodger/status` (where the model is, why, recent events), `POST /lodger/move` (move
   off the card now; it grows back later as usual). `lodger ask "question"` is a small client for it.
@@ -133,8 +140,10 @@ nothing is lost.
   graphics memory), lodger stops it before taking the card and starts it again when the model leaves
   the card (step aside, sleep, exit; `lodger unpause` after a crash). While it has a model loaded,
   lodger stays on the processor. Without `--pause`, a running router keeps lodger off the card.
-- **pi**: `lodger pi [pi options]` opens pi on the served model, from `~/.local/state/lodger/pi` (links
-  to your `~/.pi/agent` files plus a models.json with a `lodger` provider), so `~/.pi` isn't changed.
+- **pi**: on start (port 8181 only) lodger writes a `lodger` provider listing every model into
+  `~/.pi/agent/models.json` (other providers kept) and makes it pi's default in `settings.json` unless
+  another provider was chosen there. Plain `pi` then lists them all; `/model` or `--model lodger/NAME`
+  switches. `lodger pi` refreshes that list and opens pi.
   A move in the middle of a tool call ends that answer with an error (pi retries); plain text continues.
 - The safety exception (lodger may start our build's `llama-server`, local only) is written in
   `../CLAUDE.md` and the Claude hook's comment.
@@ -170,10 +179,11 @@ this PC loads models onto the card and lodger uses it freely.
 
 ## Layout
 - `bin/lodger` - the one command: `lodger plan|run|measure|stress|serve|ask|stress-serve` (`--help` on each).
-- `lodger/` - the code: `launch.py` (plan/run, watchdog), `plan.py` (placement), `neighbors.py` (who
+- `systemd/models.example.toml` - the model list used here (live copy: `~/.config/lodger/models.toml`).
+- `lodger/` - the code: `catalog.py` (the model list), `launch.py` (plan/run, watchdog), `plan.py` (placement), `neighbors.py` (who
   needs the card), `sysmem.py` (memory readers), `model.py` (model file reader), `measure.py`, `stress.py`,
   `serve.py` (serve, ask, step aside, grow back), `servetest.py` (stress-serve).
-- `systemd/lodger.service` - starts `lodger serve` (35B, `--allow-gpu --idle 10`) with the desktop session;
+- `systemd/lodger.service` - starts `lodger serve --allow-gpu --idle 10` (all models) with the desktop session;
   linked into `~/.config/systemd/user/` and enabled.
 - `tools/vram-eater.hip` - test program that takes graphics memory like a game loading; built into
   `build/` (not for git).
@@ -293,3 +303,22 @@ this PC loads models onto the card and lodger uses it freely.
   `local` provider and its fallback to the PC's Qwen 9B removed (backup `config.yaml.bak-2026-10-28`,
   checked that nothing else changed), Hermes restarted and running (Grok first, then Codex). The login
   service now loads onto the card: 35B, 128K context, 50 words/s.
+- 2026-10-28 13:30-14:10 **lodger runs all local models** (user: "I want to see all my local AIs through
+  lodger"; 0xSero's Local AI should not run models itself). Done:
+  - 0xSero's Local AI: its LFM2.5 2.6B containers stopped with its own `omarchy-local-ai stop` (its code
+    untouched); the model file is now served by lodger.
+  - `~/.config/lodger/models.toml`: 8 models, settings from the old router presets (sampling, thinking
+    off for the 9B and the 35B), q8_0 KV cache + flash attention for all (A/B on the 35B: 52-53 words/s
+    with q8_0 vs 50-51 with f16, and room for 4 more expert layers on the card).
+  - All 6 servable models loaded and answered on the card, no graphics-card errors or crashes:
+    LFM 2.6B 165 words/s (128K), Qwen3.5-9B 65 (128K), Saluki 27B 35 (64K, all on the card),
+    Qwen3.6-35B 52 (128K, 21 of 40 expert layers on the card), Swift 27B 12 and Heretic 27B 8.5 (64K,
+    53 and 47 of 65 layers on the card: these dense 13 GB models don't fit beside 2 GiB kept free).
+  - Not served: Bonsai 27B (PQ2_0, a file type this llama.cpp and gguf-py can't read; needs the Prism
+    fork) and DeepSeek V4.1 (248 GB + Engram file; needs ds41-local's own setup).
+  - Fixed on the way: the planner gave up on the card when llama.cpp's estimate was higher (models with
+    an MTP layer), because it compared against its shrunk working budget instead of the real limit.
+  - Plain `pi` lists all 6 (settings backup `~/.pi/agent/settings.json.bak-2026-10-28`); tested reading a
+    file with the 35B and listing files with the 9B (lodger switched by itself).
+  - Later: vision (the projector files are there, not planned yet); MTP / n-gram speculation for the
+    27Bs (the old router got ~58 vs 32 words/s on Heretic with it; llama-fit-params can't size it yet).

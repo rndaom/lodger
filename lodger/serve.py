@@ -1,11 +1,14 @@
-"""lodger serve: keep a model ready for apps on this PC, and move it out of your way and back.
+"""lodger serve: keep your local models ready for apps on this PC, and move them out of your way and back.
 
-  lodger serve MODEL [--allow-gpu] [--port 8181] [--ctx 16384] [--think]
-  lodger ask "question" [--port 8181]
+  lodger serve [MODEL.gguf ...] [--allow-gpu] [--port 8181] [--idle MIN]
+  lodger ask "question" [--model NAME] [--port 8181]
+  lodger pi [pi options]
 
 Apps talk to lodger at http://127.0.0.1:8181/v1/chat/completions (the usual OpenAI-style API); only
-this PC can reach it. Behind it, lodger runs our llama.cpp build's server on a private port, with the
-same plan, fence and watchdog as `lodger run`.
+this PC can reach it. It serves every model in ~/.config/lodger/models.toml (or the files given), one at
+a time: a request naming another model switches to it once nothing is being written. Behind it, lodger
+runs our llama.cpp build's server on a private port, with the same plan, fence and watchdog as `lodger run`.
+pi lists all of them: `lodger serve` writes a "lodger" provider into pi's models.json.
 - Steps aside: when another app needs the graphics card, the model is stopped on the card and started
   again on the processor at once. An answer being written continues where it stopped.
 - Grows back: when the card has been quiet for a while and no answer is being written, the model moves
@@ -18,7 +21,7 @@ import argparse
 import http.client
 import json
 import os
-import re
+import contextlib
 import signal
 import socket
 import subprocess
@@ -27,14 +30,14 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import plan as planner, sysmem
+from . import catalog, plan as planner, sysmem
 from .launch import GAME_GUARD_FLAG, RUNS, Watchdog, gpu_blockers, router_coming, unit_cgroup, unit_props
 from .neighbors import Neighbors
 
 MiB, GiB = sysmem.MiB, sysmem.GiB
 HOST = "127.0.0.1"          # only this PC; part of the approved exception (../CLAUDE.md)
 QUIET_SECONDS = 60          # the card must be quiet this long before the model grows back
-MOVE_WAIT = 300             # how long a request waits for the model to be ready
+MOVE_WAIT = 600             # how long a request waits for its model (a switch may wait for an answer)
 PAUSE_IDLE_VRAM = 128 * MiB  # a --pause service holding less graphics memory than this counts as idle
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
 
@@ -88,24 +91,22 @@ class Engine:
     count = 0
     all = []
 
-    def __init__(self, plan, a, out):
+    def __init__(self, plan, entry, out):
         Engine.count += 1
-        self.plan, self.out = plan, out
+        self.plan, self.entry, self.out = plan, entry, out
         self.port = free_port()
         self.unit = f"lodger-{os.getpid()}-{Engine.count}"
         self.where = "card" if plan["ngl"] else "processor"
         p = plan
         cmd = [os.path.join(planner.BIN, "llama-server"), "-m", p["model"], "-c", str(p["ctx"]),
                "-t", str(p["threads"]), "--fit", "off", "-np", "1", "--host", HOST, "--port", str(self.port),
-               "--no-webui", "-a", a.name]
+               "--no-webui", "-a", entry.name] + entry.args()
         if p["ngl"]:
             cmd += ["--device", "ROCm0", "-ngl", str(p["ngl"])] + (["-ncmoe", str(p["n_cpu_moe"])] if p["n_cpu_moe"] else [])
             env = {"HIP_VISIBLE_DEVICES": "0"}
         else:
             cmd += ["--device", "none", "-ngl", "0"]
             env = {"HIP_VISIBLE_DEVICES": "-1", "ROCR_VISIBLE_DEVICES": "-1"}
-        if not a.think:
-            cmd += ["--reasoning", "off"]
         sr = ["systemd-run", "--user", "--quiet", "--collect", f"--unit={self.unit}", "--pipe", "--wait"]
         sr += [f"--property={k}={v}" for k, v in unit_props(p).items()]
         sr += [f"--setenv={k}={v}" for k, v in env.items()]
@@ -156,7 +157,7 @@ class Engine:
         # learn: planned vs really used on the card (only once it had loaded)
         if self.plan["ngl"] and time.time() - self.started > 20:
             with open(os.path.join(RUNS, "calibration.jsonl"), "a") as f:
-                f.write(json.dumps({"time": time.strftime("%F %T"), "model": self.plan["name"], "ngl": self.plan["ngl"],
+                f.write(json.dumps({"time": time.strftime("%F %T"), "model": self.entry.name, "ngl": self.plan["ngl"],
                                     "n_cpu_moe": self.plan["n_cpu_moe"], "ctx": self.plan["ctx"],
                                     "gpu_est": self.plan["gpu_est"], "llama_gpu_est": self.plan.get("llama_gpu_est"),
                                     "gpu_real": self.wd.peak["model_vram"] or None, "stopped": self.wd.reason,
@@ -164,8 +165,13 @@ class Engine:
 
 
 class Lodger:
-    def __init__(self, a):
+    def __init__(self, a, models, default):
         self.a = a
+        self.models = models                  # name -> catalog.Entry
+        self.cur = models[default]            # the model loaded (or to load next)
+        self.default = default
+        self.switch_to = None                 # a request is waiting for this model
+        self.busy = {}                        # engine -> answers being written on it now
         self.cv = threading.Condition()
         self.engine = None
         self.ready = False
@@ -179,41 +185,72 @@ class Lodger:
         self.events = []                      # (time, text) shown in /lodger/status
         self.force_off_card = False
         self.closing = False
-        self.asleep = bool(a.idle)            # with --idle: load the model on the first request, not at start
+        self.asleep = bool(a.idle)            # with --idle: load a model on the first request, not at start
         self.wake = False
         self.last_used = time.time()
-        self.ctx = a.ctx                      # one context for the whole session (decide_ctx), so a conversation
-                                              # that fits on the card still fits after a move to the processor
-        self.out = os.path.join(RUNS, time.strftime("%Y-%m-%d-%H%M%S") + "-serve-" + a.name)
+        self.out = os.path.join(RUNS, time.strftime("%Y-%m-%d-%H%M%S") + "-serve")
         os.makedirs(self.out)
 
     def note(self, text):
         log(text)
         self.events = (self.events + [(time.strftime("%H:%M:%S"), text)])[-20:]
 
-    def decide_ctx(self):
-        """The session's context: automatic (see plan.CTX_CAP/CTX_SHARE) for where the model may run, the
-        shorter of card and processor, so it fits wherever the model ends up. Planning only, nothing loads."""
-        if self.ctx:
+    def find(self, name):
+        """The model a request names: exact or any case; none/"lodger" = the loaded one."""
+        if not name or name == "lodger":
+            return self.cur
+        e = self.models.get(name) or next((m for n, m in self.models.items() if n.lower() == str(name).lower()), None)
+        return e if e and not e.skip else None
+
+    def available(self):
+        return [e for e in self.models.values() if not e.skip]
+
+    def decide_ctx(self, entry):
+        """A model's context for this session: automatic (see plan.CTX_CAP/CTX_SHARE) for where it may run,
+        the shorter of card and processor, so a conversation that fits on the card still fits after a move
+        to the processor. Planning only, nothing loads."""
+        if entry.ctx or entry.skip:
             return
         ctxs = []
         try:
-            p = planner.make(self.a.model, cpu_only=True, threads=self.a.threads, why_gpu_off="deciding the context")
+            p = planner.make(entry.path, cpu_only=True, threads=self.a.threads, why_gpu_off="deciding the context",
+                             extra=entry.planning_args())
             if not p["refuse"]:
                 ctxs.append(p["ctx"])
             if self.a.allow_gpu:
-                p = planner.make(self.a.model, leave_gpu=self.a.leave_gpu * MiB, threads=self.a.threads)
+                # as if lodger's own model weren't on the card: that memory is freed before this one loads
+                e, card = self.engine, sysmem.dgpu()
+                mine = (e.wd.peak["model_vram"] or e.plan["gpu_bytes"]) if e and e.where == "card" and e.alive() else 0
+                p = planner.make(entry.path, leave_gpu=self.a.leave_gpu * MiB, threads=self.a.threads,
+                                 extra=entry.planning_args(), vram_free=sysmem.vram_free(card) + mine if card else None)
                 if not p["refuse"] and p["ngl"]:
                     ctxs.append(p["ctx"])
-        except (Exception, SystemExit) as ex:
-            log(f"couldn't work out the context ({ex}); using {planner.MIN_CTX}")
-        self.ctx = min(ctxs) if ctxs else planner.MIN_CTX
-        log(f"context for this session: {self.ctx} words")
+        except (Exception, SystemExit) as ex:   # e.g. a file type this llama.cpp can't read
+            entry.skip = f"can't be read by this llama.cpp build ({str(ex)[:120]})"
+            log(f"{entry.name}: {entry.skip}")
+            return
+        entry.ctx = min(ctxs) if ctxs else planner.MIN_CTX
+
+    def prepare(self):
+        """At start: work out every model's context (cached after the first time), then tell pi about them."""
+        for e in list(self.models.values()):
+            self.decide_ctx(e)
+        ok = self.available()
+        log(f"{len(ok)} models ready to serve: " + ", ".join(f"{e.name} ({e.ctx})" for e in ok))
+        for e in self.models.values():
+            if e.skip:
+                log(f"not served: {e.name}: {e.skip}")
+        if self.a.port == 8181:
+            write_pi_config(self.a.port, [model_info(e) for e in ok], self.default)
 
     def make_plan(self, on_card):
+        e = self.cur
+        self.decide_ctx(e)
+        if e.skip:
+            return {"refuse": e.skip}
         try:
-            return planner.make(self.a.model, target_ctx=self.ctx, min_ctx=self.ctx if on_card else self.a.min_ctx,
-                                cpu_only=not on_card,
+            return planner.make(e.path, target_ctx=e.ctx, min_ctx=e.ctx if on_card else self.a.min_ctx,
+                                cpu_only=not on_card, extra=e.planning_args(),
                                 leave_gpu=self.a.leave_gpu * MiB, threads=self.a.threads, device_check=on_card,
                                 why_gpu_off=None if on_card else (self.why_off_card or "the card is not wanted now"))
         except (Exception, SystemExit) as ex:   # a failed llama.cpp probe must not take the server down
@@ -256,8 +293,8 @@ class Lodger:
         return e
 
     def _launch(self, want_card, card_only=False):
-        """Start an engine (card if wanted and possible, else processor) and wait until it answers.
-        card_only: give up instead of falling back to the processor. Returns the Engine, or None."""
+        """Start an engine for the current model (card if wanted and possible, else processor) and wait until
+        it answers. card_only: give up instead of falling back to the processor. Returns the Engine, or None."""
         if want_card:
             self.why_off_card = self.a.allow_gpu and self.pausable_busy()
             if not self.why_off_card:
@@ -269,15 +306,16 @@ class Lodger:
         p = self.make_plan(want_card and not self.why_off_card)
         if p["refuse"] or (card_only and not p["ngl"]):
             if p["refuse"]:
-                self.note(f"can't start the model: {p['refuse']}")
+                self.note(f"can't start {self.cur.name}: {p['refuse']}")
             return None
         n = Engine.count + 1
-        out = os.path.join(self.out, f"engine-{n}-{'card' if p['ngl'] else 'processor'}")
+        out = os.path.join(self.out, f"engine-{n}-{self.cur.name}-{'card' if p['ngl'] else 'processor'}")
         if self.closing:
             return None
         os.makedirs(out)
-        e = Engine(p, self.a, out)
-        self.note(f"starting on the {e.where}" + (f" ({self.why_off_card})" if self.why_off_card and not p["ngl"] else "")
+        e = Engine(p, self.cur, out)
+        self.note(f"starting {self.cur.name} on the {e.where}"
+                  + (f" ({self.why_off_card})" if self.why_off_card and not p["ngl"] else "")
                   + f", context {p['ctx']}" + (f", {p['ngl']} layers on the card" if p["ngl"] else ""))
         if not e.wait_ready():
             reason = e.wd.reason or "it exited while loading (see engine.log)"
@@ -287,35 +325,64 @@ class Lodger:
                 e.finish()
             self.note(f"the {e.where} engine didn't come up: {reason}")
             return None
-        self.note(f"ready on the {e.where} after {time.time() - e.started:.0f} s")
+        self.note(f"{self.cur.name} ready on the {e.where} after {time.time() - e.started:.0f} s")
         return e
 
     def install(self, e):
         with self.cv:
             old, self.engine, self.ready = self.engine, e, True
-            self.why = f"on the {e.where}" + (f": {self.why_off_card}" if e.where == "processor" and self.why_off_card else "")
+            self.why = f"{e.entry.name} on the {e.where}" + (
+                f": {self.why_off_card}" if e.where == "processor" and self.why_off_card else "")
             self.card_since = time.time() if e.where == "card" else None
             self.cv.notify_all()
         return old
 
-    def bring_up(self, want_card):
-        """Start an engine and keep trying (on the processor) until one is up."""
-        delay = 10
+    def bring_up(self, want_card, tries=None):
+        """Start an engine for the current model, retrying on the processor until one is up (or `tries`
+        attempts failed: then the model is marked as failed and False returned)."""
+        delay, n = 10, 1
         e = self.launch(want_card)
         while not e and not self.closing:
+            if tries and n >= tries:
+                return False
             time.sleep(delay)
-            delay = min(delay * 2, 300)
+            delay, n = min(delay * 2, 300), n + 1
             e = self.launch(False)
         if e:
             self.install(e)
+        return bool(e)
 
-    def wait_engine(self, limit=MOVE_WAIT):
+    def wait_engine(self, entry, limit=MOVE_WAIT):
+        """The engine for `entry`, once it's loaded and ready (asks for a switch or a wake-up if needed);
+        None if that doesn't happen within `limit` seconds or the model can't run."""
+        end = time.time() + limit
         with self.cv:
-            self.last_used = time.time()
-            if self.asleep:
-                self.wake = True
-            self.cv.wait_for(lambda: self.ready and self.engine and self.engine.alive(), timeout=limit)
-            return self.engine if self.ready and self.engine and self.engine.alive() else None
+            while True:
+                self.last_used = time.time()
+                if entry.skip:
+                    return None
+                if (self.cur is entry and self.ready and self.engine and self.engine.alive()
+                        and self.switch_to in (None, entry)):
+                    return self.engine
+                if self.cur is not entry and self.switch_to is None:
+                    self.switch_to = entry            # first in line: the monitor switches once nothing is written
+                if self.asleep:
+                    self.wake = True
+                left = end - time.time()
+                if left <= 0:
+                    return None
+                self.cv.wait(min(1.0, left))
+
+    @contextlib.contextmanager
+    def using(self, e):
+        with self.cv:
+            self.busy[e] = self.busy.get(e, 0) + 1
+        try:
+            yield
+        finally:
+            with self.cv:
+                self.busy[e] -= 1
+                self.cv.notify_all()
 
     def stepped_aside(self):
         self.last_aside = time.time()
@@ -325,8 +392,29 @@ class Lodger:
             self.quiet_needed = QUIET_SECONDS
         self.card_since = None
 
+    def switch(self):
+        """Unload the current model and load the one a request is waiting for."""
+        with self.cv:
+            target, old = self.switch_to, self.engine
+            self.ready, self.engine, self.cur = False, None, target
+            self.switch_to, self.asleep, self.wake = None, False, False
+            self.why = f"switching to {target.name}"
+        self.note(f"switching to {target.name}" + (f" (from {old.entry.name})" if old else ""))
+        if old:
+            old.stop()
+            if old.where == "card":
+                self.unpause()
+        self.card_since, self.quiet_needed = None, QUIET_SECONDS
+        if not self.bring_up(want_card=self.a.allow_gpu, tries=2):
+            with self.cv:
+                target.skip = target.skip or "it didn't start (see the engine logs)"
+                self.asleep, self.cur = True, self.models[self.default]
+                self.why = f"{target.name} couldn't start: {target.skip}"
+                self.cv.notify_all()
+            self.note(self.why)
+
     def monitor(self):
-        """Steps aside / grows back. Runs for the life of `lodger serve`."""
+        """Switches models, steps aside / grows back, sleeps. Runs for the life of `lodger serve`."""
         nb = Neighbors()
         while not self.closing:
             time.sleep(1)
@@ -334,22 +422,35 @@ class Lodger:
                 return
             if nb.update() or self.others_coming():
                 self.quiet_since = time.time()
+            e = self.engine
+            # another model wanted: switch once nothing is being written with this one
+            if self.switch_to and self.switch_to is not self.cur and (not e or not self.busy.get(e)):
+                self.switch()
+                continue
             if self.asleep:
                 if self.wake:
                     self.wake = False
-                    self.note("a request came in: loading the model")
-                    self.bring_up(want_card=self.a.allow_gpu)
+                    with self.cv:
+                        if self.switch_to:
+                            self.cur, self.switch_to = self.switch_to, None
+                    self.note(f"a request came in: loading {self.cur.name}")
                     with self.cv:
                         self.asleep = False
+                    if not self.bring_up(want_card=self.a.allow_gpu, tries=2):
+                        with self.cv:
+                            self.cur.skip = self.cur.skip or "it didn't start (see the engine logs)"
+                            self.asleep, self.why = True, f"{self.cur.name} couldn't start: {self.cur.skip}"
+                            self.cur = self.models[self.default]
+                            self.cv.notify_all()
+                        self.note(self.why)
                 continue
-            e = self.engine
             # unused for a while: unload, so the memory is yours again until the next request
             if (self.a.idle and e and e.alive() and self.active == 0
                     and time.time() - self.last_used >= self.a.idle * 60):
                 with self.cv:
                     self.ready, self.asleep, self.engine = False, True, None
-                    self.why = f"asleep: unloaded after {self.a.idle} min unused (loads again on the next request)"
-                self.note(f"unused for {self.a.idle} min: unloading the model until the next request")
+                    self.why = f"asleep: unloaded after {self.a.idle:g} min unused (loads again on the next request)"
+                self.note(f"unused for {self.a.idle:g} min: unloading {e.entry.name} until the next request")
                 e.stop()
                 self.card_since = None
                 self.unpause()
@@ -403,12 +504,19 @@ class Lodger:
 
     def status(self):
         e = self.engine
-        return {"model": self.a.name, "ready": self.ready, "where": "asleep" if self.asleep else e.where if e else None,
-                "why": self.why,
-                "context": self.ctx, "answers_in_progress": self.active, "quiet_needed_s": self.quiet_needed,
-                "card_quiet_for_s": round(time.time() - self.quiet_since),
+        return {"model": self.cur.name, "default": self.default, "ready": self.ready,
+                "where": "asleep" if self.asleep else e.where if e else None, "why": self.why,
+                "context": self.cur.ctx, "answers_in_progress": self.active,
+                "switching_to": self.switch_to.name if self.switch_to else None,
+                "quiet_needed_s": self.quiet_needed, "card_quiet_for_s": round(time.time() - self.quiet_since),
                 "plan": {k: e.plan[k] for k in ("ngl", "n_cpu_moe", "ctx", "gpu_est")} if e else None,
+                "models": {n: m.skip or "ok" for n, m in self.models.items()},
                 "events": self.events}
+
+
+def model_info(e):
+    return {"id": e.name, "object": "model", "owned_by": "lodger", "context_window": e.ctx,
+            "reasoning": e.reasoning, "meta": {"n_ctx": e.ctx}}
 
 
 def make_handler(lodger):
@@ -432,9 +540,7 @@ def make_handler(lodger):
                     return self.send_json(200, {"status": "ok", "asleep": True})
                 return self.send_json(200 if lodger.ready else 503, {"status": "ok" if lodger.ready else "loading"})
             if self.path == "/v1/models":
-                return self.send_json(200, {"object": "list", "data": [{
-                    "id": lodger.a.name, "object": "model", "owned_by": "lodger", "context_window": lodger.ctx,
-                    "reasoning": lodger.a.think, "meta": {"n_ctx": lodger.ctx}}]})
+                return self.send_json(200, {"object": "list", "data": [model_info(e) for e in lodger.available()]})
             if self.path == "/lodger/status":
                 return self.send_json(200, lodger.status())
             self.send_json(404, {"error": "not found"})
@@ -452,13 +558,18 @@ def make_handler(lodger):
                 body = json.loads(raw)
             except ValueError:
                 return self.send_json(400, {"error": "body is not JSON"})
+            entry = lodger.find(body.get("model"))
+            if not entry:
+                names = ", ".join(e.name for e in lodger.available())
+                return self.send_json(404, {"error": {"message": f"lodger has no model called {body.get('model')!r}; "
+                                                                 f"it has: {names}"}})
             with lodger.cv:
                 lodger.active += 1
             try:
                 if body.get("stream"):
-                    self.stream(body)
+                    self.stream(body, entry)
                 else:
-                    self.whole(body)
+                    self.whole(body, entry)
             finally:
                 with lodger.cv:
                     lodger.active -= 1
@@ -469,14 +580,18 @@ def make_handler(lodger):
             c.request("POST", "/v1/chat/completions", json.dumps(body), {"Content-Type": "application/json"})
             return c, c.getresponse()
 
-        def whole(self, body):
+        def unavailable(self, entry):
+            return f"{entry.name} is not available right now: " + (entry.skip or lodger.why)
+
+        def whole(self, body, entry):
             for _ in range(4):
-                e = lodger.wait_engine()
+                e = lodger.wait_engine(entry)
                 if not e:
-                    return self.send_json(503, {"error": "the model is not available right now: " + lodger.why})
+                    return self.send_json(503, {"error": {"message": self.unavailable(entry)}})
                 try:
-                    c, r = self.upstream(e, body)
-                    data = r.read()
+                    with lodger.using(e):
+                        c, r = self.upstream(e, body)
+                        data = r.read()
                     if r.status == 200 or e.alive():
                         self.send_response(r.status)
                         self.send_header("Content-Type", "application/json")
@@ -487,9 +602,9 @@ def make_handler(lodger):
                 except (OSError, http.client.HTTPException):
                     pass
                 time.sleep(1)                       # the engine moved underneath us: ask again on the new one
-            self.send_json(503, {"error": "the model kept moving; try again"})
+            self.send_json(503, {"error": {"message": "the model kept moving; try again"}})
 
-        def stream(self, body):
+        def stream(self, body, entry):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -498,9 +613,9 @@ def make_handler(lodger):
             content, reasoning, pieces, tooling = "", "", 0, False
             limit = body.get("max_tokens") or body.get("max_completion_tokens") or body.get("n_predict")
             for attempt in range(6):
-                e = lodger.wait_engine()
+                e = lodger.wait_engine(entry)
                 if not e:
-                    self.event(f'data: {json.dumps({"error": {"message": "the model is not available: " + lodger.why}})}')
+                    self.event(f'data: {json.dumps({"error": {"message": self.unavailable(entry)}})}')
                     return
                 req = dict(body)
                 if content or reasoning:
@@ -517,34 +632,35 @@ def make_handler(lodger):
                     self.event(f": lodger restarted the model on the {e.where}; continuing the answer")
                 c = None
                 try:
-                    c, r = self.upstream(e, req)
-                    if r.status != 200:
-                        err = r.read().decode(errors="replace")
-                        if e.alive() and lodger.engine is e:
-                            self.event(f"data: {json.dumps({'error': {'message': err[:500]}})}")
-                            return
-                        raise OSError("engine went away")
-                    while True:
-                        line = r.readline()
-                        if not line:
-                            raise OSError("stream ended early")
-                        s = line.decode(errors="replace").rstrip("\r\n")
-                        if not s:
-                            continue
-                        if s.startswith("data: ") and s != "data: [DONE]":
-                            try:
-                                d = json.loads(s[6:])
-                                delta = (d.get("choices") or [{}])[0].get("delta") or {}
-                                if delta.get("content") or delta.get("reasoning_content"):
-                                    pieces += 1
-                                tooling = tooling or bool(delta.get("tool_calls"))
-                                content += delta.get("content") or ""
-                                reasoning += delta.get("reasoning_content") or ""
-                            except ValueError:
-                                pass
-                        self.event(s)
-                        if s == "data: [DONE]":
-                            return
+                    with lodger.using(e):
+                        c, r = self.upstream(e, req)
+                        if r.status != 200:
+                            err = r.read().decode(errors="replace")
+                            if e.alive() and lodger.engine is e:
+                                self.event(f"data: {json.dumps({'error': {'message': err[:500]}})}")
+                                return
+                            raise OSError("engine went away")
+                        while True:
+                            line = r.readline()
+                            if not line:
+                                raise OSError("stream ended early")
+                            s = line.decode(errors="replace").rstrip("\r\n")
+                            if not s:
+                                continue
+                            if s.startswith("data: ") and s != "data: [DONE]":
+                                try:
+                                    d = json.loads(s[6:])
+                                    delta = (d.get("choices") or [{}])[0].get("delta") or {}
+                                    if delta.get("content") or delta.get("reasoning_content"):
+                                        pieces += 1
+                                    tooling = tooling or bool(delta.get("tool_calls"))
+                                    content += delta.get("content") or ""
+                                    reasoning += delta.get("reasoning_content") or ""
+                                except ValueError:
+                                    pass
+                            self.event(s)
+                            if s == "data: [DONE]":
+                                return
                 except (OSError, http.client.HTTPException):
                     if self.client_gone:
                         return
@@ -575,15 +691,14 @@ def make_handler(lodger):
 
 def serve(argv):
     ap = argparse.ArgumentParser(prog="lodger serve", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("model")
+    ap.add_argument("files", nargs="*", metavar="MODEL.gguf",
+                    help=f"serve only these files (default: the models in {catalog.CONFIG})")
+    ap.add_argument("--default", help="model to load when a request doesn't name one")
     ap.add_argument("--allow-gpu", action="store_true", help="the graphics card may be used")
     ap.add_argument("--port", type=int, default=8181)
-    ap.add_argument("--name", help="model name apps see (default: from the file)")
-    ap.add_argument("--ctx", type=int, help="context length (default: automatic, from the model and this PC)")
     ap.add_argument("--min-ctx", type=int, default=planner.MIN_CTX)
     ap.add_argument("--leave-gpu", type=int, default=0, metavar="MiB")
     ap.add_argument("--threads", type=int)
-    ap.add_argument("--think", action="store_true", help="let the model reason before answering")
     ap.add_argument("--idle", type=float, default=0, metavar="MIN",
                     help="unload the model after MIN minutes unused, and load it on the next request "
                          "(it then also waits for the first request before loading); 0 = keep it loaded")
@@ -592,22 +707,27 @@ def serve(argv):
                          "lodger stops it before using the graphics card and starts it again when it leaves the "
                          "card; while it has a model loaded, lodger stays off the card. Repeatable.")
     a = ap.parse_args(argv)
-    a.name = a.name or re.sub(r"(?i)\.gguf$", "", os.path.basename(a.model))
-    lodger = Lodger(a)
+    models, default = catalog.load(a.files or None)
+    if not models:
+        sys.exit(f"no models found: add folders or files to {catalog.CONFIG}")
+    default = a.default or (default if default in models else None) or next(iter(models))
+    lodger = Lodger(a, models, default)
     unpause_all()                                # left over from a crash
-    lodger.decide_ctx()
     httpd = ThreadingHTTPServer((HOST, a.port), make_handler(lodger))
     httpd.daemon_threads = True
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
     signal.signal(signal.SIGINT, signal.default_int_handler)   # also when started in the background of a script
-    log(f"lodger serving {a.name} at http://{HOST}:{a.port}/v1 (only this PC); logs in {lodger.out}")
+    log(f"lodger serving {len(models)} models at http://{HOST}:{a.port}/v1 (only this PC); default {default}; "
+        f"logs in {lodger.out}")
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
+        lodger.decide_ctx(lodger.cur)
         if lodger.asleep:
             lodger.why = "asleep until the first request"
-            log("waiting for the first request before loading the model")
+            log("waiting for the first request before loading a model")
         else:
             lodger.bring_up(want_card=a.allow_gpu)
+        threading.Thread(target=lodger.prepare, daemon=True).start()
         threading.Thread(target=lodger.monitor, daemon=True).start()
         while True:
             time.sleep(3600)
@@ -626,9 +746,10 @@ def ask(argv):
     ap = argparse.ArgumentParser(prog="lodger ask")
     ap.add_argument("question")
     ap.add_argument("--port", type=int, default=8181)
+    ap.add_argument("--model", default="", help="which model (default: the one loaded)")
     ap.add_argument("-n", type=int, default=512, help="most words in the answer")
     a = ap.parse_args(argv)
-    body = {"model": "lodger", "stream": True, "max_tokens": a.n,
+    body = {"model": a.model, "stream": True, "max_tokens": a.n,
             "messages": [{"role": "user", "content": a.question}]}
     c = http.client.HTTPConnection(HOST, a.port, timeout=900)
     c.request("POST", "/v1/chat/completions", json.dumps(body), {"Content-Type": "application/json"})
@@ -647,6 +768,8 @@ def ask(argv):
                 print(f"\n[error: {d['error'].get('message')}]", file=sys.stderr)
                 return 1
             delta = (d.get("choices") or [{}])[0].get("delta") or {}
+            if delta.get("reasoning_content"):          # thinking: shown dimmed, apart from the answer
+                print(f"\033[2m{delta['reasoning_content']}\033[0m", end="", file=sys.stderr, flush=True)
             text = delta.get("content") or ""
             words += bool(text)
             print(text, end="", flush=True)
@@ -657,44 +780,57 @@ def ask(argv):
     return 0
 
 
-def pi(argv):
-    """`lodger pi [pi options]`: open pi talking to the model lodger serves. Your own pi setup (settings,
-    themes, skills, sign-ins, your models.json) is used as it is, from a separate folder: nothing in
-    ~/.pi is changed."""
-    port = 8181
-    if argv[:1] == ["--port"]:
-        port, argv = int(argv[1]), argv[2:]
+
+PI_DIR = os.environ.get("PI_CODING_AGENT_DIR") or os.path.expanduser("~/.pi/agent")
+
+
+def write_pi_config(port, models, default):
+    """Tell pi about lodger's models: a "lodger" provider in pi's models.json (other providers are kept),
+    and lodger's default model as pi's default unless you chose another one in pi's settings."""
+    path = os.path.join(PI_DIR, "models.json")
     try:
-        c = http.client.HTTPConnection(HOST, port, timeout=5)
-        c.request("GET", "/v1/models")
-        m = json.loads(c.getresponse().read())["data"][0]
-    except (OSError, ValueError, KeyError, IndexError):
-        print(f"lodger isn't serving on port {port}. Start it:  systemctl --user start lodger", file=sys.stderr)
-        return 1
-    home = os.environ.get("PI_CODING_AGENT_DIR") or os.path.expanduser("~/.pi/agent")
-    ag = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "lodger", "pi")
-    os.makedirs(ag, exist_ok=True)
-    for name in os.listdir(home) if os.path.isdir(home) else []:
-        dst = os.path.join(ag, name)
-        if name != "models.json" and not os.path.lexists(dst):
-            os.symlink(os.path.join(home, name), dst)
-    try:
-        with open(os.path.join(home, "models.json")) as f:
-            models = json.load(f)
+        with open(path) as f:
+            cfg = json.load(f)
     except (OSError, ValueError):
-        models = {}
-    ctx = m.get("context_window") or planner.MIN_CTX
-    models.setdefault("providers", {})["lodger"] = {
+        cfg = {}
+    cfg.setdefault("providers", {})["lodger"] = {
         "baseUrl": f"http://{HOST}:{port}/v1", "apiKey": "lodger", "api": "openai-completions",
-        "models": [{"id": m["id"], "name": f"{m['id']} (lodger, this PC)", "reasoning": bool(m.get("reasoning")),
-                    "contextWindow": ctx, "maxTokens": min(32768, ctx // 4), "input": ["text"],
-                    "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-                    "compat": {"supportsDeveloperRole": False}}]}
-    with open(os.path.join(ag, "models.json"), "w") as f:
-        json.dump(models, f, indent=1)
-    env = dict(os.environ, PI_CODING_AGENT_DIR=ag)
+        "models": [{"id": m["id"], "name": f"{m['id']} (local)", "reasoning": bool(m.get("reasoning")),
+                    "contextWindow": m["context_window"], "maxTokens": min(32768, m["context_window"] // 4),
+                    "input": ["text"], "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                    "compat": {"supportsDeveloperRole": False}} for m in models if m.get("context_window")]}
+    os.makedirs(PI_DIR, exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(path + ".tmp", path)
+    spath = os.path.join(PI_DIR, "settings.json")
     try:
-        os.execvpe("pi", ["pi", "--provider", "lodger", "--model", m["id"]] + argv, env)
+        with open(spath) as f:
+            settings = json.load(f)
+    except (OSError, ValueError):
+        settings = {}
+    if settings.get("defaultProvider") in (None, "lodger"):
+        settings.update(defaultProvider="lodger", defaultModel=default)
+        with open(spath + ".tmp", "w") as f:
+            json.dump(settings, f, indent=2)
+        os.replace(spath + ".tmp", spath)
+
+
+def pi(argv):
+    """`lodger pi [pi options]`: pi with lodger's models (refreshes pi's list of them first). Plain `pi`
+    works too: `lodger serve` writes the same list when it starts."""
+    try:
+        c = http.client.HTTPConnection(HOST, 8181, timeout=5)
+        c.request("GET", "/v1/models")
+        models = json.loads(c.getresponse().read())["data"]
+        c.request("GET", "/lodger/status")
+        default = json.loads(c.getresponse().read())["default"]
+    except (OSError, ValueError, KeyError):
+        print("lodger isn't running. Start it:  systemctl --user start lodger", file=sys.stderr)
+        return 1
+    write_pi_config(8181, models, default)
+    try:
+        os.execvp("pi", ["pi"] + argv)
     except FileNotFoundError:
         print("pi isn't installed (https://github.com/earendil-works/pi)", file=sys.stderr)
         return 1
