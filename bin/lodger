@@ -10,6 +10,8 @@
   lodger pi [pi options]    talk to it in pi (your pi setup, untouched)
   lodger unpause            start again any service lodger paused (after a crash)
   lodger stress-serve MODEL check serve steps aside and grows back without crashing anything
+  lodger doctor             what lodger sees on this PC (reads only)
+  lodger setup              download llama.cpp (Vulkan by default) into ~/.local/share/lodger
 
 `lodger <command> --help` for the options."""
 import os
@@ -31,6 +33,12 @@ if __name__ == "__main__":
     if cmd == "stress-serve":
         from lodger import servetest
         sys.exit(servetest.main(sys.argv[2:]))
+    if cmd == "doctor":
+        from lodger import doctor
+        sys.exit(doctor.main(sys.argv[2:]))
+    if cmd == "setup":
+        from lodger import setup
+        sys.exit(setup.main(sys.argv[2:]))
     if cmd in ("serve", "ask", "pi", "unpause"):
         from lodger import serve
         sys.exit(getattr(serve, {"unpause": "unpause_all"}.get(cmd, cmd))(sys.argv[2:]))
