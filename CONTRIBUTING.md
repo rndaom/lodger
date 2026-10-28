@@ -52,27 +52,21 @@ lodger exists so that a model cannot take down somebody's desktop, and it has ha
 
 ## Adding a GPU vendor
 
-Today the card-specific code is mixed into `sysmem.py`, `neighbors.py`, `plan.py` and `launch.py`, and is
-written for AMD. A refactor that moves it into a `lodger/gpu/` package, **with one module per vendor**, is
-landing now. This is the planned shape, so you can start reading the kernel and vendor docs for your card. Names
-may still change a little, so check the code on `main` before you build on it.
-
-Each backend (`lodger/gpu/<vendor>.py`) provides:
+All card-specific code lives in `lodger/gpu/`, **one module per kernel driver**. Read the docstring at the top of
+[`lodger/gpu/__init__.py`](lodger/gpu/__init__.py) for the exact interface; in short, a backend provides:
 
 | Function | What it does |
 |---|---|
-| `devices()` | The cards of this vendor, found from sysfs only. **Must never wake a sleeping card** (laptop GPUs). |
-| `power(dev)` | Whether the card is awake, asleep or on battery-saving, read without waking it. |
-| `memory(dev)` | Total, used and free graphics memory in bytes, from the kernel's numbers; `None` while the card sleeps. |
-| `clients(pid)` | What one app holds on the card: memory, and how long the card's 3D/compute engine has worked for it. |
-| `llama_device(dev, backend)` | llama.cpp's name for that card (`Vulkan0`, `CUDA0`, `ROCm0`), matched by PCI id, never by index. |
-| `launch_env(dev, backend)` | The environment variables the engine needs to see only that card. |
+| `integrated(dev)` | True for a processor's built-in graphics, which shares the PC's RAM. |
+| `memory(dev)` | Total and used graphics memory (plus shared GTT) in bytes, from the kernel's numbers; `None` when unknown or while the card sleeps. |
+| `why_unknown(dev)` | Plain words for why `memory()` is `None`. |
+| `usage(dev, pids)` | What each app holds on the card and how long the card has worked for it. |
 
-Plus **engine and memory-region tables** for the shared parser of the kernel's
-[DRM fdinfo](https://docs.kernel.org/gpu/drm-usage-stats.html) files, which covers amdgpu, i915, xe and others:
-which `drm-engine-*` entries are 3D/compute, and which memory regions live on the card rather than in system
-RAM. A vendor whose driver gives no fdinfo (NVIDIA) provides its own `clients()` instead, for example through
-NVML.
+Then add the driver to `BACKENDS` in `lodger/gpu/__init__.py`, and tell `lodger/engine.py` how llama.cpp finds
+the card (its device name, `Vulkan0`/`CUDA0`/`ROCm0`, matched by PCI address, never by index). Drivers that
+write the kernel's [DRM fdinfo](https://docs.kernel.org/gpu/drm-usage-stats.html) files (amdgpu, i915, xe and
+others) share one parser, `lodger/gpu/fdinfo.py`: add a row to its `DRIVERS` table saying which engines are
+3D/compute and which memory regions live on the card. NVIDIA writes no fdinfo, so `lodger/gpu/nvidia.py` uses NVML.
 
 Things to get right for your vendor:
 
@@ -90,7 +84,7 @@ Open an issue before you start, so we can agree the interface and avoid double w
 
 If you run lodger on a card or machine that isn't listed as tested, please file a
 [hardware report](https://github.com/rndaom/lodger/issues/new?template=hardware_report.yml). It asks for the output
-of `lodger doctor` (coming; until it lands, give your GPU, driver and kernel versions by hand), your distro, RAM
+of `lodger doctor`, your distro, RAM
 and what happened. A report that says "it didn't work, and here is the log" helps as much as one that says "it
 did".
 

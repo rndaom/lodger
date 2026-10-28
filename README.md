@@ -27,7 +27,7 @@ card is needed.
 When two of them disagree, the earlier one wins.
 
 1. **Never crash the desktop.** Before loading, lodger looks at how much graphics memory (VRAM) and normal
-   memory (RAM) is free *right now*, keeps a safety margin for everything else (always at least 2 GiB of VRAM),
+   memory (RAM) is free *right now*, keeps a safety margin for everything else (a desktop reserve of VRAM it learns),
    and refuses rather than guesses. While running it keeps watching and stops the model at once if memory gets
    too low.
 2. **Share.** It never competes with the apps you have open. When one needs the card or memory, the model
@@ -57,9 +57,9 @@ OpenAI-style API. What lodger adds around the engine:
 |---|---|
 | AMD Radeon, discrete (tested: **RX 7800 XT**, 16 GB, ROCm) | Works. This is the one machine it has been tested on. |
 | AMD Radeon, other models | Expected to work, **not tested**. Reports welcome. |
-| NVIDIA | **In progress, help wanted.** Needs a backend that reads memory and per-app use through NVML. |
-| Intel Arc / integrated | **In progress, help wanted.** The kernel exposes what is needed; the backend is not written. |
-| AMD APUs / laptops with shared memory | **In progress, help wanted.** Budgets work differently when the card shares RAM with the system. |
+| NVIDIA | Written (memory and per-app use through NVML), **not tested on a real card yet**. Reports wanted. |
+| Intel Arc / integrated | Per-app use written, **not tested**. Arc's free memory isn't read yet, so lodger leaves Arc cards alone for now. Help wanted. |
+| AMD APUs / laptops with shared memory | Written (budgets from the shared RAM; no card work on battery; a sleeping card is never woken), **not tested**. Reports wanted. |
 | Processor only | Works (`--cpu-only`), without the stepping aside. |
 | Windows, macOS | Not planned for now. Contributions welcome, see [CONTRIBUTING](CONTRIBUTING.md). |
 
@@ -70,12 +70,12 @@ whether it worked or not.
 
 ## Requirements
 
-- **Linux** with a systemd user session (lodger uses `systemd-run --user` for its fence) and cgroup v2.
+- **Linux.** With a systemd user session lodger fences the model with `systemd-run --user`; without one it uses
+  a cgroup v2 folder it may write to, or else runs unfenced but still watched (`lodger doctor` says which).
   Flatpak is not supported: its private `/proc` hides what other apps use, and lodger needs to see that.
 - **Python 3.11 or newer.** [uv](https://docs.astral.sh/uv/) brings its own.
-- **llama.cpp** with `llama-server` and `llama-fit-params` built or downloaded. Today lodger looks for a build
-  in a fixed place (`lodger/model.py`); a configurable location and `lodger setup` to fetch one for you are
-  *coming*.
+- **llama.cpp**: `lodger setup` downloads a ready-made build (Vulkan by default) and checks it. Your own build
+  works too: set `llama_cpp` in `~/.config/lodger/config.toml` or `LODGER_LLAMA_CPP`.
 - **A model** as a `.gguf` file, from [Hugging Face](https://huggingface.co/models?library=gguf) for example.
   Check the model's licence yourself; lodger never downloads or redistributes models for you.
 - **RAM:** 16 GB or more is comfortable. The only machine tested has 30 GiB. 8 GB works for small models on the
@@ -85,6 +85,8 @@ whether it worked or not.
 
 ```bash
 uv tool install lodger        # or: pipx install lodger
+lodger doctor                 # what lodger sees on this PC, and what will work
+lodger setup                  # download llama.cpp (Vulkan by default)
 lodger serve --allow-gpu      # keep a model ready for apps on this PC
 ```
 
@@ -105,13 +107,6 @@ Then connect an app at **`http://127.0.0.1:8181/v1`** (see below), or just try i
 
 ```bash
 lodger ask "Why is the sky blue?"
-```
-
-Coming, not there yet:
-
-```bash
-lodger doctor     # check this PC: card, driver, systemd, llama.cpp, and say what will work
-lodger setup      # download the right llama.cpp, write a systemd user unit that starts lodger at login
 ```
 
 To start lodger at login today, use [`systemd/lodger.service`](systemd/lodger.service) as a starting point for
@@ -160,8 +155,8 @@ middle of a move: that answer ends with an error, and well-behaved clients retry
 | `lodger measure` | Log what each app uses, read-only |
 | `lodger unpause` | Start again any service lodger paused, after a crash |
 | `lodger stress MODEL`, `lodger stress-serve MODEL` | Tests that grab the card on purpose. See [Safety](#safety) |
-| `lodger doctor` | *Coming.* Check this PC and say what will work |
-| `lodger setup` | *Coming.* Download llama.cpp and set up the login service |
+| `lodger doctor` | What lodger sees on this PC (cards, power, memory, llama.cpp, fence), read-only. Paste it into hardware reports |
+| `lodger setup` | Download a llama.cpp release (Vulkan, ROCm, CUDA or CPU) into `~/.local/share/lodger`, checksum checked |
 
 `lodger <command> --help` shows the options. `lodger plan` is the safest first step: it only reads and prints.
 
@@ -170,7 +165,9 @@ middle of a move: that answer ends with an error, and well-behaved clients retry
 lodger is built so that a model cannot take your desktop down, because that has happened: a model started by
 hand filled a 16 GB card, and the desktop crashed with everything open.
 
-- It keeps **at least 2 GiB of graphics memory free** for your desktop, and 4 GiB (or 15%) of RAM.
+- It keeps a **desktop reserve of graphics memory free**: 1/8 of the card, kept between 1 and 2 GiB, or more once
+  it has seen how much your desktop really uses and how much it jumps (`reserve` in config.toml sets your own
+  floor). And 4 GiB (or 15%) of RAM.
 - It refuses to start rather than guess, and says why in plain words.
 - The model runs in a **fence**: its own cgroup with a RAM cap and no swap, low CPU and disk priority, fewer
   threads than the processor has, and crash dumps off.

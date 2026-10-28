@@ -12,6 +12,8 @@ HELP = """lodger: local AI that lives on your PC as a guest. Your apps come firs
   lodger pi [pi options]    talk to it in pi (your pi setup, untouched)
   lodger unpause            start again any service lodger paused (after a crash)
   lodger stress-serve MODEL check serve steps aside and grows back without crashing anything
+  lodger doctor             what lodger sees on this PC (reads only)
+  lodger setup              download llama.cpp (Vulkan by default) into ~/.local/share/lodger
 
 `lodger <command> --help` for the options."""
 
@@ -31,6 +33,12 @@ def main(argv=None):
     if cmd == "stress-serve":
         from lodger import servetest
         return servetest.main(args[1:])
+    if cmd == "doctor":
+        from lodger import doctor
+        return doctor.main(args[1:])
+    if cmd == "setup":
+        from lodger import setup
+        return setup.main(args[1:])
     if cmd in ("serve", "ask", "pi", "unpause"):
         from lodger import serve
         return getattr(serve, {"unpause": "unpause_all"}.get(cmd, cmd))(args[1:])

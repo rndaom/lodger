@@ -34,7 +34,7 @@ Changelog = "https://github.com/rndaom/lodger/blob/main/CHANGELOG.md"
 lodger = "lodger.cli:main"
 
 [tool.setuptools]
-packages = ["lodger"]
+packages = ["lodger", "lodger.gpu"]
 
 [tool.ruff]
 target-version = "py311"
