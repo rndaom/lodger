@@ -138,9 +138,9 @@ nothing is lost.
   A move in the middle of a tool call ends that answer with an error (pi retries); plain text continues.
 - The safety exception (lodger may start our build's `llama-server`, local only) is written in
   `../CLAUDE.md` and the Claude hook's comment.
-The Steam Deck is **not** part of this: llama-router keeps serving it exactly as today, and lodger keeps
-staying off the card while the router runs. Whether lodger should one day take over that job is a
-separate, later question (see "Later").
+The Steam Deck is **not** part of this. Since 2026-10-28 the PC doesn't serve the Deck at all
+(llama-router and llama-game-guard disabled, Hermes on the Deck uses Grok then Codex), so nothing else on
+this PC loads models onto the card and lodger uses it freely.
 
 ## Gaps fixed on 2026-10-28 (were "known gaps" in version 1)
 - **Steam's start-up looked like a game.** Game detection by process names (`reaper`, `wineserver`,
@@ -153,8 +153,6 @@ separate, later question (see "Later").
 - **Card scratch space was guessed**: now llama.cpp's own estimate + learned overhead.
 
 ## Later (promise 2 and 3)
-- Maybe: lodger also serves the Steam Deck instead of llama-router (same port 8080, key, firewall, model
-  names; the Deck mostly asks for qwen3.5-9b-fast). Separate decision, only after lodger works on this PC.
 - Shrink in place without a restart (grow-back is done, but every move restarts the engine).
 - `lodger serve --think`: continuing a half-written *reasoning* part after a move is untested.
 - Save the stress test's answers, to check the seam of a moved answer by eye on the card too (checked on
@@ -290,3 +288,8 @@ separate, later question (see "Later").
   Ctrl-C handler.
 - Project home: lodger stays its own project, separate from 0xSero's Local AI (different job: sharing the
   PC, not picking and launching recipes). It speaks the standard API, so any of those tools can use it.
+- 2026-10-28 13:15 user: "get local AI off the Deck" (the router conflicted with lodger). Done:
+  llama-router and llama-game-guard disabled and stopped on the PC (files kept); on the Deck, Hermes'
+  `local` provider and its fallback to the PC's Qwen 9B removed (backup `config.yaml.bak-2026-10-28`,
+  checked that nothing else changed), Hermes restarted and running (Grok first, then Codex). The login
+  service now loads onto the card: 35B, 128K context, 50 words/s.
