@@ -2,107 +2,95 @@
 import os
 import re
 
+from . import gpu, host
+
 MiB = 1 << 20
 GiB = 1 << 30
+OURS = "lodger (model)"      # the model's own processes (its unit or cgroup is called lodger-*)
 
 
-def _read(path, default=None):
-    try:
-        with open(path) as f:
-            return f.read()
-    except OSError:
-        return default
+_read = host.read
 
 
-def _int(path, default=0):
-    s = _read(path)
-    return int(s) if s and s.strip().isdigit() else default
-
-
-# ---------- graphics cards ----------
+# ---------- graphics cards (any vendor: see lodger/gpu) ----------
 
 def cards():
-    """Every amdgpu card with VRAM: {pci, card, total, used, gtt_total, gtt_used} in bytes."""
+    """Every card lodger can read memory from: {dev, card, pci, total, used, gtt_total, gtt_used, outputs},
+    bytes. Built-in graphics report their own small "VRAM" here, like the kernel does."""
     out = []
-    for name in sorted(os.listdir("/sys/class/drm")):
-        if not re.fullmatch(r"card\d+", name):
+    for d in gpu.devices():
+        m = d.memory() if d.known else None
+        if not m or not m["total"]:
             continue
-        dev = f"/sys/class/drm/{name}/device"
-        total = _int(f"{dev}/mem_info_vram_total")
-        if not total:
-            continue
-        out.append({
-            "card": name,
-            "pci": os.path.basename(os.path.realpath(dev)),
-            "total": total,
-            "used": _int(f"{dev}/mem_info_vram_used"),
-            "gtt_total": _int(f"{dev}/mem_info_gtt_total"),
-            "gtt_used": _int(f"{dev}/mem_info_gtt_used"),
-            "outputs": connected_outputs(name),
-        })
+        out.append({"dev": d, "card": d.card, "pci": d.pci, "total": m["total"], "used": m["used"],
+                    "gtt_total": m["gtt_total"] or 0, "gtt_used": m["gtt_used"] or 0, "outputs": d.outputs()})
     return out
 
 
 def dgpu():
-    """The card with the most VRAM (same rule as ~/.local/bin/llama-server)."""
-    cs = cards()
-    return max(cs, key=lambda c: c["total"]) if cs else None
+    """The card lodger uses (see gpu.choose), or None."""
+    return gpu.choose()
 
 
-def vram_free(card=None):
-    c = card or dgpu()
-    if not c:
-        return 0
-    dev = f"/sys/class/drm/{c['card']}/device"
-    return _int(f"{dev}/mem_info_vram_total") - _int(f"{dev}/mem_info_vram_used")
+def vram_free(dev=None):
+    """Free memory on the card lodger uses (or `dev`), bytes; 0 if there is none or it can't be read."""
+    d = dev or dgpu()
+    f = d.free() if d else None
+    return f or 0
 
 
-def connected_outputs(card):
-    outs = []
-    for name in os.listdir("/sys/class/drm"):
-        if name.startswith(card + "-") and (_read(f"/sys/class/drm/{name}/status", "") or "").strip() == "connected":
-            outs.append(name[len(card) + 1:])
-    return sorted(outs)
+def gpu_use(dev, pids):
+    """What these processes hold on `dev` together: {vram, gtt} bytes."""
+    tot = {"vram": 0, "gtt": 0}
+    if dev:
+        for rec in dev.usage(pids).values():
+            tot["vram"] += rec["vram"]
+            tot["gtt"] += rec["gtt"]
+    return tot
 
 
 # ---------- RAM ----------
 
 def meminfo():
     """/proc/meminfo in bytes."""
-    out = {}
-    for line in (_read("/proc/meminfo") or "").splitlines():
-        k, v = line.split(":", 1)
-        parts = v.split()
-        out[k] = int(parts[0]) * (1024 if len(parts) > 1 else 1)
-    return out
+    return host.meminfo()
 
 
 # ---------- per process ----------
 
 def app_name(pid):
     """Group processes by the systemd scope/service the desktop started them in:
-    app-vesktop-2328.scope -> vesktop, wayland-wm@hyprland.desktop.service -> hyprland."""
+    app-vesktop-2328.scope -> vesktop, wayland-wm@hyprland.desktop.service -> hyprland.
+    Without a systemd user session, a user's processes are grouped by program name."""
     cg = _read(f"/proc/{pid}/cgroup", "") or ""
     path = cg.strip().split("::", 1)[-1]
     leaf = path.rsplit("/", 1)[-1]
-    if not leaf or leaf == "init.scope" or "user.slice" not in path:
-        return "system"
-    if leaf.startswith("wayland-wm@"):
-        return "hyprland"
     if leaf.startswith("lodger-"):
-        return "lodger (model)"
+        return OURS
+    if not leaf or leaf == "init.scope" or "user.slice" not in path:
+        return comm(pid) if "user.slice" not in path and _own(pid) else "system"
+    if leaf.startswith("wayland-wm@"):                       # the compositor, as uwsm starts it
+        return re.split(r"[.@]", leaf[len("wayland-wm@"):])[0].lower()
     name = re.sub(r"\.(service|scope|slice)$", "", leaf)
     name = name.encode().decode("unicode_escape")          # gtk\x2dlaunch -> gtk-launch
     if name.startswith("app-"):
         name = name[4:]
-        name = re.sub(r"^Hyprland-", "", name)              # launched by a Hyprland keybind
+        name = re.sub(r"^(Hyprland|gnome|kde|niri|sway)-", "", name)   # launched by the desktop's own launcher
         name = re.sub(r"@.*$", "", name)                    # vesktop@autostart -> vesktop
         name = re.sub(r"-[0-9a-f]{4,}$", "", name)          # trailing launch id
     return name
 
 
+def _own(pid):
+    """Is this process the current user's?"""
+    for line in (_read(f"/proc/{pid}/status") or "").splitlines():
+        if line.startswith("Uid:"):
+            return line.split()[1] == str(os.getuid())
+    return False
+
+
 def pids():
-    return [int(p) for p in os.listdir("/proc") if p.isdigit()]
+    return [int(p) for p in host.listdir("/proc") if p.isdigit()]
 
 
 def comm(pid):
@@ -119,55 +107,26 @@ def pss(pid):
     return int(m.group(1)) * 1024 if m else 0
 
 
-_UNITS = {"": 1, "KiB": 1024, "MiB": MiB, "GiB": GiB}
-
-
-def gpu_clients(pid):
-    """amdgpu clients a process holds: {(pci, client_id): {vram, gtt, busy_ns}}. vram/gtt are resident
-    bytes; busy_ns is the time the card's 3D or compute engine has spent on this client so far."""
-    out = {}
-    fddir = f"/proc/{pid}/fdinfo"
-    try:
-        fds = os.listdir(fddir)
-    except OSError:
-        return out
-    for fd in fds:
-        s = _read(f"{fddir}/{fd}")
-        if not s or "drm-driver:\tamdgpu" not in s:
-            continue
-        kv = dict(line.split(":\t", 1) for line in s.splitlines() if ":\t" in line)
-        key = (kv.get("drm-pdev", "?"), kv.get("drm-client-id", fd))
-        if key in out:
-            continue
-        rec = {"busy_ns": max(int(kv.get(f"drm-engine-{e}", "0 ns").split()[0]) for e in ("gfx", "compute"))}
-        for mem in ("vram", "gtt"):
-            v = kv.get(f"drm-resident-{mem}") or kv.get(f"drm-memory-{mem}") or "0"
-            num, *unit = v.split()
-            rec[mem] = int(num) * _UNITS.get(unit[0] if unit else "", 1)
-        out[key] = rec
-    return out
-
-
 def snapshot(with_pss=True):
     """Everything at one moment. Each GPU client is counted once, for the first process seen
     holding it (a client can be passed between processes)."""
-    seen = set()
     apps = {}
-    for pid in pids():
-        name = app_name(pid)
-        a = apps.setdefault(name, {"vram": {}, "gtt": {}, "pss": 0, "procs": 0, "top": {}})
+    all_pids = pids()
+    names = {pid: app_name(pid) for pid in all_pids}
+    for pid in all_pids:
+        a = apps.setdefault(names[pid], {"vram": {}, "gtt": {}, "pss": 0, "procs": 0, "top": {}})
         a["procs"] += 1
         if with_pss:
             p = pss(pid)
             a["pss"] += p
             c = comm(pid)
             a["top"][c] = a["top"].get(c, 0) + p
-        for key, rec in gpu_clients(pid).items():
-            if key in seen:
+    for d in gpu.devices():
+        for pid, rec in d.usage(all_pids).items():
+            a = apps.get(names.get(pid))
+            if a is None:
                 continue
-            seen.add(key)
-            pci = key[0]
-            a["vram"][pci] = a["vram"].get(pci, 0) + rec["vram"]
-            a["gtt"][pci] = a["gtt"].get(pci, 0) + rec["gtt"]
+            a["vram"][d.pci] = a["vram"].get(d.pci, 0) + rec["vram"]
+            a["gtt"][d.pci] = a["gtt"].get(d.pci, 0) + rec["gtt"]
     apps = {k: v for k, v in apps.items() if v["procs"]}
     return {"cards": cards(), "mem": meminfo(), "apps": apps}

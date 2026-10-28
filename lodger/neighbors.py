@@ -10,20 +10,22 @@ import os
 import time
 
 from . import sysmem
+from .gpu import fdinfo
 
 MiB = sysmem.MiB
 BUSY_FRAC = float(os.environ.get("LODGER_BUSY_FRAC", 0.25))
 BUSY_SECONDS = 3.0
 GROWTH = 512 * MiB
 GROWTH_SECONDS = 5.0
-OURS = "lodger (model)"
+OURS = sysmem.OURS
 
 
 class Neighbors:
-    def __init__(self, card=None):
+    def __init__(self, card=None, ours=None):
         self.card = card or sysmem.dgpu()
-        self.pci = self.card["pci"] if self.card else None
-        self.hist = collections.deque()      # (time, {app: (busy_ns, vram)})
+        self.pci = self.card.pci if self.card else None
+        self.ours = ours or (lambda: ())     # pids of lodger's own model (when it runs without a lodger-* cgroup)
+        self.hist = collections.deque()      # (time, {app: (busy_ns, vram, cycles)})
         self.busy_since = {}                 # app -> time it went over BUSY_FRAC
         self.gpu_pids, self.scanned = {}, 0  # pid -> app, for processes that hold the card (rescanned every 2 s)
 
@@ -33,22 +35,21 @@ class Neighbors:
         if full:
             self.scanned = now
         apps = {}
-        for pid in (sysmem.pids() if full else list(self.gpu_pids)):
-            clients = sysmem.gpu_clients(pid)
-            if not clients:
+        if not self.card:
+            return apps
+        pids = sysmem.pids() if full else list(self.gpu_pids)
+        use = self.card.usage(pids)
+        ours = set(self.ours())
+        for pid in pids:
+            if pid not in use:
                 self.gpu_pids.pop(pid, None)
                 continue
             name = self.gpu_pids.get(pid) or sysmem.app_name(pid)
             self.gpu_pids[pid] = name
-            if name == OURS:
+            if name == OURS or pid in ours:
                 continue
-            b, v = apps.get(name, (0, 0))
-            for (pci, _), rec in clients.items():
-                if pci == self.pci:
-                    b += rec["busy_ns"]
-                    v += rec["vram"]
-            apps[name] = (b, v)
-        return apps
+            fdinfo.add(apps.setdefault(name, fdinfo.empty()), use[pid])
+        return {app: (r["busy_ns"], r["vram"], r["cycles"]) for app, r in apps.items()}
 
     def update(self):
         """Take a sample; return the reason another app needs the card, or None."""
@@ -65,9 +66,14 @@ class Neighbors:
             return None
         t_prev, prev = ref
         reason = None
-        for app, (b, v) in cur.items():
+        for app, (b, v, cyc) in cur.items():
             # an app seen for the first time starts counting from its next sample
-            frac = (b - prev.get(app, (b, 0))[0]) / max(1e-3, now - t_prev) / 1e9
+            b0, _, cyc0 = prev.get(app, (b, 0, cyc))
+            frac = (b - b0) / max(1e-3, now - t_prev) / 1e9
+            for e, (c, tot) in cyc.items():                  # drivers that count cycles (xe)
+                c0, tot0 = cyc0.get(e, (c, tot))
+                if tot > tot0:
+                    frac = max(frac, (c - c0) / (tot - tot0))
             if frac >= BUSY_FRAC:
                 self.busy_since.setdefault(app, t_prev)
                 if now - self.busy_since[app] >= BUSY_SECONDS and not reason:
@@ -76,7 +82,7 @@ class Neighbors:
                 self.busy_since.pop(app, None)
             old = next(((t, s) for t, s in self.hist if now - t <= GROWTH_SECONDS), None)
             if old and not reason:
-                grew = v - old[1].get(app, (0, 0))[1]
+                grew = v - old[1].get(app, (0, 0, {}))[1]
                 if grew >= GROWTH:
                     reason = f"{app} took {grew // MiB} MiB of graphics memory in {now - old[0]:.0f} s"
         return reason

@@ -195,12 +195,8 @@ class Watchdog(threading.Thread):
                                 pids = [int(x) for x in pf.read().split()]
                         except OSError:
                             pids = []
-                        seen = {}
-                        for pid in pids:
-                            seen.update(sysmem.gpu_clients(pid))
-                        pci = self.card["pci"] if self.card else None
-                        mv = sum(v["vram"] for k, v in seen.items() if k[0] == pci)
-                        mg = sum(v["gtt"] for k, v in seen.items() if k[0] == pci)
+                        use = sysmem.gpu_use(self.card, pids)
+                        mv, mg = use["vram"], use["gtt"]
                         ram = read_int(cg + "/memory.current")
                         self.peak["cgroup_ram"] = max(self.peak["cgroup_ram"], read_int(cg + "/memory.peak") or ram or 0)
                     self.peak["model_vram"] = max(self.peak["model_vram"], mv)

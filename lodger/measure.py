@@ -31,8 +31,9 @@ def main(argv):
     signal.signal(signal.SIGINT, lambda *_: stop.append(1))
     signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
 
-    d = sysmem.dgpu()
-    pci = d["pci"] if d else None
+    dev = sysmem.dgpu()
+    pci = dev.pci if dev else None
+    d = next((c for c in sysmem.cards() if c["pci"] == pci), None)
     peaks = {}          # app -> {vram, gtt, vram_igpu, pss}
     totals = []         # (t, vram_used, gtt_used, ram_avail, swap_used)
     t0 = time.time()

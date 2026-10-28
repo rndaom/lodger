@@ -54,11 +54,7 @@ def unit_vram(unit):
             pids = [int(x) for x in f.read().split()]
     except (OSError, TypeError):
         return 0
-    pci = (sysmem.dgpu() or {}).get("pci")
-    seen = {}
-    for pid in pids:
-        seen.update(sysmem.gpu_clients(pid))
-    return sum(v["vram"] for k, v in seen.items() if k[0] == pci)
+    return sysmem.gpu_use(sysmem.dgpu(), pids)["vram"]
 
 
 def pause_flag(unit):

@@ -125,11 +125,7 @@ def game_procs():
 
 
 def game_vram():
-    pci = (sysmem.dgpu() or {}).get("pci")
-    seen = {}
-    for pid in game_procs():
-        seen.update(sysmem.gpu_clients(pid))
-    return sum(v["vram"] for k, v in seen.items() if k[0] == pci)
+    return sysmem.gpu_use(sysmem.dgpu(), game_procs())["vram"]
 
 
 def start_steam(limit=240):
