@@ -5,15 +5,14 @@ import json
 import os
 import subprocess
 
-from . import config, engine, sysmem
+from . import config, engine, reserve, sysmem
 from . import gpu as gpus
 from .model import Model
 
 MiB, GiB = sysmem.MiB, sysmem.GiB
 AUTO = object()                  # make(card=AUTO): the card lodger chose (gpus.choose)
 
-# Margins (see NOTES.md "How the launcher decides")
-VRAM_KEEP_FREE = 2048 * MiB      # never plan to leave less than this free on the card
+# Margins (see NOTES.md "How lodger decides"). Graphics memory kept for the desktop: reserve.py.
 EST_MARGIN = 0.10                # our estimate can be this much too low ...
 EST_MARGIN_FIXED = 256 * MiB     # ... plus this
 HIP_OVERHEAD = 512 * MiB         # HIP runtime, memory pools, staging (grew ~0.35 GiB at runtime on 2026-10-25)
@@ -137,20 +136,25 @@ def with_margin(x):
 
 def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu=0,
          vram_free=None, ram_avail=None, threads=None, why_gpu_off=None, device_check=False, extra=(),
-         card=AUTO, mem=None):
+         card=AUTO, mem=None, keep=None):
     """Return a plan dict, or one with plan["refuse"] set to the reason.
     target_ctx: context to aim for; None = automatic (see CTX_CAP, CTX_SHARE).
     device_check: also ask llama.cpp for its own estimate on the card (starts the card's driver briefly).
-    card: the graphics card (default: the one lodger chose; None: there is none); mem: /proc/meminfo numbers.
-    model_path may also be a Model."""
+    card: the graphics card (default: the one lodger chose; None: there is none); mem: /proc/meminfo numbers;
+    keep: graphics memory to leave for the desktop (default: reserve.py). model_path may also be a Model."""
     m = model_path if isinstance(model_path, Model) else Model(model_path)
     L = m.n_layer
     why = []
     card = sysmem.dgpu() if card is AUTO else card
     mem = sysmem.meminfo() if mem is None else mem
+    cfg = config.get()
     live = vram_free is None                    # not a --pretend plan
     if card is None:
-        no_card = gpus.why_none(config.get()["gpu"])
+        no_card = gpus.why_none(cfg["gpu"])
+    elif live and card.asleep() and not cfg["wake_gpu"]:
+        no_card = "the graphics card is asleep (power saving); lodger doesn't wake it (wake_gpu in config.toml)"
+    elif live and not card.integrated and gpus.power_source()[0] == "battery" and not cfg["gpu_on_battery"]:
+        no_card = "the PC is on battery; lodger starts work on the graphics card only when plugged in (gpu_on_battery)"
     elif live and card.free(meminfo=mem) is None:
         no_card = card.why_unknown() or "its free memory can't be read"
     else:
@@ -160,7 +164,13 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
     ram_avail = mem["MemAvailable"] if ram_avail is None else ram_avail
     ram_keep = max(RAM_KEEP_FREE_MIN, int(mem["MemTotal"] * RAM_KEEP_FREE_FRAC))
     ram_budget = ram_avail - ram_keep
-    keep = VRAM_KEEP_FREE
+    shared = bool(card and card.integrated)
+    if shared:
+        # built-in graphics take their memory from RAM: never more than RAM can spare
+        vram_free = max(0, min(vram_free, ram_budget))
+    keep_why = None
+    if keep is None:
+        keep, keep_why = reserve.reserve(card.pci, card.total(meminfo=mem)) if card else (reserve.floor(0), None)
     vram_budget = vram_free - keep - leave_gpu
 
     auto = target_ctx is None
@@ -177,14 +187,18 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
         "model": m.path, "name": m.meta.get("name"), "arch": m.meta.get("arch"),
         "layers": L, "moe": m.is_moe, "model_bytes": m.total,
         "vram_free": vram_free, "vram_budget": vram_budget, "ram_avail": ram_avail, "ram_budget": ram_budget,
-        "keep": keep,
+        "keep": keep, "shared_memory": shared,
         "threads": threads or max(2, physical_cores() - 2),
         "why": why, "refuse": None,
     }
     why.append(f"Model: {m.meta.get('name')} ({m.meta.get('arch')}), {m.total / GiB:.1f} GiB, {L} layers"
                + (f", mixture of experts ({m.meta.get('expert_used')} of {m.meta.get('expert_count')} experts per word)"
                   if m.is_moe else "") + ".")
-    why.append(f"Free right now: {vram_free / GiB:.1f} GiB on the graphics card, {ram_avail / GiB:.1f} GiB RAM.")
+    why.append(f"Free right now: {vram_free / GiB:.1f} GiB on the graphics card, {ram_avail / GiB:.1f} GiB RAM."
+               if not shared else f"Free right now: {ram_avail / GiB:.1f} GiB RAM, shared by the processor and its built-in "
+               f"graphics; the graphics can take {vram_free / GiB:.1f} GiB of it (what RAM can spare, within its GTT limit).")
+    if keep_why:
+        why.append(f"Desktop reserve: {keep_why}.")
     why.append(f"Kept back: {keep / GiB:.1f} GiB of graphics memory for the desktop"
                + (f" + {leave_gpu / GiB:.1f} GiB you asked to leave" if leave_gpu else "")
                + f", {ram_keep / GiB:.1f} GiB RAM for everything else. "
@@ -227,6 +241,11 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
         plan.update(ngl=0, ngl_layers=0, n_cpu_moe=0, ctx=None, output_on_gpu=False, gpu_bytes=0, gpu_est=0)
     else:
         plan.update(gpu)
+        if shared:
+            ram_budget -= gpu["gpu_bytes"]          # what the built-in graphics take is gone from RAM
+            plan["ram_budget"] = ram_budget
+            why.append(f"The built-in graphics' part ({gpu['gpu_bytes'] / GiB:.1f} GiB) comes out of RAM; "
+                       f"{max(0, ram_budget) / GiB:.1f} GiB RAM is left for the rest.")
     on_cpu_layers = set(range(L - plan["ngl_layers"]))
     experts_on_cpu = on_cpu_layers | set(range(plan["n_cpu_moe"]))
 

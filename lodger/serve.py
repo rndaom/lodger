@@ -30,7 +30,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import catalog, engine, plan as planner, sysmem
+from . import catalog, engine, plan as planner, reserve, sysmem
 from .launch import GAME_GUARD_FLAG, RUNS, Watchdog, gpu_blockers, router_coming, unit_cgroup, unit_props
 from .neighbors import Neighbors
 
@@ -108,7 +108,7 @@ class Engine:
         # own session: Ctrl-C in the terminal reaches lodger only, which then stops the engine itself
         self.proc = subprocess.Popen(sr + cmd, stdin=subprocess.DEVNULL, stdout=self.logf, stderr=subprocess.STDOUT,
                                      start_new_session=True)
-        self.wd = Watchdog(self.unit, bool(p["ngl"]), out, log=os.path.join(out, "engine.log"))
+        self.wd = Watchdog(self.unit, bool(p["ngl"]), out, log=os.path.join(out, "engine.log"), keep=p["keep"])
         self.wd.start()
         self.started = time.time()
         Engine.all.append(self)
@@ -408,12 +408,16 @@ class Lodger:
     def monitor(self):
         """Switches models, steps aside / grows back, sleeps. Runs for the life of `lodger serve`."""
         nb = Neighbors()
+        last_note = 0.0
         while not self.closing:
             time.sleep(1)
             if self.closing:
                 return
             if nb.update() or self.others_coming():
                 self.quiet_since = time.time()
+            elif time.time() - last_note >= 10:
+                last_note = time.time()
+                self.note_desktop()
             e = self.engine
             # another model wanted: switch once nothing is being written with this one
             if self.switch_to and self.switch_to is not self.cur and (not e or not self.busy.get(e)):
@@ -493,6 +497,17 @@ class Lodger:
                 old = self.install(new)
                 if old:
                     old.stop()                          # an answer still being written there continues on the card
+
+    def note_desktop(self):
+        """While no app needs the card: note how much of it everything but our model uses (reserve.py)."""
+        card = sysmem.dgpu()
+        m = card.memory() if card and not card.asleep() else None
+        if not m:
+            return
+        e = self.engine
+        ours = e.wd.now["gtt" if card.integrated else "vram"] if e and e.where == "card" and e.alive() else 0
+        used = (m["gtt_used"] or 0) if card.integrated else m["used"]
+        reserve.note(card.pci, max(0, used - ours))
 
     def status(self):
         e = self.engine

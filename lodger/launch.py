@@ -22,14 +22,13 @@ import sys
 import threading
 import time
 
-from . import config, engine, plan as planner, sysmem
+from . import config, engine, plan as planner, reserve, sysmem
 from .neighbors import Neighbors
 
 MiB, GiB = sysmem.MiB, sysmem.GiB
 RUNS = config.runs_dir()
-# watchdog: stop the model if the card has less than this free, or RAM available falls under this.
+# watchdog: stop the model if RAM available falls under this (graphics memory: reserve.kill_line).
 # LODGER_KILL_*_MIB can only raise these (used to test the stop path), never lower them.
-KILL_VRAM_FREE = max(1536, int(os.environ.get("LODGER_KILL_VRAM_FREE_MIB", 0))) * MiB
 KILL_RAM_AVAIL = max(1536, int(os.environ.get("LODGER_KILL_RAM_AVAIL_MIB", 0))) * MiB
 LOAD_SECONDS = 90          # watch faster while the model loads (its biggest allocations happen then)
 # ~/.local/bin/llama-game-guard leaves this while it has llama-router stopped for a game; the router comes back after
@@ -135,13 +134,15 @@ def read_int(path):
 
 
 class Watchdog(threading.Thread):
-    def __init__(self, unit, on_gpu, out, log=None):
+    def __init__(self, unit, on_gpu, out, log=None, keep=None):
         super().__init__(daemon=True)
+        self.kill_vram = reserve.kill_line(keep if keep is not None else reserve.floor(0))
         self.unit, self.on_gpu, self.out = unit, on_gpu, out
         self.log, self.device_seen = log, False   # the engine's log: is it on the card lodger chose?
         self.stop_flag = threading.Event()
         self.reason = None
         self.peak = {"model_vram": 0, "model_gtt": 0, "cgroup_ram": 0}
+        self.now = {"vram": 0, "gtt": 0}
         self.low = {"vram_free": None, "ram_avail": None}
         self.card = sysmem.dgpu()
         self.neighbors = Neighbors(self.card) if on_gpu else None
@@ -186,8 +187,8 @@ class Watchdog(threading.Thread):
                 ra = sysmem.meminfo()["MemAvailable"]
                 self.low["vram_free"] = vf if self.low["vram_free"] is None else min(self.low["vram_free"], vf)
                 self.low["ram_avail"] = ra if self.low["ram_avail"] is None else min(self.low["ram_avail"], ra)
-                if self.on_gpu and self.card and vf < KILL_VRAM_FREE:   # stopping a processor-only model frees no VRAM
-                    self.kill(f"only {vf // MiB} MiB of graphics memory left (limit {KILL_VRAM_FREE // MiB})")
+                if self.on_gpu and self.card and vf < self.kill_vram:   # stopping a processor-only model frees no VRAM
+                    self.kill(f"only {vf // MiB} MiB of graphics memory left (limit {self.kill_vram // MiB})")
                 elif ra < KILL_RAM_AVAIL:
                     self.kill(f"only {ra // MiB} MiB of RAM left (limit {KILL_RAM_AVAIL // MiB})")
                 elif self.on_gpu and self.log and not self.device_seen and self.check_device():
@@ -212,6 +213,7 @@ class Watchdog(threading.Thread):
                         mv, mg = use["vram"], use["gtt"]
                         ram = read_int(cg + "/memory.current")
                         self.peak["cgroup_ram"] = max(self.peak["cgroup_ram"], read_int(cg + "/memory.peak") or ram or 0)
+                    self.now = {"vram": mv, "gtt": mg}
                     self.peak["model_vram"] = max(self.peak["model_vram"], mv)
                     self.peak["model_gtt"] = max(self.peak["model_gtt"], mg)
                     f.write(f"{now - t0:.1f}\t{vf // MiB}\t{ra // MiB}\t{mv // MiB}\t{mg // MiB}\t{(ram or 0) // MiB}\n")
@@ -271,7 +273,7 @@ def do_run(a):
     with open(os.path.join(out, "plan.json"), "w") as f:
         json.dump({**p, "cmd": cmd, "env": env, "cgroup": props}, f, indent=1)
 
-    wd = Watchdog(unit, bool(p["ngl"]), out, log=None if interactive else os.path.join(out, "log.txt"))
+    wd = Watchdog(unit, bool(p["ngl"]), out, log=None if interactive else os.path.join(out, "log.txt"), keep=p["keep"])
     wd.start()
     t0 = time.time()
     signal.signal(signal.SIGINT, lambda *_: wd.kill("you pressed Ctrl+C", graceful=True))
