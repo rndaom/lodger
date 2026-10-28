@@ -22,6 +22,7 @@ import threading
 import time
 
 from . import config, engine, fence, plan as planner, reserve, sysmem
+from .gpu import fdinfo
 from .neighbors import Neighbors
 
 MiB, GiB = sysmem.MiB, sysmem.GiB
@@ -30,6 +31,7 @@ RUNS = config.runs_dir()
 # LODGER_KILL_*_MIB can only raise these (used to test the stop path), never lower them.
 KILL_RAM_AVAIL = max(1536, int(os.environ.get("LODGER_KILL_RAM_AVAIL_MIB", 0))) * MiB
 LOAD_SECONDS = 90          # watch faster while the model loads (its biggest allocations happen then)
+OTHER_CARD = 256 * MiB     # the model holding this much on a card lodger didn't choose: wrong card, stop it
 # The author's own setup (extras.llama_router in config.toml): ~/.local/bin/llama-game-guard leaves this while it
 # has llama-router stopped for a game; the router comes back after
 GAME_GUARD_FLAG = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"),
@@ -133,7 +135,7 @@ class Watchdog(threading.Thread):
         super().__init__(daemon=True)
         self.kill_vram = reserve.kill_line(keep if keep is not None else reserve.floor(0))
         self.fenced, self.on_gpu, self.out = fenced, on_gpu, out
-        self.log, self.device_seen = log, False   # the engine's log: is it on the card lodger chose?
+        self.log, self.device_seen = log, False   # the engine's log, if llama.cpp says there which card it uses
         self.stop_flag = threading.Event()
         self.reason = None
         self.peak = {"model_vram": 0, "model_gtt": 0, "cgroup_ram": 0}
@@ -155,13 +157,24 @@ class Watchdog(threading.Thread):
         self.fenced.kill(signal.SIGKILL)
 
     def check_device(self):
-        """Stop the engine if llama.cpp says it uses another card than the one lodger chose. True if stopped."""
+        """Stop the engine if it uses another card than the one lodger chose (or any card, on the processor
+        only). The kernel's fdinfo shows where the model's graphics memory is (amdgpu, i915, xe; not NVIDIA's
+        driver); llama.cpp's 'using device' line counts too, where its log has one (most builds print it
+        only at a higher log level). True if stopped."""
+        mine = self.card.pci if self.on_gpu and self.card else None
+        for pci, used in fdinfo.per_card(self.fenced.pids()).items():
+            if pci != mine and used >= OTHER_CARD:
+                self.kill(f"the model put {used // MiB} MiB on the graphics card at {pci}, "
+                          + (f"not on the one lodger chose ({mine})" if mine else "but it was meant to run on the processor only"))
+                return True
+        if not (self.on_gpu and self.card and self.log) or self.device_seen:
+            return False
         try:
             with open(self.log, errors="replace") as f:
                 text = f.read(1 << 20)
         except OSError:
             return False
-        if self.card and engine.USING.search(text):
+        if engine.USING.search(text):
             self.device_seen = True
             why = engine.check_log(text, self.card)
             if why:
@@ -171,12 +184,15 @@ class Watchdog(threading.Thread):
 
     def run(self):
         t0 = time.time()
-        last_nb = last_log = 0.0
+        last_nb = last_log = last_dev = 0.0
         with open(os.path.join(self.out, "watch.tsv"), "w") as f:
             f.write("t\tvram_free_MiB\tram_avail_MiB\tmodel_vram_MiB\tmodel_gtt_MiB\tmodel_ram_MiB\n")
             while not self.stop_flag.is_set():
                 now = time.time()
                 loading = now - t0 < LOAD_SECONDS
+                dev_due = now - last_dev >= (0.1 if loading else 1.0)   # which card is the model on?
+                if dev_due:
+                    last_dev = now
                 vf = sysmem.vram_free(self.card)                       # cheap: checked every tick
                 ra = sysmem.meminfo()["MemAvailable"]
                 self.low["vram_free"] = vf if self.low["vram_free"] is None else min(self.low["vram_free"], vf)
@@ -187,7 +203,7 @@ class Watchdog(threading.Thread):
                     self.kill(f"only {ra // MiB} MiB of RAM left (limit {KILL_RAM_AVAIL // MiB})")
                 elif self.fenced.over_cap():                           # no kernel fence on this PC: we are the fence
                     self.kill(f"the model went over its RAM cap ({self.fenced.cap // MiB} MiB)")
-                elif self.on_gpu and self.log and not self.device_seen and self.check_device():
+                elif dev_due and self.check_device():
                     pass
                 elif self.on_gpu and now - last_nb >= 0.25:
                     last_nb = now
