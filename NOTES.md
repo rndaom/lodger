@@ -125,6 +125,17 @@ nothing is lost.
   60 s, lodger makes a fresh plan; if it fits, it loads the card engine *while the processor engine keeps
   answering*, then swaps. If the model has to step aside again within 10 min of growing back, the quiet
   wait doubles (60, 120, 240 ... up to 30 min), so a game sitting in its menu doesn't make it bounce.
+- **Context is automatic** (`plan.CTX_CAP`, `CTX_SHARE`): as long as the model can take, up to 128K, as
+  long as it costs at most a quarter of the memory the model may use there. It is decided once per session
+  (the shorter of the card's and the processor's), so a conversation that fits on the card still fits
+  after a move. `--ctx N` overrides. /v1/models reports it (`context_window`).
+- **Other AI servers** (`--pause SERVICE`, e.g. `llama-router`): while that service is idle (holds no
+  graphics memory), lodger stops it before taking the card and starts it again when the model leaves
+  the card (step aside, sleep, exit; `lodger unpause` after a crash). While it has a model loaded,
+  lodger stays on the processor. Without `--pause`, a running router keeps lodger off the card.
+- **pi**: `lodger pi [pi options]` opens pi on the served model, from `~/.local/state/lodger/pi` (links
+  to your `~/.pi/agent` files plus a models.json with a `lodger` provider), so `~/.pi` isn't changed.
+  A move in the middle of a tool call ends that answer with an error (pi retries); plain text continues.
 - The safety exception (lodger may start our build's `llama-server`, local only) is written in
   `../CLAUDE.md` and the Claude hook's comment.
 The Steam Deck is **not** part of this: llama-router keeps serving it exactly as today, and lodger keeps
@@ -264,3 +275,18 @@ separate, later question (see "Later").
   don't use it (tested: asleep at start, ~5 s to wake for the 9B, unloads, wakes again). The service runs
   the 35B with `--idle 10`; first question after login: 16 s (planning 4 s, loading 9 s, answer).
   While llama-router runs (always, for the Deck) lodger stays on the processor (~16 words/s), by design.
+
+- 2026-10-28 13:00 user asked for: automatic context, a fix for "stuck on the processor", and pi as the
+  way to talk to models. Done (see Server): 35B gets 128K context on this PC (17 of 40 expert layers on
+  the card instead of 23 at 16K; 48-51 words/s), the 9B on the processor 64K.
+  Tested on the card with llama-router running: router paused when the model took the card, started
+  again when it unloaded, stepped aside (memory grab mid-answer: answer finished on the processor) or
+  was moved, paused again on grow-back, started again on exit. pi through lodger read a file with its
+  tool. No graphics-card errors, no crashes.
+  Not yet in the login service: `--pause llama-router` changes what the Deck sees (its server is off
+  while the PC uses the card), so it waits for the user's OK. Until then the service stays on the
+  processor while the router runs.
+  Found: a background job started from a script ignores Ctrl-C, so `lodger serve` now sets its own
+  Ctrl-C handler.
+- Project home: lodger stays its own project, separate from 0xSero's Local AI (different job: sharing the
+  PC, not picking and launching recipes). It speaks the standard API, so any of those tools can use it.

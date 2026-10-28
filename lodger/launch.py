@@ -1,6 +1,6 @@
 """lodger plan / lodger run: run a model on what is free right now, fenced in and watched.
 
-  lodger plan MODEL [--ctx 16384] [--cpu-only] [--leave-gpu MiB] [--allow-gpu] [--pretend-vram-free MiB] [--pretend-ram-avail MiB]
+  lodger plan MODEL [--ctx N] [--cpu-only] [--leave-gpu MiB] [--allow-gpu] [--pretend-vram-free MiB] [--pretend-ram-avail MiB]
   lodger run  MODEL [same options] [--prompt TEXT] [-n 256] [--runtime SEC]
 
 plan: say what would go where, and why, without starting anything.
@@ -316,7 +316,7 @@ def main(argv):
     ap = argparse.ArgumentParser(prog="lodger", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("action", choices=["plan", "run"])
     ap.add_argument("model")
-    ap.add_argument("--ctx", type=int, default=16384, help="context length to aim for (words/tokens)")
+    ap.add_argument("--ctx", type=int, help="context length to aim for (words/tokens; default: automatic)")
     ap.add_argument("--min-ctx", type=int, default=planner.MIN_CTX)
     ap.add_argument("--cpu-only", action="store_true")
     ap.add_argument("--allow-gpu", action="store_true", help="the graphics card may be used")

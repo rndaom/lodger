@@ -7,6 +7,8 @@
   lodger stress MODEL ...   check nothing crashes while sharing the PC
   lodger serve MODEL ...    keep a model ready for apps on this PC (steps aside, grows back)
   lodger ask "question"     ask the model lodger is serving
+  lodger pi [pi options]    talk to it in pi (your pi setup, untouched)
+  lodger unpause            start again any service lodger paused (after a crash)
   lodger stress-serve MODEL check serve steps aside and grows back without crashing anything
 
 `lodger <command> --help` for the options."""
@@ -29,8 +31,8 @@ if __name__ == "__main__":
     if cmd == "stress-serve":
         from lodger import servetest
         sys.exit(servetest.main(sys.argv[2:]))
-    if cmd in ("serve", "ask"):
+    if cmd in ("serve", "ask", "pi", "unpause"):
         from lodger import serve
-        sys.exit(getattr(serve, cmd)(sys.argv[2:]))
+        sys.exit(getattr(serve, {"unpause": "unpause_all"}.get(cmd, cmd))(sys.argv[2:]))
     print(__doc__)
     sys.exit(0 if cmd in ("", "-h", "--help", "help") else 2)

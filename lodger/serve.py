@@ -28,13 +28,49 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import plan as planner, sysmem
-from .launch import RUNS, Watchdog, gpu_blockers, router_coming, unit_props
+from .launch import GAME_GUARD_FLAG, RUNS, Watchdog, gpu_blockers, router_coming, unit_cgroup, unit_props
 from .neighbors import Neighbors
 
 MiB, GiB = sysmem.MiB, sysmem.GiB
 HOST = "127.0.0.1"          # only this PC; part of the approved exception (../CLAUDE.md)
 QUIET_SECONDS = 60          # the card must be quiet this long before the model grows back
 MOVE_WAIT = 300             # how long a request waits for the model to be ready
+PAUSE_IDLE_VRAM = 128 * MiB  # a --pause service holding less graphics memory than this counts as idle
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+
+
+def unit_active(unit):
+    return subprocess.run(["systemctl", "--user", "is-active", "-q", unit]).returncode == 0
+
+
+def unit_vram(unit):
+    """Graphics memory the processes of a systemd user service hold on the card."""
+    cg = unit_cgroup(unit)
+    try:
+        with open(cg + "/cgroup.procs") as f:
+            pids = [int(x) for x in f.read().split()]
+    except (OSError, TypeError):
+        return 0
+    pci = (sysmem.dgpu() or {}).get("pci")
+    seen = {}
+    for pid in pids:
+        seen.update(sysmem.gpu_clients(pid))
+    return sum(v["vram"] for k, v in seen.items() if k[0] == pci)
+
+
+def pause_flag(unit):
+    return os.path.join(RUNTIME_DIR, f"lodger.paused-{unit}")
+
+
+def unpause_all(argv=()):
+    """Start again every service lodger paused (also after a crash: `lodger unpause`)."""
+    for name in sorted(os.listdir(RUNTIME_DIR)):
+        if name.startswith("lodger.paused-"):
+            unit = name[len("lodger.paused-"):]
+            subprocess.run(["systemctl", "--user", "start", unit], capture_output=True)
+            os.remove(os.path.join(RUNTIME_DIR, name))
+            log(f"started {unit} again")
+    return 0
 
 
 def log(msg):
@@ -146,6 +182,8 @@ class Lodger:
         self.asleep = bool(a.idle)            # with --idle: load the model on the first request, not at start
         self.wake = False
         self.last_used = time.time()
+        self.ctx = a.ctx                      # one context for the whole session (decide_ctx), so a conversation
+                                              # that fits on the card still fits after a move to the processor
         self.out = os.path.join(RUNS, time.strftime("%Y-%m-%d-%H%M%S") + "-serve-" + a.name)
         os.makedirs(self.out)
 
@@ -153,19 +191,79 @@ class Lodger:
         log(text)
         self.events = (self.events + [(time.strftime("%H:%M:%S"), text)])[-20:]
 
+    def decide_ctx(self):
+        """The session's context: automatic (see plan.CTX_CAP/CTX_SHARE) for where the model may run, the
+        shorter of card and processor, so it fits wherever the model ends up. Planning only, nothing loads."""
+        if self.ctx:
+            return
+        ctxs = []
+        try:
+            p = planner.make(self.a.model, cpu_only=True, threads=self.a.threads, why_gpu_off="deciding the context")
+            if not p["refuse"]:
+                ctxs.append(p["ctx"])
+            if self.a.allow_gpu:
+                p = planner.make(self.a.model, leave_gpu=self.a.leave_gpu * MiB, threads=self.a.threads)
+                if not p["refuse"] and p["ngl"]:
+                    ctxs.append(p["ctx"])
+        except (Exception, SystemExit) as ex:
+            log(f"couldn't work out the context ({ex}); using {planner.MIN_CTX}")
+        self.ctx = min(ctxs) if ctxs else planner.MIN_CTX
+        log(f"context for this session: {self.ctx} words")
+
     def make_plan(self, on_card):
         try:
-            return planner.make(self.a.model, target_ctx=self.a.ctx, min_ctx=self.a.min_ctx, cpu_only=not on_card,
+            return planner.make(self.a.model, target_ctx=self.ctx, min_ctx=self.ctx if on_card else self.a.min_ctx,
+                                cpu_only=not on_card,
                                 leave_gpu=self.a.leave_gpu * MiB, threads=self.a.threads, device_check=on_card,
                                 why_gpu_off=None if on_card else (self.why_off_card or "the card is not wanted now"))
         except (Exception, SystemExit) as ex:   # a failed llama.cpp probe must not take the server down
             return {"refuse": f"planning failed: {ex}"}
 
+    def pausable_busy(self):
+        for u in self.a.pause:
+            if unit_active(u) and unit_vram(u) >= PAUSE_IDLE_VRAM:
+                return f"{u} has a model loaded on the graphics card (it's being used)"
+        return None
+
+    def others_coming(self):
+        """Is another AI server about to need the card? Services in --pause count only while busy."""
+        if os.path.exists(GAME_GUARD_FLAG):
+            return "llama-game-guard paused llama-router for a game"
+        busy = self.pausable_busy()
+        if busy:
+            return busy
+        return None if "llama-router" in self.a.pause else router_coming()
+
+    def pause_others(self):
+        """Stop idle --pause services before the model takes the card (they could load a model at any moment)."""
+        for u in self.a.pause:
+            if unit_active(u):
+                subprocess.run(["systemctl", "--user", "stop", u], capture_output=True)
+                open(pause_flag(u), "w").close()
+                self.note(f"paused {u} (idle) while the model uses the graphics card")
+
+    def unpause(self):
+        for u in self.a.pause:
+            if os.path.exists(pause_flag(u)):
+                subprocess.run(["systemctl", "--user", "start", u], capture_output=True)
+                os.remove(pause_flag(u))
+                self.note(f"started {u} again (the model left the graphics card)")
+
     def launch(self, want_card, card_only=False):
+        e = self._launch(want_card, card_only)
+        if not (e and e.where == "card") and not (self.engine and self.engine.where == "card" and self.engine.alive()):
+            self.unpause()                       # the card isn't ours after all
+        return e
+
+    def _launch(self, want_card, card_only=False):
         """Start an engine (card if wanted and possible, else processor) and wait until it answers.
         card_only: give up instead of falling back to the processor. Returns the Engine, or None."""
         if want_card:
-            self.why_off_card = gpu_blockers(self.a.allow_gpu, sysmem.dgpu())
+            self.why_off_card = self.a.allow_gpu and self.pausable_busy()
+            if not self.why_off_card:
+                if self.a.allow_gpu:
+                    self.pause_others()
+                self.why_off_card = gpu_blockers(self.a.allow_gpu, sysmem.dgpu())
         if card_only and self.why_off_card:
             return None
         p = self.make_plan(want_card and not self.why_off_card)
@@ -234,7 +332,7 @@ class Lodger:
             time.sleep(1)
             if self.closing:
                 return
-            if nb.update() or router_coming():
+            if nb.update() or self.others_coming():
                 self.quiet_since = time.time()
             if self.asleep:
                 if self.wake:
@@ -254,6 +352,7 @@ class Lodger:
                 self.note(f"unused for {self.a.idle} min: unloading the model until the next request")
                 e.stop()
                 self.card_since = None
+                self.unpause()
                 continue
             if e and not e.alive():
                 reason = e.wd.reason
@@ -268,6 +367,8 @@ class Lodger:
                     self.note(f"the {e.where} engine stopped" + (f": {reason}" if reason else
                               f" unexpectedly (see {e.out}/engine.log)"))
                     time.sleep(3)
+                if e.where == "card":
+                    self.unpause()
                 self.bring_up(want_card=False)          # straight back up on the processor
                 continue
             if self.force_off_card and e and e.where == "card":
@@ -278,6 +379,7 @@ class Lodger:
                 with self.cv:
                     self.ready = False
                 e.stop()
+                self.unpause()
                 self.bring_up(want_card=False)
                 continue
             # grow back: on the processor, card allowed, nothing being written, card quiet for a while
@@ -303,7 +405,7 @@ class Lodger:
         e = self.engine
         return {"model": self.a.name, "ready": self.ready, "where": "asleep" if self.asleep else e.where if e else None,
                 "why": self.why,
-                "answers_in_progress": self.active, "quiet_needed_s": self.quiet_needed,
+                "context": self.ctx, "answers_in_progress": self.active, "quiet_needed_s": self.quiet_needed,
                 "card_quiet_for_s": round(time.time() - self.quiet_since),
                 "plan": {k: e.plan[k] for k in ("ngl", "n_cpu_moe", "ctx", "gpu_est")} if e else None,
                 "events": self.events}
@@ -330,7 +432,9 @@ def make_handler(lodger):
                     return self.send_json(200, {"status": "ok", "asleep": True})
                 return self.send_json(200 if lodger.ready else 503, {"status": "ok" if lodger.ready else "loading"})
             if self.path == "/v1/models":
-                return self.send_json(200, {"object": "list", "data": [{"id": lodger.a.name, "object": "model", "owned_by": "lodger"}]})
+                return self.send_json(200, {"object": "list", "data": [{
+                    "id": lodger.a.name, "object": "model", "owned_by": "lodger", "context_window": lodger.ctx,
+                    "reasoning": lodger.a.think, "meta": {"n_ctx": lodger.ctx}}]})
             if self.path == "/lodger/status":
                 return self.send_json(200, lodger.status())
             self.send_json(404, {"error": "not found"})
@@ -391,7 +495,7 @@ def make_handler(lodger):
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "close")
             self.end_headers()
-            content, reasoning, pieces = "", "", 0
+            content, reasoning, pieces, tooling = "", "", 0, False
             limit = body.get("max_tokens") or body.get("max_completion_tokens") or body.get("n_predict")
             for attempt in range(6):
                 e = lodger.wait_engine()
@@ -433,6 +537,7 @@ def make_handler(lodger):
                                 delta = (d.get("choices") or [{}])[0].get("delta") or {}
                                 if delta.get("content") or delta.get("reasoning_content"):
                                     pieces += 1
+                                tooling = tooling or bool(delta.get("tool_calls"))
                                 content += delta.get("content") or ""
                                 reasoning += delta.get("reasoning_content") or ""
                             except ValueError:
@@ -442,6 +547,9 @@ def make_handler(lodger):
                             return
                 except (OSError, http.client.HTTPException):
                     if self.client_gone:
+                        return
+                    if tooling:                 # half a tool call can't be continued; the app asks again
+                        self.event(f'data: {json.dumps({"error": {"message": "the model moved while writing a tool call; please retry"}})}')
                         return
                     # the engine moved: wait until it is gone or replaced (a short hiccup retries the same one)
                     t0 = time.time()
@@ -471,7 +579,7 @@ def serve(argv):
     ap.add_argument("--allow-gpu", action="store_true", help="the graphics card may be used")
     ap.add_argument("--port", type=int, default=8181)
     ap.add_argument("--name", help="model name apps see (default: from the file)")
-    ap.add_argument("--ctx", type=int, default=16384)
+    ap.add_argument("--ctx", type=int, help="context length (default: automatic, from the model and this PC)")
     ap.add_argument("--min-ctx", type=int, default=planner.MIN_CTX)
     ap.add_argument("--leave-gpu", type=int, default=0, metavar="MiB")
     ap.add_argument("--threads", type=int)
@@ -479,12 +587,19 @@ def serve(argv):
     ap.add_argument("--idle", type=float, default=0, metavar="MIN",
                     help="unload the model after MIN minutes unused, and load it on the next request "
                          "(it then also waits for the first request before loading); 0 = keep it loaded")
+    ap.add_argument("--pause", action="append", default=[], metavar="SERVICE",
+                    help="a systemd user service running another AI server (e.g. llama-router): while it is idle, "
+                         "lodger stops it before using the graphics card and starts it again when it leaves the "
+                         "card; while it has a model loaded, lodger stays off the card. Repeatable.")
     a = ap.parse_args(argv)
     a.name = a.name or re.sub(r"(?i)\.gguf$", "", os.path.basename(a.model))
     lodger = Lodger(a)
+    unpause_all()                                # left over from a crash
+    lodger.decide_ctx()
     httpd = ThreadingHTTPServer((HOST, a.port), make_handler(lodger))
     httpd.daemon_threads = True
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
+    signal.signal(signal.SIGINT, signal.default_int_handler)   # also when started in the background of a script
     log(f"lodger serving {a.name} at http://{HOST}:{a.port}/v1 (only this PC); logs in {lodger.out}")
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
@@ -503,6 +618,7 @@ def serve(argv):
         httpd.shutdown()
         for e in Engine.all:                     # also one still loading for a move
             e.stop()
+        lodger.unpause()
     return 0
 
 
@@ -539,3 +655,46 @@ def ask(argv):
     if timings:
         print(f"[{timings.get('predicted_per_second', 0):.1f} words/s writing, {time.time() - t0:.0f} s total]", file=sys.stderr)
     return 0
+
+
+def pi(argv):
+    """`lodger pi [pi options]`: open pi talking to the model lodger serves. Your own pi setup (settings,
+    themes, skills, sign-ins, your models.json) is used as it is, from a separate folder: nothing in
+    ~/.pi is changed."""
+    port = 8181
+    if argv[:1] == ["--port"]:
+        port, argv = int(argv[1]), argv[2:]
+    try:
+        c = http.client.HTTPConnection(HOST, port, timeout=5)
+        c.request("GET", "/v1/models")
+        m = json.loads(c.getresponse().read())["data"][0]
+    except (OSError, ValueError, KeyError, IndexError):
+        print(f"lodger isn't serving on port {port}. Start it:  systemctl --user start lodger", file=sys.stderr)
+        return 1
+    home = os.environ.get("PI_CODING_AGENT_DIR") or os.path.expanduser("~/.pi/agent")
+    ag = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "lodger", "pi")
+    os.makedirs(ag, exist_ok=True)
+    for name in os.listdir(home) if os.path.isdir(home) else []:
+        dst = os.path.join(ag, name)
+        if name != "models.json" and not os.path.lexists(dst):
+            os.symlink(os.path.join(home, name), dst)
+    try:
+        with open(os.path.join(home, "models.json")) as f:
+            models = json.load(f)
+    except (OSError, ValueError):
+        models = {}
+    ctx = m.get("context_window") or planner.MIN_CTX
+    models.setdefault("providers", {})["lodger"] = {
+        "baseUrl": f"http://{HOST}:{port}/v1", "apiKey": "lodger", "api": "openai-completions",
+        "models": [{"id": m["id"], "name": f"{m['id']} (lodger, this PC)", "reasoning": bool(m.get("reasoning")),
+                    "contextWindow": ctx, "maxTokens": min(32768, ctx // 4), "input": ["text"],
+                    "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                    "compat": {"supportsDeveloperRole": False}}]}
+    with open(os.path.join(ag, "models.json"), "w") as f:
+        json.dump(models, f, indent=1)
+    env = dict(os.environ, PI_CODING_AGENT_DIR=ag)
+    try:
+        os.execvpe("pi", ["pi", "--provider", "lodger", "--model", m["id"]] + argv, env)
+    except FileNotFoundError:
+        print("pi isn't installed (https://github.com/earendil-works/pi)", file=sys.stderr)
+        return 1

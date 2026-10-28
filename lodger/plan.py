@@ -21,6 +21,10 @@ RAM_KEEP_FREE_MIN = 4 * GiB      # RAM left for everything else: at least this .
 RAM_KEEP_FREE_FRAC = 0.15        # ... or this share of all RAM
 PROC_OVERHEAD = 512 * MiB        # the program itself, tokenizer, buffers outside llama.cpp's estimate
 MIN_CTX = 4096
+# Context when you don't name one: as long as the model can take, up to CTX_CAP, as long as it costs no
+# more than CTX_SHARE of the memory the model may use there (the rest is better spent on the model itself).
+CTX_CAP = 131072
+CTX_SHARE = 0.25
 
 
 def probe(model, ctx, gpu=None):
@@ -118,9 +122,10 @@ def with_margin(x):
     return int(x * (1 + EST_MARGIN) + EST_MARGIN_FIXED)
 
 
-def make(model_path, target_ctx=16384, min_ctx=MIN_CTX, cpu_only=False, leave_gpu=0,
+def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu=0,
          vram_free=None, ram_avail=None, threads=None, why_gpu_off=None, device_check=False):
     """Return a plan dict, or one with plan["refuse"] set to the reason.
+    target_ctx: context to aim for; None = automatic (see CTX_CAP, CTX_SHARE).
     device_check: also ask llama.cpp for its own estimate on the card (starts the card's driver briefly)."""
     m = Model(model_path)
     L = m.n_layer
@@ -133,8 +138,15 @@ def make(model_path, target_ctx=16384, min_ctx=MIN_CTX, cpu_only=False, leave_gp
     ram_budget = ram_avail - ram_keep
     vram_budget = vram_free - VRAM_KEEP_FREE - leave_gpu
 
-    ctxs = ladder(target_ctx, min_ctx, m.meta.get("ctx_train"))
+    auto = target_ctx is None
+    ctxs = ladder(CTX_CAP if auto else target_ctx, min(min_ctx, CTX_CAP if auto else target_ctx), m.meta.get("ctx_train"))
     costs = Costs(m, ctxs[-1], ctxs[0])
+
+    def fair(budget):
+        """Automatic context: the lengths that cost at most CTX_SHARE of `budget` (at least the shortest)."""
+        if not auto:
+            return ctxs
+        return [c for c in ctxs if with_margin(costs.context(c)) <= CTX_SHARE * budget] or ctxs[-1:]
 
     plan = {
         "model": m.path, "name": m.meta.get("name"), "arch": m.meta.get("arch"),
@@ -158,7 +170,7 @@ def make(model_path, target_ctx=16384, min_ctx=MIN_CTX, cpu_only=False, leave_gp
     else:
         overhead, src = learned_overhead()
         budget, w = vram_budget, []
-        gpu = place_on_gpu(m, costs, ctxs, budget, w, overhead)
+        gpu = place_on_gpu(m, costs, fair(budget), budget, w, overhead)
         for _ in range(3):
             if not (gpu and device_check):
                 break
@@ -173,7 +185,7 @@ def make(model_path, target_ctx=16384, min_ctx=MIN_CTX, cpu_only=False, leave_gp
                 break
             budget -= short                             # llama.cpp says more than we thought: plan smaller
             w = [f"llama.cpp's own estimate for the card was {short // MiB} MiB higher than ours; planned smaller."]
-            gpu = place_on_gpu(m, costs, ctxs, budget, w, overhead)
+            gpu = place_on_gpu(m, costs, fair(budget), budget, w, overhead)
         else:
             if gpu and device_check:
                 w.append("Couldn't get our plan and llama.cpp's estimate to agree; not using the graphics card.")
@@ -197,7 +209,7 @@ def make(model_path, target_ctx=16384, min_ctx=MIN_CTX, cpu_only=False, leave_gp
     # the SSD again: slow, not dangerous). Memory llama.cpp allocates itself can't be dropped: that part
     # must fit or we refuse.
     if gpu is None:
-        ctx = next((c for c in ctxs if costs.context(c) + costs.compute + PROC_OVERHEAD <= ram_budget), None)
+        ctx = next((c for c in fair(ram_budget) if costs.context(c) + costs.compute + PROC_OVERHEAD <= ram_budget), None)
         if ctx is None:
             plan["refuse"] = (f"Not enough RAM even on the processor: context + scratch need "
                               f"{(costs.context(ctxs[-1]) + costs.compute + PROC_OVERHEAD) / GiB:.1f} GiB, "
@@ -211,6 +223,10 @@ def make(model_path, target_ctx=16384, min_ctx=MIN_CTX, cpu_only=False, leave_gp
         anon = int(cpu_ctx_share) + (costs.compute if plan["n_cpu_moe"] or plan["ngl_layers"] < L else 0) + PROC_OVERHEAD
     cpu_weights = (m.token_embd + m.other + m.dense(on_cpu_layers) + m.experts(experts_on_cpu)
                    + (0 if plan["output_on_gpu"] else m.output))
+    if auto:
+        why.append(f"Context chosen automatically: {plan['ctx']} words (this model can take up to "
+                   f"{m.meta.get('ctx_train') or '?'}; lodger aims for at most {CTX_CAP} and lets the context use "
+                   f"at most {CTX_SHARE:.0%} of the memory it may take, so the model itself keeps the rest).")
     plan["ram_anon_est"] = anon
     plan["ram_weights"] = cpu_weights
 
