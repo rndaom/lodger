@@ -164,6 +164,8 @@ separate, later question (see "Later").
 - `lodger/` - the code: `launch.py` (plan/run, watchdog), `plan.py` (placement), `neighbors.py` (who
   needs the card), `sysmem.py` (memory readers), `model.py` (model file reader), `measure.py`, `stress.py`,
   `serve.py` (serve, ask, step aside, grow back), `servetest.py` (stress-serve).
+- `systemd/lodger.service` - starts `lodger serve` (35B, `--allow-gpu --idle 10`) with the desktop session;
+  linked into `~/.config/systemd/user/` and enabled.
 - `tools/vram-eater.hip` - test program that takes graphics memory like a game loading; built into
   `build/` (not for git).
 - `runs/` - logs from measurements and runs, `calibration.jsonl`, `probe-cache/` (local only, not for git).
@@ -257,3 +259,8 @@ separate, later question (see "Later").
      not seen here (2 and 4 cover mid-answer moves).
   Lowest free graphics memory 2.18 GiB (during 4: the test's eater stops at 2 GiB free).
   A first run was stopped early: the test itself waited for the whole answer before asking for the move.
+- 2026-10-28 12:37 **in git and starting at login** (user's request). `lodger serve --idle MIN`: the model
+  loads on the first request and unloads after MIN minutes unused, so lodger holds no memory while you
+  don't use it (tested: asleep at start, ~5 s to wake for the 9B, unloads, wakes again). The service runs
+  the 35B with `--idle 10`; first question after login: 16 s (planning 4 s, loading 9 s, answer).
+  While llama-router runs (always, for the Deck) lodger stays on the processor (~16 words/s), by design.
