@@ -1,0 +1,339 @@
+"""lodger plan / lodger run: run a model on what is free right now, fenced in and watched.
+
+  lodger plan MODEL [--ctx 16384] [--cpu-only] [--leave-gpu MiB] [--allow-gpu] [--pretend-vram-free MiB] [--pretend-ram-avail MiB]
+  lodger run  MODEL [same options] [--prompt TEXT] [-n 256] [--runtime SEC]
+
+plan: say what would go where, and why, without starting anything.
+run:  start our llama.cpp (llama-cli) with that plan in its own cgroup (RAM cap, no swap, no crash
+      dumps, low CPU/disk priority) and watch it several times a second. It steps aside (stops) at once
+      if free VRAM or RAM gets too low, or if another app needs the graphics card: keeps it busy or
+      takes a lot of its memory. Without --prompt it opens an interactive chat in this terminal.
+The graphics card is only used when you allow it: --allow-gpu (or answer the question on a terminal).
+Otherwise the model runs on the processor only."""
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+from . import plan as planner, sysmem
+from .neighbors import Neighbors
+
+MiB, GiB = sysmem.MiB, sysmem.GiB
+RUNS = os.path.realpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "runs"))
+# watchdog: stop the model if the card has less than this free, or RAM available falls under this.
+# LODGER_KILL_*_MIB can only raise these (used to test the stop path), never lower them.
+KILL_VRAM_FREE = max(1536, int(os.environ.get("LODGER_KILL_VRAM_FREE_MIB", 0))) * MiB
+KILL_RAM_AVAIL = max(1536, int(os.environ.get("LODGER_KILL_RAM_AVAIL_MIB", 0))) * MiB
+LOAD_SECONDS = 90          # watch faster while the model loads (its biggest allocations happen then)
+# ~/.local/bin/llama-game-guard leaves this while it has llama-router stopped for a game; the router comes back after
+GAME_GUARD_FLAG = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"),
+                               "llama-game-guard.router-stopped")
+
+
+def router_active():
+    return subprocess.run(["systemctl", "--user", "is-active", "-q", "llama-router"]).returncode == 0
+
+
+def router_coming():
+    if router_active():
+        return ("llama-router is running and the Steam Deck can make it load a big model at any moment; "
+                "stop it first (systemctl --user stop llama-router) and start it again afterwards")
+    if os.path.exists(GAME_GUARD_FLAG):
+        return "llama-game-guard stopped llama-router for a game and will start it again when the game ends"
+    return None
+
+
+def settle(card, seconds=2.0, limit=30.0):
+    """Before taking memory on the card: is another app busy on it, or still loading (free memory
+    falling)? Returns a reason the card is taken, or None once it has been calm for `seconds`."""
+    nb = Neighbors(card)
+    t0 = time.time()
+    while time.time() - t0 < limit:
+        start = sysmem.vram_free(card)
+        busy = nb.watch(seconds)
+        if busy:
+            return busy
+        if start - sysmem.vram_free(card) < 256 * MiB:
+            return None
+        print("(memory on the graphics card is still changing: waiting for it to settle)", flush=True)
+    return "memory on the graphics card kept changing for 30 s (another app is loading)"
+
+
+def gpu_blockers(allowed, card):
+    """Reasons the graphics card must not be used right now (None = fine)."""
+    if not allowed:
+        return "the graphics card is only used when you allow it (pass --allow-gpu)"
+    return router_coming() or settle(card)
+
+
+def fmt_cmd(cmd, env):
+    e = " ".join(f"{k}={v}" for k, v in env.items())
+    return (e + " " if e else "") + " ".join(shlex.quote(c) for c in cmd)
+
+
+def llama_cmd(p, a):
+    cmd = [os.path.join(planner.BIN, "llama-cli"), "-m", p["model"], "-c", str(p["ctx"]), "-t", str(p["threads"]),
+           "--fit", "off"]
+    if p["ngl"]:
+        cmd += ["--device", "ROCm0", "-ngl", str(p["ngl"])]       # ROCm0 = RX 7800 XT, ROCm1 = built-in graphics
+        if p["n_cpu_moe"]:
+            cmd += ["-ncmoe", str(p["n_cpu_moe"])]
+        env = {"HIP_VISIBLE_DEVICES": "0"}
+    else:
+        cmd += ["--device", "none", "-ngl", "0"]
+        env = {"HIP_VISIBLE_DEVICES": "-1", "ROCR_VISIBLE_DEVICES": "-1"}
+    if not a.think:
+        cmd += ["--reasoning", "off"]
+    if a.prompt is not None:
+        cmd += ["-st", "-n", str(a.n), "-p", a.prompt]
+    return cmd, env
+
+
+def show(p, cmd=None, env=None):
+    print("\n".join("- " + w for w in p["why"]))
+    if p["refuse"]:
+        print(f"\nREFUSED: {p['refuse']}")
+        return
+    where = (f"graphics card: {p['ngl_layers']} of {p['layers']} layers"
+             + (f", experts of {p['layers'] - p['n_cpu_moe']} layers" if p["moe"] and p["ngl"] else "")
+             + f", ~{p['gpu_est'] / GiB:.1f} GiB (planned with margin {p['gpu_bytes'] / GiB:.1f} GiB)") if p["ngl"] else "processor only"
+    print(f"\nPlan: {where}; context {p['ctx']} words; RAM fence {p['ram_cap'] / GiB:.1f} GiB.")
+    if cmd:
+        print("Command: " + fmt_cmd(cmd, env))
+
+
+def unit_props(p, runtime=None):
+    """The fence around the model (systemd unit properties)."""
+    props = {
+        "MemoryMax": str(p["ram_cap"]), "MemorySwapMax": "0",
+        "LimitCORE": "0",                       # no crash dump: a dumping process keeps its VRAM for seconds
+        "CPUWeight": "20", "IOWeight": "20",    # your apps get the processor and disks first
+        "Nice": "10",
+    }
+    if not p["ngl"]:
+        props["PrivateDevices"] = "yes"         # processor only: the graphics card's device files don't exist for it
+    if runtime:
+        props["RuntimeMaxSec"] = str(runtime)
+    return props
+
+
+def unit_cgroup(unit):
+    r = subprocess.run(["systemctl", "--user", "show", "-p", "ControlGroup", "--value", unit + ".service"],
+                       capture_output=True, text=True)
+    cg = r.stdout.strip()
+    return "/sys/fs/cgroup" + cg if cg else None
+
+
+def read_int(path):
+    try:
+        with open(path) as f:
+            return int(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+class Watchdog(threading.Thread):
+    def __init__(self, unit, on_gpu, out):
+        super().__init__(daemon=True)
+        self.unit, self.on_gpu, self.out = unit, on_gpu, out
+        self.stop_flag = threading.Event()
+        self.reason = None
+        self.peak = {"model_vram": 0, "model_gtt": 0, "cgroup_ram": 0}
+        self.low = {"vram_free": None, "ram_avail": None}
+        self.card = sysmem.dgpu()
+        self.neighbors = Neighbors(self.card) if on_gpu else None
+
+    def kill(self, why, graceful=False):
+        if self.reason:
+            return
+        self.reason = why
+        print(f"\n[lodger] STOPPING THE MODEL: {why}", file=sys.stderr, flush=True)
+        if graceful:
+            subprocess.run(["systemctl", "--user", "kill", "-s", "TERM", self.unit + ".service"], capture_output=True)
+            t0 = time.time()
+            while time.time() - t0 < 1.5 and unit_cgroup(self.unit):
+                time.sleep(0.1)
+        subprocess.run(["systemctl", "--user", "kill", "-s", "KILL", self.unit + ".service"], capture_output=True)
+
+    def run(self):
+        t0 = time.time()
+        last_nb = last_log = 0.0
+        with open(os.path.join(self.out, "watch.tsv"), "w") as f:
+            f.write("t\tvram_free_MiB\tram_avail_MiB\tmodel_vram_MiB\tmodel_gtt_MiB\tmodel_ram_MiB\n")
+            cg = None
+            while not self.stop_flag.is_set():
+                now = time.time()
+                loading = now - t0 < LOAD_SECONDS
+                vf = sysmem.vram_free(self.card)                       # cheap: checked every tick
+                ra = sysmem.meminfo()["MemAvailable"]
+                self.low["vram_free"] = vf if self.low["vram_free"] is None else min(self.low["vram_free"], vf)
+                self.low["ram_avail"] = ra if self.low["ram_avail"] is None else min(self.low["ram_avail"], ra)
+                if self.on_gpu and self.card and vf < KILL_VRAM_FREE:   # stopping a processor-only model frees no VRAM
+                    self.kill(f"only {vf // MiB} MiB of graphics memory left (limit {KILL_VRAM_FREE // MiB})")
+                elif ra < KILL_RAM_AVAIL:
+                    self.kill(f"only {ra // MiB} MiB of RAM left (limit {KILL_RAM_AVAIL // MiB})")
+                elif self.on_gpu and now - last_nb >= 0.25:
+                    last_nb = now
+                    why = self.neighbors.update() or router_coming()
+                    if why:
+                        self.kill(why + "; giving the graphics card back", graceful=True)
+                if now - last_log >= 0.5:                              # model's own use, logged twice a second
+                    last_log = now
+                    cg = cg or unit_cgroup(self.unit)
+                    mv = mg = 0
+                    ram = None
+                    if cg:
+                        try:
+                            with open(cg + "/cgroup.procs") as pf:
+                                pids = [int(x) for x in pf.read().split()]
+                        except OSError:
+                            pids = []
+                        seen = {}
+                        for pid in pids:
+                            seen.update(sysmem.gpu_clients(pid))
+                        pci = self.card["pci"] if self.card else None
+                        mv = sum(v["vram"] for k, v in seen.items() if k[0] == pci)
+                        mg = sum(v["gtt"] for k, v in seen.items() if k[0] == pci)
+                        ram = read_int(cg + "/memory.current")
+                        self.peak["cgroup_ram"] = max(self.peak["cgroup_ram"], read_int(cg + "/memory.peak") or ram or 0)
+                    self.peak["model_vram"] = max(self.peak["model_vram"], mv)
+                    self.peak["model_gtt"] = max(self.peak["model_gtt"], mg)
+                    f.write(f"{now - t0:.1f}\t{vf // MiB}\t{ra // MiB}\t{mv // MiB}\t{mg // MiB}\t{(ram or 0) // MiB}\n")
+                    f.flush()
+                self.stop_flag.wait(0.1 if loading else 0.25)
+
+
+def build_plan(a, for_run):
+    pretend = a.pretend_vram_free is not None or a.pretend_ram_avail is not None
+    if for_run and pretend:
+        sys.exit("--pretend-* is for 'plan' only: a real run always uses the real free memory.")
+    why_off = None
+    card = sysmem.dgpu()
+    if not a.cpu_only and not pretend:
+        allowed = a.allow_gpu
+        if for_run and not allowed and sys.stdin.isatty():
+            allowed = input("Use the graphics card? [y/N] ").strip().lower() == "y"
+        if for_run or allowed:
+            why_off = gpu_blockers(allowed, card)
+        else:
+            b = router_coming()
+            print("(note: this plan assumes the graphics card is allowed; a real run needs --allow-gpu"
+                  + (f", and now: {b}" if b else "") + ")\n")
+    return planner.make(
+        a.model, target_ctx=a.ctx, min_ctx=a.min_ctx, cpu_only=a.cpu_only, leave_gpu=a.leave_gpu * MiB,
+        vram_free=None if a.pretend_vram_free is None else a.pretend_vram_free * MiB,
+        ram_avail=None if a.pretend_ram_avail is None else a.pretend_ram_avail * MiB,
+        threads=a.threads, why_gpu_off=why_off, device_check=bool(a.allow_gpu and not why_off and not pretend))
+
+
+def do_run(a):
+    p = build_plan(a, True)
+    cmd, env = llama_cmd(p, a) if not p["refuse"] else (None, None)
+    show(p, cmd, env)
+    if p["refuse"]:
+        return 2
+    if p["ngl"]:
+        # last look right before starting: if another app took memory while we planned, plan again on the processor
+        drop = p["vram_free"] - sysmem.vram_free()
+        if drop > 256 * MiB:
+            print(f"\n{drop // MiB} MiB of graphics memory was taken while planning: running on the processor instead.")
+            a.cpu_only = True
+            p = build_plan(a, True)
+            cmd, env = llama_cmd(p, a) if not p["refuse"] else (None, None)
+            show(p, cmd, env)
+            if p["refuse"]:
+                return 2
+    name = re.sub(r"[^A-Za-z0-9.]+", "-", p["name"] or "model")[:40]
+    out = os.path.join(RUNS, time.strftime("%Y-%m-%d-%H%M%S") + "-run-" + name)
+    os.makedirs(out)
+    unit = f"lodger-{os.getpid()}"
+    props = unit_props(p, a.runtime)
+    interactive = a.prompt is None
+    sr = ["systemd-run", "--user", "--quiet", "--collect", f"--unit={unit}", "--pty" if interactive else "--pipe", "--wait"]
+    sr += [f"--property={k}={v}" for k, v in props.items()]
+    sr += [f"--setenv={k}={v}" for k, v in env.items()]
+    with open(os.path.join(out, "plan.json"), "w") as f:
+        json.dump({**p, "cmd": cmd, "env": env, "cgroup": props}, f, indent=1)
+
+    wd = Watchdog(unit, bool(p["ngl"]), out)
+    wd.start()
+    t0 = time.time()
+    signal.signal(signal.SIGINT, lambda *_: wd.kill("you pressed Ctrl+C", graceful=True))
+    if interactive:
+        rc = subprocess.run(sr + cmd).returncode
+    else:
+        with open(os.path.join(out, "output.txt"), "w") as o, open(os.path.join(out, "log.txt"), "w") as e:
+            rc = subprocess.run(sr + cmd, stdin=subprocess.DEVNULL, stdout=o, stderr=e).returncode
+    secs = time.time() - t0
+    wd.stop_flag.set()
+    wd.join()
+
+    speed, text = None, ""
+    if not interactive:
+        text = open(os.path.join(out, "output.txt"), errors="ignore").read()
+        log = open(os.path.join(out, "log.txt"), errors="ignore").read()
+        speed = [l.strip() for l in (text + log).splitlines() if "t/s" in l][-3:]
+        answer = text[text.find("\n> ") + 1:] if "\n> " in text else text
+        print("\n--- answer ---\n" + "\n".join(l for l in answer.strip().splitlines() if "t/s" not in l and l != "Exiting...").strip())
+        if speed:
+            print("--- speed ---\n" + "\n".join(speed))
+    res = {
+        "exit": rc, "seconds": round(secs, 1), "stopped_by_watchdog": wd.reason,
+        "model_vram_peak": wd.peak["model_vram"], "model_gtt_peak": wd.peak["model_gtt"],
+        "model_ram_peak": wd.peak["cgroup_ram"],
+        "vram_free_lowest": wd.low["vram_free"], "ram_avail_lowest": wd.low["ram_avail"], "speed": speed,
+    }
+    with open(os.path.join(out, "result.json"), "w") as f:
+        json.dump(res, f, indent=1)
+    # learn: what we planned vs what it really used (a run stopped while loading hasn't shown its full use)
+    loaded = not wd.reason or secs > LOAD_SECONDS or (not interactive and "\n> " in text)
+    with open(os.path.join(RUNS, "calibration.jsonl"), "a") as f:
+        f.write(json.dumps({"time": time.strftime("%F %T"), "model": p["name"], "ngl": p["ngl"],
+                            "n_cpu_moe": p["n_cpu_moe"], "ctx": p["ctx"],
+                            "gpu_est": p["gpu_est"], "llama_gpu_est": p.get("llama_gpu_est"),
+                            "gpu_real": wd.peak["model_vram"] if loaded else None,
+                            "ram_anon_est": p["ram_anon_est"], "ram_cap": p["ram_cap"],
+                            "ram_real_peak": wd.peak["cgroup_ram"], "exit": rc, "stopped": wd.reason,
+                            "run": os.path.basename(out)}) + "\n")
+    lo_v = wd.low["vram_free"]
+    print(f"\nexit {rc} after {secs:.0f} s"
+          + (f"; STOPPED: {wd.reason}" if wd.reason else "")
+          + f". Model used at most {wd.peak['model_vram'] // MiB} MiB VRAM (planned {p['gpu_est'] // MiB}),"
+          f" {wd.peak['cgroup_ram'] // MiB} MiB RAM incl. cached weights (fence {p['ram_cap'] // MiB})."
+          + (f" Lowest free VRAM {lo_v // MiB} MiB," if lo_v is not None else "")
+          + f" lowest free RAM {(wd.low['ram_avail'] or 0) // MiB} MiB.\nLogs: {out}")
+    return 0 if rc == 0 and not wd.reason else 1
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="lodger", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("action", choices=["plan", "run"])
+    ap.add_argument("model")
+    ap.add_argument("--ctx", type=int, default=16384, help="context length to aim for (words/tokens)")
+    ap.add_argument("--min-ctx", type=int, default=planner.MIN_CTX)
+    ap.add_argument("--cpu-only", action="store_true")
+    ap.add_argument("--allow-gpu", action="store_true", help="the graphics card may be used")
+    ap.add_argument("--leave-gpu", type=int, default=0, metavar="MiB", help="extra graphics memory to leave free")
+    ap.add_argument("--threads", type=int)
+    ap.add_argument("--pretend-vram-free", type=int, metavar="MiB", help="plan only: pretend this much VRAM is free")
+    ap.add_argument("--pretend-ram-avail", type=int, metavar="MiB", help="plan only: pretend this much RAM is available")
+    ap.add_argument("--prompt")
+    ap.add_argument("-n", type=int, default=256, help="most words to write for --prompt")
+    ap.add_argument("--think", action="store_true", help="let the model reason before answering")
+    ap.add_argument("--runtime", type=int, help="stop after this many seconds")
+    a = ap.parse_args(argv)
+    if not shutil.which("systemd-run"):
+        sys.exit("systemd-run not found")
+    if a.action == "plan":
+        p = build_plan(a, False)
+        cmd, env = llama_cmd(p, a) if not p["refuse"] else (None, None)
+        show(p, cmd, env)
+        return 2 if p["refuse"] else 0
+    return do_run(a)
