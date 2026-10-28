@@ -197,7 +197,7 @@ GitHub: https://github.com/rndaom/lodger (public since 2026-10-28). **MIT.** Res
 
 Roadmap, in order:
 1. **Open the base** - done 2026-10-28 (next section). NVIDIA, Intel and APUs written but untested on real
-   hardware; Intel Arc free memory not read yet; the stock Vulkan build not yet run on the card.
+   hardware; Intel Arc free memory not read yet. The stock Vulkan build ran the 9B on the RX 7800 XT (71 words/s).
 2. **Lock the front door** - done 2026-10-28 (see Server): Host allowlist, Origin check, optional API key,
    the engine with its own key.
 3. **Repo for contributors** - done 2026-10-28: README, LICENSE, CONTRIBUTING, SECURITY, conduct, issue forms
