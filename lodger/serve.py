@@ -6,10 +6,12 @@
 
 Apps talk to lodger at http://127.0.0.1:8181/v1/chat/completions (the usual OpenAI-style API); only
 this PC can reach it, and web pages in your browser can't use it (only pages served from this PC can).
-With --api-key-file or LODGER_API_KEY, apps must also send the key (Authorization: Bearer KEY). It serves every model in ~/.config/lodger/models.toml (or the files given), one at
-a time: a request naming another model switches to it once nothing is being written. Behind it, lodger
-runs our llama.cpp build's server on a private port, with the same plan, fence and watchdog as `lodger run`.
-pi lists all of them: `lodger serve` writes a "lodger" provider into pi's models.json.
+With --api-key-file or LODGER_API_KEY, apps must also send the key (Authorization: Bearer KEY).
+It serves every model in ~/.config/lodger/models.toml (or the files given), one at a time:
+a request naming another model switches to it once nothing is being written. Behind it, lodger runs
+llama.cpp's server on a private port, with the same plan, fence and watchdog as `lodger run`.
+pi (https://github.com/earendil-works/pi) can list all of them: `lodger pi` writes a "lodger" provider into
+pi's models.json (and `lodger serve` keeps it current when extras.pi is on in config.toml).
 - Steps aside: when another app needs the graphics card, the model is stopped on the card and started
   again on the processor at once. An answer being written continues where it stopped.
 - Grows back: when the card has been quiet for a while and no answer is being written, the model moves
@@ -34,7 +36,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import catalog, plan as planner, sysmem
+from . import catalog, config, engine, fence, plan as planner, reserve, sysmem
 from .launch import GAME_GUARD_FLAG, RUNS, Watchdog, gpu_blockers, router_coming, unit_cgroup, unit_props
 from .neighbors import Neighbors
 
@@ -60,11 +62,7 @@ def unit_vram(unit):
             pids = [int(x) for x in f.read().split()]
     except (OSError, TypeError):
         return 0
-    pci = (sysmem.dgpu() or {}).get("pci")
-    seen = {}
-    for pid in pids:
-        seen.update(sysmem.gpu_clients(pid))
-    return sum(v["vram"] for k, v in seen.items() if k[0] == pci)
+    return sysmem.gpu_use(sysmem.dgpu(), pids)["vram"]
 
 
 def pause_flag(unit):
@@ -93,7 +91,7 @@ def free_port():
 
 
 class Engine:
-    """One llama-server process in its own fenced systemd unit, with a watchdog."""
+    """One llama-server process in its own fence (see fence.py), with a watchdog."""
     count = 0
     all = []
 
@@ -101,35 +99,29 @@ class Engine:
         Engine.count += 1
         self.plan, self.entry, self.out = plan, entry, out
         self.port = free_port()
-        self.unit = f"lodger-{os.getpid()}-{Engine.count}"
         self.where = "card" if plan["ngl"] else "processor"
+        self.name = f"lodger-{os.getpid()}-{Engine.count}"
         # its own key, so other programs on this PC can't use its private port; handed over in a file only
         # we can read (a command line is visible to every user), removed once the engine has read it
         self.key = secrets.token_urlsafe(32)
-        self.keyfile = os.path.join(RUNTIME_DIR, self.unit + ".key")
+        self.keyfile = os.path.join(RUNTIME_DIR, self.name + ".key")
         fd = os.open(self.keyfile, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "w") as f:
             f.write(self.key + "\n")
         p = plan
-        cmd = [os.path.join(planner.BIN, "llama-server"), "-m", p["model"], "-c", str(p["ctx"]),
+        cmd = [engine.tool("llama-server"), "-m", p["model"], "-c", str(p["ctx"]),
                "-t", str(p["threads"]), "--fit", "off", "-np", "1", "--host", HOST, "--port", str(self.port),
                "--api-key-file", self.keyfile, "--no-webui", "-a", entry.name] + entry.args()
-        if p["ngl"]:
-            cmd += ["--device", "ROCm0", "-ngl", str(p["ngl"])] + (["-ncmoe", str(p["n_cpu_moe"])] if p["n_cpu_moe"] else [])
-            env = {"HIP_VISIBLE_DEVICES": "0"}
-        else:
-            cmd += ["--device", "none", "-ngl", "0"]
-            env = {"HIP_VISIBLE_DEVICES": "-1", "ROCR_VISIBLE_DEVICES": "-1"}
-        sr = ["systemd-run", "--user", "--quiet", "--collect", f"--unit={self.unit}", "--pipe", "--wait"]
-        sr += [f"--property={k}={v}" for k, v in unit_props(p).items()]
-        sr += [f"--setenv={k}={v}" for k, v in env.items()]
+        dargs, env = engine.device_args(p["ngl"], sysmem.dgpu(), p["n_cpu_moe"])
+        cmd += dargs
         with open(os.path.join(out, "plan.json"), "w") as f:
-            json.dump({**p, "cmd": cmd, "env": env}, f, indent=1)
+            json.dump({**p, "cmd": cmd, "env": env, "fence": fence.mode()[0]}, f, indent=1)
         self.logf = open(os.path.join(out, "engine.log"), "w")
         # own session: Ctrl-C in the terminal reaches lodger only, which then stops the engine itself
-        self.proc = subprocess.Popen(sr + cmd, stdin=subprocess.DEVNULL, stdout=self.logf, stderr=subprocess.STDOUT,
-                                     start_new_session=True)
-        self.wd = Watchdog(self.unit, bool(p["ngl"]), out)
+        self.fence = fence.Fenced(cmd, env, unit_props(p), stdout=self.logf, stderr=subprocess.STDOUT, new_session=True,
+                                  name=self.name)
+        self.proc = self.fence.proc
+        self.wd = Watchdog(self.fence, bool(p["ngl"]), out, log=os.path.join(out, "engine.log"), keep=p["keep"])
         self.wd.start()
         self.started = time.time()
         Engine.all.append(self)
@@ -160,13 +152,7 @@ class Engine:
     def stop(self):
         """Planned stop (not the watchdog): the watchdog is told first so it records no reason."""
         self.wd.stop_flag.set()
-        subprocess.run(["systemctl", "--user", "kill", "-s", "TERM", self.unit + ".service"], capture_output=True)
-        try:
-            self.proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            subprocess.run(["systemctl", "--user", "kill", "-s", "KILL", self.unit + ".service"], capture_output=True)
-            self.proc.wait(timeout=10)
-        subprocess.run(["systemctl", "--user", "stop", self.unit + ".service"], capture_output=True)  # in case it outlived its client
+        self.fence.stop()
         self.finish()
 
     def finish(self):
@@ -176,6 +162,10 @@ class Engine:
         self.wd.stop_flag.set()
         self.wd.join(timeout=5)
         self.logf.close()
+        if self.fence.pids():
+            self.fence.stop()
+        else:
+            self.fence.close()
         # learn: planned vs really used on the card (only once it had loaded)
         if self.plan["ngl"] and time.time() - self.started > 20:
             with open(os.path.join(RUNS, "calibration.jsonl"), "a") as f:
@@ -262,7 +252,7 @@ class Lodger:
         for e in self.models.values():
             if e.skip:
                 log(f"not served: {e.name}: {e.skip}")
-        if self.a.port == 8181:
+        if self.a.port == 8181 and config.extra("pi"):
             write_pi_config(self.a.port, [model_info(e) for e in ok], self.default,
                             pi_key(self.a.api_key, self.a.api_key_file))
 
@@ -287,7 +277,7 @@ class Lodger:
 
     def others_coming(self):
         """Is another AI server about to need the card? Services in --pause count only while busy."""
-        if os.path.exists(GAME_GUARD_FLAG):
+        if config.extra("llama_router") and os.path.exists(GAME_GUARD_FLAG):
             return "llama-game-guard paused llama-router for a game"
         busy = self.pausable_busy()
         if busy:
@@ -438,13 +428,17 @@ class Lodger:
 
     def monitor(self):
         """Switches models, steps aside / grows back, sleeps. Runs for the life of `lodger serve`."""
-        nb = Neighbors()
+        nb = Neighbors(ours=fence.our_pids)
+        last_note = 0.0
         while not self.closing:
             time.sleep(1)
             if self.closing:
                 return
             if nb.update() or self.others_coming():
                 self.quiet_since = time.time()
+            elif time.time() - last_note >= 10:
+                last_note = time.time()
+                self.note_desktop()
             e = self.engine
             # another model wanted: switch once nothing is being written with this one
             if self.switch_to and self.switch_to is not self.cur and (not e or not self.busy.get(e)):
@@ -524,6 +518,17 @@ class Lodger:
                 old = self.install(new)
                 if old:
                     old.stop()                          # an answer still being written there continues on the card
+
+    def note_desktop(self):
+        """While no app needs the card: note how much of it everything but our model uses (reserve.py)."""
+        card = sysmem.dgpu()
+        m = card.memory() if card and not card.asleep() else None
+        if not m:
+            return
+        e = self.engine
+        ours = e.wd.now["gtt" if card.integrated else "vram"] if e and e.where == "card" and e.alive() else 0
+        used = (m["gtt_used"] or 0) if card.integrated else m["used"]
+        reserve.note(card.pci, max(0, used - ours))
 
     def status(self):
         e = self.engine

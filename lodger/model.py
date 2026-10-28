@@ -1,13 +1,35 @@
 """What a model file holds: the exact size of every piece, grouped the way the planner places them.
-Reads only the file headers (gguf-py from our llama.cpp tree); split models are read from all parts."""
+Reads only the file headers with the `gguf` package (PyPI; or, if that isn't installed, the gguf-py folder of
+the llama.cpp source tree lodger uses). Split models are read from all parts."""
 import glob
 import os
 import re
 import sys
 
-LLAMA_CPP = os.path.expanduser("~/Projects/sybil/ds41-local/src/llama.cpp")
-sys.path.insert(0, os.path.join(LLAMA_CPP, "gguf-py"))
-from gguf import GGUFReader  # noqa: E402
+_gguf = None
+GGUF_FROM = None
+
+
+def gguf_reader():
+    """GGUFReader from the gguf package, or from the llama.cpp source tree lodger uses if that isn't installed.
+    Loaded on first use, so lodger's other commands work without it."""
+    global _gguf, GGUF_FROM
+    if _gguf is None:
+        try:
+            from gguf import GGUFReader
+            GGUF_FROM = "the gguf package"
+        except ImportError:
+            from . import engine
+            tree = os.path.join(engine.root()[0] or "", "gguf-py")
+            if not os.path.isdir(tree):
+                raise SystemExit("lodger needs the gguf package to read model files: pip install gguf "
+                                 "(installing lodger with pip, pipx or uv brings it)")
+            sys.path.insert(0, tree)
+            from gguf import GGUFReader
+            GGUF_FROM = tree
+        _gguf = GGUFReader
+    return _gguf
+
 
 EXPERT = re.compile(r"^blk\.(\d+)\.ffn_.*_(?:ch)?exps(?:\.|$)")
 LAYER = re.compile(r"^blk\.(\d+)\.")
@@ -49,7 +71,7 @@ class Model:
         self.meta = {}
         has_output = False
         for i, fp in enumerate(self.files):
-            r = GGUFReader(fp, "r")
+            r = gguf_reader()(fp, "r")
             if i == 0:
                 arch = _field(r, "general.architecture")
                 self.meta = {

@@ -3,17 +3,15 @@ Every number is in bytes. Each choice records a plain-words reason in plan["why"
 import hashlib
 import json
 import os
-import subprocess
 
-from . import sysmem
-from .model import LLAMA_CPP, Model
+from . import config, engine, fence, reserve, sysmem
+from . import gpu as gpus
+from .model import Model
 
 MiB, GiB = sysmem.MiB, sysmem.GiB
-BIN = os.path.join(LLAMA_CPP, "build", "bin")
-CACHE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "runs", "probe-cache")
+AUTO = object()                  # make(card=AUTO): the card lodger chose (gpus.choose)
 
-# Margins (see NOTES.md "How the launcher decides")
-VRAM_KEEP_FREE = 2048 * MiB      # never plan to leave less than this free on the card
+# Margins (see NOTES.md "How lodger decides"). Graphics memory kept for the desktop: reserve.py.
 EST_MARGIN = 0.10                # our estimate can be this much too low ...
 EST_MARGIN_FIXED = 256 * MiB     # ... plus this
 HIP_OVERHEAD = 512 * MiB         # HIP runtime, memory pools, staging (grew ~0.35 GiB at runtime on 2026-10-25)
@@ -27,33 +25,43 @@ CTX_CAP = 131072
 CTX_SHARE = 0.25
 
 
-def probe(model, ctx, gpu=None, extra=()):
+def cache_dir():
+    return os.path.join(config.runs_dir(), "probe-cache")
+
+
+def probe(model, ctx, gpu=None, extra=(), dev=None):
     """Ask llama.cpp what this model needs, without loading it (llama-fit-params --fit-print).
     gpu=None: processor only, in a unit with no device files, so the graphics card is never touched.
-    gpu=(ngl, n_cpu_moe): llama.cpp's own estimate for the RX 7800 XT with that placement. This starts the
+    gpu=(ngl, n_cpu_moe): llama.cpp's own estimate for the card `dev` with that placement. This starts the
     card's driver briefly (no big allocations), so only when the graphics card is allowed.
     extra: llama.cpp options that change memory use (e.g. --cache-type-k q8_0).
-    Returns {model, context, compute} in bytes for the device. Cached."""
-    os.makedirs(CACHE, exist_ok=True)
+    Returns {model, context, compute} in bytes for the device. Cached (per llama.cpp build)."""
+    cache = cache_dir()
+    os.makedirs(cache, exist_ok=True)
     st = os.stat(model.files[0])
-    key = hashlib.sha1((f"{model.path}:{st.st_size}:{st.st_mtime}:{ctx}:{gpu}" + (f":{list(extra)}" if extra else "")).encode()).hexdigest()[:16]
-    cf = os.path.join(CACHE, key + ".json")
+    fit = engine.tool("llama-fit-params")
+    if gpu is not None:
+        dev = dev or sysmem.dgpu()
+        dargs, denv = engine.device_args(gpu[0], dev, gpu[1])
+        name = dargs[1]
+    key = hashlib.sha1((f"{model.path}:{st.st_size}:{st.st_mtime}:{ctx}:{gpu}" + (f":{list(extra)}" if extra else "")
+                        + f":{fit}:{os.stat(fit).st_mtime}" + (f":{name}" if gpu is not None else "")).encode()).hexdigest()[:16]
+    cf = os.path.join(cache, key + ".json")
     if os.path.exists(cf):
         with open(cf) as f:
             return json.load(f)
-    unit = ["systemd-run", "--user", "--quiet", "--collect", "--wait", "--pipe",
-            "-p", "MemoryMax=4G", "-p", "MemorySwapMax=0", "-p", "LimitCORE=0"]
-    args = [os.path.join(BIN, "llama-fit-params"), "-m", model.files[0], "-c", str(ctx), "--fit-print", "on"] + list(extra)
+    props = {"MemoryMax": "4G", "MemorySwapMax": "0", "LimitCORE": "0"}
+    args = [fit, "-m", model.files[0], "-c", str(ctx), "--fit-print", "on"] + list(extra)
     if gpu is None:
-        unit += ["-p", "PrivateDevices=yes", "--setenv=HIP_VISIBLE_DEVICES=-1", "--setenv=ROCR_VISIBLE_DEVICES=-1"]
-        args += ["--device", "none", "-ngl", "0"]
-        dev = "Host "
+        dargs, denv = engine.device_args(0, None)
+        props["PrivateDevices"] = "yes"
+        args += dargs
+        prefix = "Host "
     else:
-        unit += ["--setenv=HIP_VISIBLE_DEVICES=0"]
-        args += ["--device", "ROCm0", "-ngl", str(gpu[0])] + (["-ncmoe", str(gpu[1])] if gpu[1] else [])
-        dev = "ROCm0 "
-    r = subprocess.run(unit + args, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=300)
-    line = next((l for l in r.stdout.splitlines() if l.startswith(dev)), None)
+        args += dargs
+        prefix = name + " "                     # --fit-print lines start with the device's name
+    r = fence.run(args, denv, props, timeout=300)
+    line = next((l for l in r.stdout.splitlines() if l.startswith(prefix)), None)
     if r.returncode or not line:
         raise SystemExit(f"llama-fit-params failed (exit {r.returncode}):\n{r.stderr[-2000:]}")
     _, mdl, ctx_mib, comp_mib = line.split()
@@ -66,7 +74,7 @@ def probe(model, ctx, gpu=None, extra=()):
 def learned_overhead():
     """What the card really used beyond llama.cpp's own estimate in recent runs (HIP runtime, memory pools,
     staging). Until there is data: HIP_OVERHEAD."""
-    path = os.path.join(CACHE, "..", "calibration.jsonl")
+    path = os.path.join(config.runs_dir(), "calibration.jsonl")
     seen = []
     try:
         with open(path) as f:
@@ -124,20 +132,43 @@ def with_margin(x):
 
 
 def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu=0,
-         vram_free=None, ram_avail=None, threads=None, why_gpu_off=None, device_check=False, extra=()):
+         vram_free=None, ram_avail=None, threads=None, why_gpu_off=None, device_check=False, extra=(),
+         card=AUTO, mem=None, keep=None):
     """Return a plan dict, or one with plan["refuse"] set to the reason.
     target_ctx: context to aim for; None = automatic (see CTX_CAP, CTX_SHARE).
-    device_check: also ask llama.cpp for its own estimate on the card (starts the card's driver briefly)."""
-    m = Model(model_path)
+    device_check: also ask llama.cpp for its own estimate on the card (starts the card's driver briefly).
+    card: the graphics card (default: the one lodger chose; None: there is none); mem: /proc/meminfo numbers;
+    keep: graphics memory to leave for the desktop (default: reserve.py). model_path may also be a Model."""
+    m = model_path if isinstance(model_path, Model) else Model(model_path)
     L = m.n_layer
     why = []
-    card = sysmem.dgpu()
-    mem = sysmem.meminfo()
-    vram_free = sysmem.vram_free(card) if vram_free is None else vram_free
+    card = sysmem.dgpu() if card is AUTO else card
+    mem = sysmem.meminfo() if mem is None else mem
+    cfg = config.get()
+    live = vram_free is None                    # not a --pretend plan
+    if card is None:
+        no_card = gpus.why_none(cfg["gpu"])
+    elif live and card.asleep() and not cfg["wake_gpu"]:
+        no_card = "the graphics card is asleep (power saving); lodger doesn't wake it (wake_gpu in config.toml)"
+    elif live and not card.integrated and gpus.power_source()[0] == "battery" and not cfg["gpu_on_battery"]:
+        no_card = "the PC is on battery; lodger starts work on the graphics card only when plugged in (gpu_on_battery)"
+    elif live and card.free(meminfo=mem) is None:
+        no_card = card.why_unknown() or "its free memory can't be read"
+    else:
+        no_card = engine.for_device(card).get("why")
+    if live:
+        vram_free = (card.free(meminfo=mem) or 0) if card else 0
     ram_avail = mem["MemAvailable"] if ram_avail is None else ram_avail
     ram_keep = max(RAM_KEEP_FREE_MIN, int(mem["MemTotal"] * RAM_KEEP_FREE_FRAC))
     ram_budget = ram_avail - ram_keep
-    vram_budget = vram_free - VRAM_KEEP_FREE - leave_gpu
+    shared = bool(card and card.integrated)
+    if shared:
+        # built-in graphics take their memory from RAM: never more than RAM can spare
+        vram_free = max(0, min(vram_free, ram_budget))
+    keep_why = None
+    if keep is None:
+        keep, keep_why = reserve.reserve(card.pci, card.total(meminfo=mem)) if card else (reserve.floor(0), None)
+    vram_budget = vram_free - keep - leave_gpu
 
     auto = target_ctx is None
     ctxs = ladder(CTX_CAP if auto else target_ctx, min(min_ctx, CTX_CAP if auto else target_ctx), m.meta.get("ctx_train"))
@@ -153,21 +184,26 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
         "model": m.path, "name": m.meta.get("name"), "arch": m.meta.get("arch"),
         "layers": L, "moe": m.is_moe, "model_bytes": m.total,
         "vram_free": vram_free, "vram_budget": vram_budget, "ram_avail": ram_avail, "ram_budget": ram_budget,
+        "keep": keep, "shared_memory": shared,
         "threads": threads or max(2, physical_cores() - 2),
         "why": why, "refuse": None,
     }
     why.append(f"Model: {m.meta.get('name')} ({m.meta.get('arch')}), {m.total / GiB:.1f} GiB, {L} layers"
                + (f", mixture of experts ({m.meta.get('expert_used')} of {m.meta.get('expert_count')} experts per word)"
                   if m.is_moe else "") + ".")
-    why.append(f"Free right now: {vram_free / GiB:.1f} GiB on the graphics card, {ram_avail / GiB:.1f} GiB RAM.")
-    why.append(f"Kept back: {VRAM_KEEP_FREE / GiB:.1f} GiB of graphics memory for the desktop"
+    why.append(f"Free right now: {vram_free / GiB:.1f} GiB on the graphics card, {ram_avail / GiB:.1f} GiB RAM."
+               if not shared else f"Free right now: {ram_avail / GiB:.1f} GiB RAM, shared by the processor and its built-in "
+               f"graphics; the graphics can take {vram_free / GiB:.1f} GiB of it (what RAM can spare, within its GTT limit).")
+    if keep_why:
+        why.append(f"Desktop reserve: {keep_why}.")
+    why.append(f"Kept back: {keep / GiB:.1f} GiB of graphics memory for the desktop"
                + (f" + {leave_gpu / GiB:.1f} GiB you asked to leave" if leave_gpu else "")
                + f", {ram_keep / GiB:.1f} GiB RAM for everything else. "
                f"Our estimates get +{EST_MARGIN:.0%} + {EST_MARGIN_FIXED // MiB} MiB extra on top.")
 
     gpu = None
-    if cpu_only or card is None or why_gpu_off:
-        why.append("Graphics card not used: " + (why_gpu_off or ("you asked for processor only" if cpu_only else "no card found")) + ".")
+    if cpu_only or no_card or why_gpu_off:
+        why.append("Graphics card not used: " + (why_gpu_off or ("you asked for processor only" if cpu_only else no_card)) + ".")
     else:
         overhead, src = learned_overhead()
         budget, w = vram_budget, []
@@ -175,7 +211,7 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
         for _ in range(3):
             if not (gpu and device_check):
                 break
-            d = probe(m, gpu["ctx"], (gpu["ngl"], gpu["n_cpu_moe"]), extra)
+            d = probe(m, gpu["ctx"], (gpu["ngl"], gpu["n_cpu_moe"]), extra, dev=card)
             llama = d["model"] + d["context"] + d["compute"]
             plan["llama_gpu_est"] = llama
             if llama + overhead <= gpu["gpu_est"]:
@@ -202,6 +238,11 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
         plan.update(ngl=0, ngl_layers=0, n_cpu_moe=0, ctx=None, output_on_gpu=False, gpu_bytes=0, gpu_est=0)
     else:
         plan.update(gpu)
+        if shared:
+            ram_budget -= gpu["gpu_bytes"]          # what the built-in graphics take is gone from RAM
+            plan["ram_budget"] = ram_budget
+            why.append(f"The built-in graphics' part ({gpu['gpu_bytes'] / GiB:.1f} GiB) comes out of RAM; "
+                       f"{max(0, ram_budget) / GiB:.1f} GiB RAM is left for the rest.")
     on_cpu_layers = set(range(L - plan["ngl_layers"]))
     experts_on_cpu = on_cpu_layers | set(range(plan["n_cpu_moe"]))
 

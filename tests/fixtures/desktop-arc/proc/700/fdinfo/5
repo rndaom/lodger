@@ -1,0 +1,35 @@
+drm-driver:	xe
+drm-client-id:	105
+drm-pdev:	0000:03:00.0
+drm-total-system:	0
+drm-shared-system:	0
+drm-active-system:	0
+drm-resident-system:	0
+drm-purgeable-system:	0
+drm-total-gtt:	2052 KiB
+drm-shared-gtt:	0
+drm-active-gtt:	0
+drm-resident-gtt:	2052 KiB
+drm-total-vram0:	524288 KiB
+drm-shared-vram0:	0
+drm-active-vram0:	0
+drm-resident-vram0:	524288 KiB
+drm-purgeable-vram0:	0
+drm-total-stolen:	0
+drm-shared-stolen:	0
+drm-active-stolen:	0
+drm-resident-stolen:	0
+drm-purgeable-stolen:	0
+drm-cycles-rcs:	28257900
+drm-total-cycles-rcs:	7655183225
+drm-cycles-bcs:	0
+drm-total-cycles-bcs:	7655183225
+drm-cycles-vcs:	900000000
+drm-total-cycles-vcs:	7655183225
+drm-engine-capacity-vcs:	2
+drm-cycles-vecs:	0
+drm-total-cycles-vecs:	7655183225
+drm-engine-capacity-vecs:	2
+drm-cycles-ccs:	0
+drm-total-cycles-ccs:	7655183225
+drm-engine-capacity-ccs:	4

@@ -275,12 +275,17 @@ class EngineKeyTest(unittest.TestCase):
     def test_engine_key(self):
         with tempfile.TemporaryDirectory() as d, \
                 mock.patch.object(serve, "RUNTIME_DIR", d), \
-                mock.patch.object(serve.subprocess, "Popen") as popen, \
+                mock.patch.object(serve.fence, "Fenced") as fenced, \
+                mock.patch.object(serve.fence, "mode", return_value=("systemd", "")), \
+                mock.patch.object(serve.engine, "tool", side_effect=lambda name: "/llama.cpp/bin/" + name), \
+                mock.patch.object(serve.engine, "device_args", return_value=(["--device", "none", "-ngl", "0"], {})), \
+                mock.patch.object(serve.sysmem, "dgpu", return_value=None), \
                 mock.patch.object(serve, "Watchdog"):
-            plan = {"model": "/m.gguf", "ctx": 4096, "threads": 4, "ngl": 0, "n_cpu_moe": 0, "ram_cap": 1 << 30}
+            plan = {"model": "/m.gguf", "ctx": 4096, "threads": 4, "ngl": 0, "n_cpu_moe": 0, "ram_cap": 1 << 30,
+                    "keep": 1 << 30}
             entry = SimpleNamespace(name="m", args=lambda: [])
             e = serve.Engine(plan, entry, d)
-            cmd = popen.call_args[0][0]
+            cmd = fenced.call_args[0][0]
             self.assertNotIn(e.key, " ".join(cmd))
             self.assertEqual(cmd[cmd.index("--api-key-file") + 1], e.keyfile)
             self.assertEqual(stat.S_IMODE(os.stat(e.keyfile).st_mode), 0o600)

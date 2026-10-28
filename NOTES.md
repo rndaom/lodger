@@ -55,11 +55,13 @@ When two promises disagree, the earlier one wins.
 1. **Is the card free to use?** Only if you allow it (`--allow-gpu`). Then lodger watches every app
    for two seconds (see "Who needs the card" below). If one is busy on the card or still loading
    (free memory falling), it waits for things to settle, or runs on the processor instead.
-2. **Measure what is free now.** VRAM free = card total minus used (`/sys/class/drm/card*/device`;
-   the kernel's number: the card runtime's own number said ~700 MiB more than really was free).
-   RAM free = `MemAvailable` from `/proc/meminfo`.
+2. **Measure what is free now.** VRAM free = card total minus used, from the kernel (`lodger/gpu/`: sysfs
+   for AMD, NVML for NVIDIA; the card runtime's own number said ~700 MiB more than really was free here).
+   Built-in graphics share RAM: free = the smaller of `MemAvailable` and the driver's GTT limit minus what
+   it has mapped. RAM free = `MemAvailable` from `/proc/meminfo`.
 3. **Subtract margins.**
-   - Keep at least 2 GiB of VRAM free for the desktop at all times (from `../CLAUDE.md`).
+   - Keep VRAM free for the desktop at all times: the desktop reserve (see "Any Linux PC"), at least 2 GiB
+     on this PC (from `../CLAUDE.md`, set in `~/.config/lodger/config.toml`).
    - Add 10% of the estimate + 256 MiB, because estimates are never exact.
    - Keep at least 4 GiB of RAM (or 15%, whichever is bigger) for everything else.
 4. **Ask what it costs.** Exact piece sizes come from the model file (`gguf` reader); context and
@@ -82,12 +84,13 @@ When two promises disagree, the earlier one wins.
 7. **Last look, then start.** Right before starting, if free VRAM dropped since planning (another
    app took some), it runs on the processor instead.
 8. **Run it fenced in.** Own cgroup with a RAM cap and no swap, low CPU and disk priority (your apps
-   first), fewer threads than the CPU has, crash dumps off. (On 2026-10-25 a crashing model kept
+   first), fewer threads than the CPU has, crash dumps off (`lodger/fence.py`; weaker kinds without systemd). (On 2026-10-25 a crashing model kept
    15 GB of VRAM busy for ~5 s while Linux saved its crash dump; that is what killed the desktop.)
    On the processor only, the card's device files don't even exist for it (`PrivateDevices=yes`).
 9. **Watch while it runs.** Ten times a second while loading (its big memory grabs happen then), four
-   times a second after. Stop at once if free VRAM < 1.5 GiB or free RAM < 1.5 GiB; step aside
-   (stop gracefully) if another app needs the card, or llama-router is (or will be) back.
+   times a second after. Stop at once if free VRAM < 3/4 of the desktop reserve (1.5 GiB here) or free RAM
+   < 1.5 GiB, or if llama.cpp picked another card than lodger chose; step aside (stop gracefully) if another
+   app needs the card (or, with the llama_router extra, llama-router is or will be back).
 10. **Learn.** Log planned vs really used, so the margins can shrink when the estimates prove good.
 
 ## Who needs the card (`lodger/neighbors.py`)
@@ -101,11 +104,13 @@ The idle desktop uses under 0.1%. Lodger's own model never counts. One check cos
 ## Extra rules
 - Stress tests run while the user is *away* (their choice, 2026-10-28): a crash then costs the least.
   The user also allowed starting games for them.
-- `llama-router` (serves the Steam Deck) can load a 15 GB model at any moment, so lodger doesn't use
-  the card while it runs, or while `llama-game-guard` has it paused for a game (that script now leaves
-  `$XDG_RUNTIME_DIR/llama-game-guard.router-stopped` while it waits to start the router again).
-- Always pin to the RX 7800 XT (`--device ROCm0`); llama.cpp also sees the processor's built-in
-  graphics as ROCm1 and must never use it.
+- `llama-router` can load a 15 GB model at any moment, so lodger doesn't use the card while it runs, or
+  while `llama-game-guard` has it paused for a game (that script leaves
+  `$XDG_RUNTIME_DIR/llama-game-guard.router-stopped` while it waits to start the router again). Since
+  2026-10-28 an opt-in extra (`extras.llama_router`), on in this PC's config.
+- The card is picked by PCI address (`gpu = "auto"` chooses the RX 7800 XT here, 0000:03:00.0) and is the
+  only one llama.cpp sees (`HIP_VISIBLE_DEVICES`), so it is always ROCm0; the processor's built-in graphics
+  (0000:11:00.0) must never be used.
 
 ## Server: `lodger serve` (user approved 2026-10-28) - this PC only
 Why: grow-back needs the conversation to survive moving the model between card and processor. With a
@@ -151,7 +156,7 @@ nothing is lost.
   graphics memory), lodger stops it before taking the card and starts it again when the model leaves
   the card (step aside, sleep, exit; `lodger unpause` after a crash). While it has a model loaded,
   lodger stays on the processor. Without `--pause`, a running router keeps lodger off the card.
-- **pi**: on start (port 8181 only) lodger writes a `lodger` provider listing every model into
+- **pi**: on start (port 8181 only, with the `pi` extra on: it is here) lodger writes a `lodger` provider listing every model into
   `~/.pi/agent/models.json` (other providers kept) and makes it pi's default in `settings.json` unless
   another provider was chosen there. Plain `pi` then lists them all; `/model` or `--model lodger/NAME`
   switches. `lodger pi` refreshes that list and opens pi.
@@ -182,18 +187,62 @@ this PC loads models onto the card and lodger uses it freely.
 - Lower graphics-card priority for the model's work, so other apps' frames come first.
 - Keep the user's most-used experts on the card: b11936 has `--moe-cache-mib N` ("GPU cache for the MoE
   experts kept in the CPU"), found 2026-10-28; try it in the plan's spare card memory.
-- Adaptive desktop reserve: the 2 GiB kept free is a fixed number (this PC's house rule, the minimum here).
-  Measure what the desktop really uses and how much it jumps, and keep that plus headroom (matters on
-  cards with 4-8 GB).
 - Two-drive striping for any model too big for RAM (from ds41-local).
 - Auto-setup: a one-time benchmark that writes the PC's profile.
 
+## Any Linux PC (vendor-neutral base, 2026-10-28; roadmap item 1 of the open-source release)
+Branch `rndaom/vendor-neutral-core-ebe78d`. The AMD-only, this-PC-only core made general; this PC's plans
+are unchanged (all 42 model x memory cases compared before/after).
+- **Graphics cards** (`lodger/gpu/`): every PCI display device from sysfs, never opening `/dev/dri` or
+  `/dev/nvidia*`, so looking never wakes a sleeping card. One DRM fdinfo parser (`fdinfo.py`: per-driver
+  key tables for amdgpu, i915, xe; engine ns or cycles; a client shared by several processes counted once)
+  feeds "who needs the card" for AMD and Intel. NVIDIA: NVML through ctypes, only while the card is awake;
+  busy time from its utilization samples. Intel Arc: free memory is a TODO (the card is skipped, with why).
+  Unknown drivers: not used.
+- **Which card** (`gpu` in config.toml): `auto` = a card with its own memory first, then the most memory,
+  then the boot card; or `none`, or a PCI address. Not on battery (`gpu_on_battery`), not while asleep
+  (`wake_gpu`): both off by default. Built-in graphics (APU, Intel iGPU) budget from shared RAM.
+- **llama.cpp** (`lodger/engine.py`): LODGER_LLAMA_CPP, else `llama_cpp` in config.toml, else what
+  `lodger setup` downloaded, else llama-server on PATH. Its backends are read from its libraries (ROCm,
+  CUDA, Vulkan); the vendor's own backend first, else Vulkan. Only the chosen card is made visible (HIP/CUDA
+  visibility by index; for Vulkan Mesa's device select by PCI and id, GGML_VK_VISIBLE_DEVICES=0, NVIDIA's
+  driver kept off when the target isn't NVIDIA), so it is always device 0; the watchdog checks llama.cpp's
+  "using device ... (PCI)" line. Model files are read with the PyPI `gguf` package (else the tree's gguf-py).
+  This PC keeps its ds41-local build through `~/.config/lodger/config.toml`.
+- **`lodger setup`**: downloads a stock release (Vulkan by default; rocm, cuda with NVIDIA's runtime, cpu),
+  checked against GitHub's SHA-256, into `~/.local/share/lodger/llama.cpp/<tag>-<backend>` + `current`.
+- **Desktop reserve** (`lodger/reserve.py`): the larger of a floor (config, else 1/8 of the card, 1-2 GiB)
+  and what the desktop showed it needs: `lodger serve` notes the card's use without lodger's model once a
+  minute while no app is busy (7 days, `runs/desktop-<pci>.json`); the 95th percentile of 10-minute rises
+  + 256 MiB, after an hour of notes. The emergency stop line is 3/4 of the reserve.
+- **Fence** (`lodger/fence.py`): systemd user unit as before; else its own `lodger-*` cgroup in a delegated
+  cgroup v2 subtree; else no hard cap, with oom_score_adj 1000, no core dumps, nice 10, and the watchdog
+  stopping the model over its RAM cap (lodger says so). Never RLIMIT_AS. `LODGER_FENCE=cgroup|none` tests them.
+- **Extras** (off unless config.toml turns them on): `llama_router` (router and game-guard checks) and `pi`
+  (`lodger serve` writing pi's models.json; `lodger pi` still does it on request). Stress tests check the
+  desktop's own compositor (XDG_CURRENT_DESKTOP) and skip the vram-eater phase where it can't run.
+- **`lodger doctor`**: a read-only report (system, RAM, power, every card, the chosen card and reserve,
+  llama.cpp and how it reaches the card, gguf, fence, models) for bug reports.
+- **Tests**: `python3 -m unittest discover tests` (stdlib only), against recorded machines in
+  `tests/fixtures/` (this desktop; hand-written NVIDIA laptop, AMD APU laptop, Intel Arc desktop) and a fake
+  NVML; the planner runs without a GPU. `LODGER_TEST_CGROUP=1` adds a live cgroup test.
+Verified here (processor only unless said): all tests; plans identical before/after; doctor; `lodger run`
+under the cgroup and none fences; `lodger serve --port 8383` answered under systemd and cgroup fences and
+left nothing behind; `lodger setup` downloaded b11972 Vulkan (33 MiB, checksum ok) and ran a model with it on
+the processor. Not tested: NVIDIA, Intel, AMD APUs on real hardware; the Vulkan card selection on any card
+(needs the user's OK on this one); the cgroup/none fences on other distros.
+
 ## Layout
-- `bin/lodger` - the one command: `lodger plan|run|measure|stress|serve|ask|stress-serve` (`--help` on each).
+- `bin/lodger` - the one command: `lodger plan|run|measure|stress|serve|ask|stress-serve|doctor|setup` (`--help` on each).
+- `systemd/config.example.toml` - every setting, documented (live copy: `~/.config/lodger/config.toml`).
 - `systemd/models.example.toml` - the model list used here (live copy: `~/.config/lodger/models.toml`).
 - `lodger/` - the code: `catalog.py` (the model list), `launch.py` (plan/run, watchdog), `plan.py` (placement), `neighbors.py` (who
   needs the card), `sysmem.py` (memory readers), `model.py` (model file reader), `measure.py`, `stress.py`,
-  `serve.py` (serve, ask, step aside, grow back), `servetest.py` (stress-serve).
+  `serve.py` (serve, ask, step aside, grow back), `servetest.py` (stress-serve), `gpu/` (cards: `fdinfo.py`,
+  `amd.py`, `nvidia.py`, `intel.py`, `generic.py`), `engine.py` (llama.cpp and the card it uses), `config.py`,
+  `reserve.py` (desktop reserve), `fence.py`, `host.py` (sysfs/proc reads, redirectable for tests),
+  `doctor.py`, `setup.py`.
+- `tests/` - stdlib unittest; `tests/fixtures/` recorded machines.
 - `systemd/lodger.service` - starts `lodger serve --allow-gpu --idle 10` (all models) with the desktop session;
   linked into `~/.config/systemd/user/` and enabled.
 - `tools/vram-eater.hip` - test program that takes graphics memory like a game loading; built into

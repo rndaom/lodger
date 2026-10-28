@@ -1,0 +1,32 @@
+# lodger's settings: ~/.config/lodger/config.toml (LODGER_CONFIG points elsewhere). Every line is optional;
+# these are the defaults. The list of models is a separate file (models.toml).
+
+# llama.cpp lodger runs: a folder with llama-server and llama-fit-params in it (or in bin/ or build/bin/).
+# Default: what `lodger setup` downloaded (~/.local/share/lodger/llama.cpp/current), else llama-server on PATH.
+# LODGER_LLAMA_CPP overrides this.
+# llama_cpp = "~/src/llama.cpp"
+
+# Which graphics card: "auto" (one with its own memory first, then the most memory), "none" (processor only),
+# or a PCI address from `lodger doctor`, e.g. "0000:03:00.0".
+gpu = "auto"
+
+# Graphics memory always left free for your desktop, at least (MiB). lodger also measures how much your
+# desktop's use jumps and keeps more when it needs to. Default: 1/8 of the card, between 1 and 2 GiB.
+# desktop_reserve_mib = 2048
+
+# Start work on the graphics card while a laptop runs on battery.
+gpu_on_battery = false
+
+# Use a card that is asleep (power saving), waking it. lodger never wakes a card just to look at it.
+wake_gpu = false
+
+# Logs, what lodger learned about your PC, and caches. Default: ~/.local/state/lodger
+# runs_dir = "~/.local/state/lodger"
+
+[extras]
+# The author's own setup: keep off the card while a `llama-router` systemd user service runs, or while
+# llama-game-guard has it paused for a game.
+llama_router = false
+# `lodger serve` on port 8181 writes a "lodger" provider with every model into pi's models.json
+# (https://github.com/earendil-works/pi). `lodger pi` does it either way.
+pi = false
