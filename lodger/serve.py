@@ -30,7 +30,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import catalog, engine, plan as planner, reserve, sysmem
+from . import catalog, engine, fence, plan as planner, reserve, sysmem
 from .launch import GAME_GUARD_FLAG, RUNS, Watchdog, gpu_blockers, router_coming, unit_cgroup, unit_props
 from .neighbors import Neighbors
 
@@ -83,7 +83,7 @@ def free_port():
 
 
 class Engine:
-    """One llama-server process in its own fenced systemd unit, with a watchdog."""
+    """One llama-server process in its own fence (see fence.py), with a watchdog."""
     count = 0
     all = []
 
@@ -91,7 +91,6 @@ class Engine:
         Engine.count += 1
         self.plan, self.entry, self.out = plan, entry, out
         self.port = free_port()
-        self.unit = f"lodger-{os.getpid()}-{Engine.count}"
         self.where = "card" if plan["ngl"] else "processor"
         p = plan
         cmd = [engine.tool("llama-server"), "-m", p["model"], "-c", str(p["ctx"]),
@@ -99,16 +98,14 @@ class Engine:
                "--no-webui", "-a", entry.name] + entry.args()
         dargs, env = engine.device_args(p["ngl"], sysmem.dgpu(), p["n_cpu_moe"])
         cmd += dargs
-        sr = ["systemd-run", "--user", "--quiet", "--collect", f"--unit={self.unit}", "--pipe", "--wait"]
-        sr += [f"--property={k}={v}" for k, v in unit_props(p).items()]
-        sr += [f"--setenv={k}={v}" for k, v in env.items()]
         with open(os.path.join(out, "plan.json"), "w") as f:
-            json.dump({**p, "cmd": cmd, "env": env}, f, indent=1)
+            json.dump({**p, "cmd": cmd, "env": env, "fence": fence.mode()[0]}, f, indent=1)
         self.logf = open(os.path.join(out, "engine.log"), "w")
         # own session: Ctrl-C in the terminal reaches lodger only, which then stops the engine itself
-        self.proc = subprocess.Popen(sr + cmd, stdin=subprocess.DEVNULL, stdout=self.logf, stderr=subprocess.STDOUT,
-                                     start_new_session=True)
-        self.wd = Watchdog(self.unit, bool(p["ngl"]), out, log=os.path.join(out, "engine.log"), keep=p["keep"])
+        self.fence = fence.Fenced(cmd, env, unit_props(p), stdout=self.logf, stderr=subprocess.STDOUT, new_session=True,
+                                  name=f"lodger-{os.getpid()}-{Engine.count}")
+        self.proc = self.fence.proc
+        self.wd = Watchdog(self.fence, bool(p["ngl"]), out, log=os.path.join(out, "engine.log"), keep=p["keep"])
         self.wd.start()
         self.started = time.time()
         Engine.all.append(self)
@@ -131,13 +128,7 @@ class Engine:
     def stop(self):
         """Planned stop (not the watchdog): the watchdog is told first so it records no reason."""
         self.wd.stop_flag.set()
-        subprocess.run(["systemctl", "--user", "kill", "-s", "TERM", self.unit + ".service"], capture_output=True)
-        try:
-            self.proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            subprocess.run(["systemctl", "--user", "kill", "-s", "KILL", self.unit + ".service"], capture_output=True)
-            self.proc.wait(timeout=10)
-        subprocess.run(["systemctl", "--user", "stop", self.unit + ".service"], capture_output=True)  # in case it outlived its client
+        self.fence.stop()
         self.finish()
 
     def finish(self):
@@ -146,6 +137,10 @@ class Engine:
         self.wd.stop_flag.set()
         self.wd.join(timeout=5)
         self.logf.close()
+        if self.fence.pids():
+            self.fence.stop()
+        else:
+            self.fence.close()
         # learn: planned vs really used on the card (only once it had loaded)
         if self.plan["ngl"] and time.time() - self.started > 20:
             with open(os.path.join(RUNS, "calibration.jsonl"), "a") as f:
@@ -407,7 +402,7 @@ class Lodger:
 
     def monitor(self):
         """Switches models, steps aside / grows back, sleeps. Runs for the life of `lodger serve`."""
-        nb = Neighbors()
+        nb = Neighbors(ours=fence.our_pids)
         last_note = 0.0
         while not self.closing:
             time.sleep(1)

@@ -15,14 +15,13 @@ import json
 import os
 import re
 import shlex
-import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
 
-from . import config, engine, plan as planner, reserve, sysmem
+from . import config, engine, fence, plan as planner, reserve, sysmem
 from .neighbors import Neighbors
 
 MiB, GiB = sysmem.MiB, sysmem.GiB
@@ -52,7 +51,7 @@ def router_coming():
 def settle(card, seconds=2.0, limit=30.0):
     """Before taking memory on the card: is another app busy on it, or still loading (free memory
     falling)? Returns a reason the card is taken, or None once it has been calm for `seconds`."""
-    nb = Neighbors(card)
+    nb = Neighbors(card, ours=fence.our_pids)
     t0 = time.time()
     while time.time() - t0 < limit:
         start = sysmem.vram_free(card)
@@ -104,7 +103,7 @@ def show(p, cmd=None, env=None):
 
 
 def unit_props(p, runtime=None):
-    """The fence around the model (systemd unit properties)."""
+    """The fence around the model (as systemd unit properties; see fence.py for PCs without systemd)."""
     props = {
         "MemoryMax": str(p["ram_cap"]), "MemorySwapMax": "0",
         "LimitCORE": "0",                       # no crash dump: a dumping process keeps its VRAM for seconds
@@ -119,25 +118,18 @@ def unit_props(p, runtime=None):
 
 
 def unit_cgroup(unit):
+    """The cgroup of a systemd user service (for --pause services)."""
     r = subprocess.run(["systemctl", "--user", "show", "-p", "ControlGroup", "--value", unit + ".service"],
                        capture_output=True, text=True)
     cg = r.stdout.strip()
     return "/sys/fs/cgroup" + cg if cg else None
 
 
-def read_int(path):
-    try:
-        with open(path) as f:
-            return int(f.read().split()[0])
-    except (OSError, ValueError, IndexError):
-        return None
-
-
 class Watchdog(threading.Thread):
-    def __init__(self, unit, on_gpu, out, log=None, keep=None):
+    def __init__(self, fenced, on_gpu, out, log=None, keep=None):
         super().__init__(daemon=True)
         self.kill_vram = reserve.kill_line(keep if keep is not None else reserve.floor(0))
-        self.unit, self.on_gpu, self.out = unit, on_gpu, out
+        self.fenced, self.on_gpu, self.out = fenced, on_gpu, out
         self.log, self.device_seen = log, False   # the engine's log: is it on the card lodger chose?
         self.stop_flag = threading.Event()
         self.reason = None
@@ -145,7 +137,7 @@ class Watchdog(threading.Thread):
         self.now = {"vram": 0, "gtt": 0}
         self.low = {"vram_free": None, "ram_avail": None}
         self.card = sysmem.dgpu()
-        self.neighbors = Neighbors(self.card) if on_gpu else None
+        self.neighbors = Neighbors(self.card, ours=fence.our_pids) if on_gpu else None
 
     def kill(self, why, graceful=False):
         if self.reason:
@@ -153,11 +145,11 @@ class Watchdog(threading.Thread):
         self.reason = why
         print(f"\n[lodger] STOPPING THE MODEL: {why}", file=sys.stderr, flush=True)
         if graceful:
-            subprocess.run(["systemctl", "--user", "kill", "-s", "TERM", self.unit + ".service"], capture_output=True)
+            self.fenced.kill(signal.SIGTERM)
             t0 = time.time()
-            while time.time() - t0 < 1.5 and unit_cgroup(self.unit):
+            while time.time() - t0 < 1.5 and not self.fenced.gone():
                 time.sleep(0.1)
-        subprocess.run(["systemctl", "--user", "kill", "-s", "KILL", self.unit + ".service"], capture_output=True)
+        self.fenced.kill(signal.SIGKILL)
 
     def check_device(self):
         """Stop the engine if llama.cpp says it uses another card than the one lodger chose. True if stopped."""
@@ -179,7 +171,6 @@ class Watchdog(threading.Thread):
         last_nb = last_log = 0.0
         with open(os.path.join(self.out, "watch.tsv"), "w") as f:
             f.write("t\tvram_free_MiB\tram_avail_MiB\tmodel_vram_MiB\tmodel_gtt_MiB\tmodel_ram_MiB\n")
-            cg = None
             while not self.stop_flag.is_set():
                 now = time.time()
                 loading = now - t0 < LOAD_SECONDS
@@ -191,6 +182,8 @@ class Watchdog(threading.Thread):
                     self.kill(f"only {vf // MiB} MiB of graphics memory left (limit {self.kill_vram // MiB})")
                 elif ra < KILL_RAM_AVAIL:
                     self.kill(f"only {ra // MiB} MiB of RAM left (limit {KILL_RAM_AVAIL // MiB})")
+                elif self.fenced.over_cap():                           # no kernel fence on this PC: we are the fence
+                    self.kill(f"the model went over its RAM cap ({self.fenced.cap // MiB} MiB)")
                 elif self.on_gpu and self.log and not self.device_seen and self.check_device():
                     pass
                 elif self.on_gpu and now - last_nb >= 0.25:
@@ -200,19 +193,14 @@ class Watchdog(threading.Thread):
                         self.kill(why + "; giving the graphics card back", graceful=True)
                 if now - last_log >= 0.5:                              # model's own use, logged twice a second
                     last_log = now
-                    cg = cg or unit_cgroup(self.unit)
                     mv = mg = 0
                     ram = None
-                    if cg:
-                        try:
-                            with open(cg + "/cgroup.procs") as pf:
-                                pids = [int(x) for x in pf.read().split()]
-                        except OSError:
-                            pids = []
+                    pids = self.fenced.pids()
+                    if pids:
                         use = sysmem.gpu_use(self.card, pids)
                         mv, mg = use["vram"], use["gtt"]
-                        ram = read_int(cg + "/memory.current")
-                        self.peak["cgroup_ram"] = max(self.peak["cgroup_ram"], read_int(cg + "/memory.peak") or ram or 0)
+                        ram, peak = self.fenced.memory()
+                        self.peak["cgroup_ram"] = max(self.peak["cgroup_ram"], peak or ram or 0)
                     self.now = {"vram": mv, "gtt": mg}
                     self.peak["model_vram"] = max(self.peak["model_vram"], mv)
                     self.peak["model_gtt"] = max(self.peak["model_gtt"], mg)
@@ -264,27 +252,32 @@ def do_run(a):
     name = re.sub(r"[^A-Za-z0-9.]+", "-", p["name"] or "model")[:40]
     out = os.path.join(RUNS, time.strftime("%Y-%m-%d-%H%M%S") + "-run-" + name)
     os.makedirs(out)
-    unit = f"lodger-{os.getpid()}"
     props = unit_props(p, a.runtime)
     interactive = a.prompt is None
-    sr = ["systemd-run", "--user", "--quiet", "--collect", f"--unit={unit}", "--pty" if interactive else "--pipe", "--wait"]
-    sr += [f"--property={k}={v}" for k, v in props.items()]
-    sr += [f"--setenv={k}={v}" for k, v in env.items()]
+    kind, why = fence.mode()
+    if kind != "systemd":
+        print(f"\n(fence: {why})")
     with open(os.path.join(out, "plan.json"), "w") as f:
-        json.dump({**p, "cmd": cmd, "env": env, "cgroup": props}, f, indent=1)
+        json.dump({**p, "cmd": cmd, "env": env, "cgroup": props, "fence": kind}, f, indent=1)
 
-    wd = Watchdog(unit, bool(p["ngl"]), out, log=None if interactive else os.path.join(out, "log.txt"), keep=p["keep"])
-    wd.start()
     t0 = time.time()
-    signal.signal(signal.SIGINT, lambda *_: wd.kill("you pressed Ctrl+C", graceful=True))
     if interactive:
-        rc = subprocess.run(sr + cmd).returncode
+        o = e = None
+        fenced = fence.Fenced(cmd, env, props, stdin=None, pty=True, name=f"lodger-{os.getpid()}")
     else:
-        with open(os.path.join(out, "output.txt"), "w") as o, open(os.path.join(out, "log.txt"), "w") as e:
-            rc = subprocess.run(sr + cmd, stdin=subprocess.DEVNULL, stdout=o, stderr=e).returncode
+        o, e = open(os.path.join(out, "output.txt"), "w"), open(os.path.join(out, "log.txt"), "w")
+        fenced = fence.Fenced(cmd, env, props, stdout=o, stderr=e, name=f"lodger-{os.getpid()}")
+    wd = Watchdog(fenced, bool(p["ngl"]), out, log=None if interactive else os.path.join(out, "log.txt"), keep=p["keep"])
+    wd.start()
+    signal.signal(signal.SIGINT, lambda *_: wd.kill("you pressed Ctrl+C", graceful=True))
+    rc = fenced.wait()
     secs = time.time() - t0
     wd.stop_flag.set()
     wd.join()
+    fenced.stop() if fenced.pids() else fenced.close()
+    for fh in (o, e):
+        if fh:
+            fh.close()
 
     speed, text = None, ""
     if not interactive:
@@ -340,8 +333,6 @@ def main(argv):
     ap.add_argument("--think", action="store_true", help="let the model reason before answering")
     ap.add_argument("--runtime", type=int, help="stop after this many seconds")
     a = ap.parse_args(argv)
-    if not shutil.which("systemd-run"):
-        sys.exit("systemd-run not found")
     if a.action == "plan":
         p = build_plan(a, False)
         cmd, env = llama_cmd(p, a) if not p["refuse"] else (None, None)

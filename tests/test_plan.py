@@ -187,31 +187,32 @@ class ProbeTest(unittest.TestCase):
         m.files = [os.path.join(build, "build", "bin", "llama-cli")]     # any file: only its size and time are read
         calls = []
 
-        def run(cmd, **kw):
-            calls.append(cmd)
+        def run(cmd, env, props, timeout=300):
+            calls.append((cmd, env, props))
             return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
-        with machine("desktop-amd"), mock.patch("lodger.plan.subprocess.run", side_effect=run):
+        with machine("desktop-amd"), mock.patch("lodger.fence.run", side_effect=run):
             r = plan.probe(m, 4096, gpu_place, dev=gpu.choose() if gpu_place else None)
         return r, calls[0]
 
     def test_vulkan_build(self):
-        r, cmd = self.run_probe(["libggml-vulkan.so"], (41, 0), "Vulkan0 1000 200 300 \nHost 10 0 5 \n")
+        r, (cmd, env, props) = self.run_probe(["libggml-vulkan.so"], (41, 0), "Vulkan0 1000 200 300 \nHost 10 0 5 \n")
         self.assertEqual(r["model"], 1000 * MiB)
-        self.assertIn("Vulkan0", cmd)
-        self.assertIn("--setenv=GGML_VK_VISIBLE_DEVICES=0", cmd)
-        self.assertIn("--setenv=DRI_PRIME=pci-0000_03_00_0", cmd)
+        self.assertEqual(cmd[cmd.index("--device") + 1], "Vulkan0")
+        self.assertEqual(env["GGML_VK_VISIBLE_DEVICES"], "0")
+        self.assertEqual(env["DRI_PRIME"], "pci-0000_03_00_0")
+        self.assertNotIn("PrivateDevices", props)
 
     def test_rocm_build(self):
-        r, cmd = self.run_probe(["libggml-hip.so"], (41, 3), "ROCm0 900 100 200 \nHost 10 0 5 \n")
+        r, (cmd, env, props) = self.run_probe(["libggml-hip.so"], (41, 3), "ROCm0 900 100 200 \nHost 10 0 5 \n")
         self.assertEqual(r["compute"], 200 * MiB)
-        self.assertIn("--setenv=HIP_VISIBLE_DEVICES=0", cmd)
+        self.assertEqual(env, {"HIP_VISIBLE_DEVICES": "0"})
         self.assertEqual(cmd[cmd.index("-ncmoe") + 1], "3")
 
     def test_processor_only_hides_the_cards(self):
-        r, cmd = self.run_probe(["libggml-vulkan.so"], None, "Host 10 20 30 \n")
+        r, (cmd, env, props) = self.run_probe(["libggml-vulkan.so"], None, "Host 10 20 30 \n")
         self.assertEqual(r["context"], 20 * MiB)
-        self.assertIn("PrivateDevices=yes", cmd)
-        self.assertIn("--setenv=GGML_VK_VISIBLE_DEVICES=", cmd)
+        self.assertEqual(props["PrivateDevices"], "yes")
+        self.assertEqual(env, {"GGML_VK_VISIBLE_DEVICES": ""})
         self.assertEqual(cmd[cmd.index("--device") + 1], "none")
 
 

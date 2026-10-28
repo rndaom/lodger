@@ -3,9 +3,8 @@ Every number is in bytes. Each choice records a plain-words reason in plan["why"
 import hashlib
 import json
 import os
-import subprocess
 
-from . import config, engine, reserve, sysmem
+from . import config, engine, fence, reserve, sysmem
 from . import gpu as gpus
 from .model import Model
 
@@ -51,19 +50,17 @@ def probe(model, ctx, gpu=None, extra=(), dev=None):
     if os.path.exists(cf):
         with open(cf) as f:
             return json.load(f)
-    unit = ["systemd-run", "--user", "--quiet", "--collect", "--wait", "--pipe",
-            "-p", "MemoryMax=4G", "-p", "MemorySwapMax=0", "-p", "LimitCORE=0"]
+    props = {"MemoryMax": "4G", "MemorySwapMax": "0", "LimitCORE": "0"}
     args = [fit, "-m", model.files[0], "-c", str(ctx), "--fit-print", "on"] + list(extra)
     if gpu is None:
         dargs, denv = engine.device_args(0, None)
-        unit += ["-p", "PrivateDevices=yes"] + [f"--setenv={k}={v}" for k, v in denv.items()]
+        props["PrivateDevices"] = "yes"
         args += dargs
         prefix = "Host "
     else:
-        unit += [f"--setenv={k}={v}" for k, v in denv.items()]
         args += dargs
         prefix = name + " "                     # --fit-print lines start with the device's name
-    r = subprocess.run(unit + args, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=300)
+    r = fence.run(args, denv, props, timeout=300)
     line = next((l for l in r.stdout.splitlines() if l.startswith(prefix)), None)
     if r.returncode or not line:
         raise SystemExit(f"llama-fit-params failed (exit {r.returncode}):\n{r.stderr[-2000:]}")
