@@ -90,7 +90,7 @@ def _own(pid):
 
 
 def pids():
-    return [int(p) for p in host.listdir("/proc") if p.isdigit()]
+    return sorted(int(p) for p in host.listdir("/proc") if p.isdigit())
 
 
 def comm(pid):
