@@ -114,6 +114,17 @@ def clients(pid):
     return out
 
 
+def per_card(pids):
+    """Graphics memory (on the card + system RAM it maps) the processes hold on each card: {pci: bytes}."""
+    seen, out = set(), {}
+    for pid in pids:
+        for key, rec in clients(pid).items():
+            if key not in seen:
+                seen.add(key)
+                out[key[0]] = out.get(key[0], 0) + rec["vram"] + rec["gtt"]
+    return out
+
+
 def usage(pci, pids):
     """What each process does on the card at `pci`: {pid: {vram, gtt, busy_ns, cycles}}. A client passed
     between processes is counted once, for the first process holding it."""

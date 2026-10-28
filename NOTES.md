@@ -89,7 +89,7 @@ When two promises disagree, the earlier one wins.
    On the processor only, the card's device files don't even exist for it (`PrivateDevices=yes`).
 9. **Watch while it runs.** Ten times a second while loading (its big memory grabs happen then), four
    times a second after. Stop at once if free VRAM < 3/4 of the desktop reserve (1.5 GiB here) or free RAM
-   < 1.5 GiB, or if llama.cpp picked another card than lodger chose; step aside (stop gracefully) if another
+   < 1.5 GiB, or if the model holds 256 MiB+ on another card than lodger chose (kernel fdinfo); step aside (stop gracefully) if another
    app needs the card (or, with the llama_router extra, llama-router is or will be back).
 10. **Learn.** Log planned vs really used, so the margins can shrink when the estimates prove good.
 
@@ -195,8 +195,11 @@ are unchanged (all 42 model x memory cases compared before/after).
   `lodger setup` downloaded, else llama-server on PATH. Its backends are read from its libraries (ROCm,
   CUDA, Vulkan); the vendor's own backend first, else Vulkan. Only the chosen card is made visible (HIP/CUDA
   visibility by index; for Vulkan Mesa's device select by PCI and id, GGML_VK_VISIBLE_DEVICES=0, NVIDIA's
-  driver kept off when the target isn't NVIDIA), so it is always device 0; the watchdog checks llama.cpp's
-  "using device ... (PCI)" line. Model files are read with the PyPI `gguf` package (else the tree's gguf-py).
+  driver kept off when the target isn't NVIDIA), so it is always device 0. The watchdog checks the kernel's
+  fdinfo: 256 MiB+ of the model's memory on any other card (any card, for a processor-only model) stops it.
+  (llama.cpp's "using device ... (PCI)" line counts too, but b11936 and b11972 don't print it by default:
+  llama-cli and llama-server both stay quiet, so the first version of this check never fired.) Not for
+  NVIDIA's driver, which has no fdinfo. Model files are read with the PyPI `gguf` package (else the tree's gguf-py).
   This PC keeps its ds41-local build through `~/.config/lodger/config.toml`.
 - **`lodger setup`**: downloads a stock release (Vulkan by default; rocm, cuda with NVIDIA's runtime, cpu),
   checked against GitHub's SHA-256, into `~/.local/share/lodger/llama.cpp/<tag>-<backend>` + `current`.
@@ -218,8 +221,11 @@ are unchanged (all 42 model x memory cases compared before/after).
 Verified here (processor only unless said): all tests; plans identical before/after; doctor; `lodger run`
 under the cgroup and none fences; `lodger serve --port 8383` answered under systemd and cgroup fences and
 left nothing behind; `lodger setup` downloaded b11972 Vulkan (33 MiB, checksum ok) and ran a model with it on
-the processor. Not tested: NVIDIA, Intel, AMD APUs on real hardware; the Vulkan card selection on any card
-(needs the user's OK on this one); the cgroup/none fences on other distros.
+the processor. On the card (user's OK, 2026-10-28 19:10, lodger.service asleep): the stock b11972 Vulkan
+build put the 9B on the RX 7800 XT, not the built-in graphics (fdinfo: 5.1 GiB on 03:00.0), **71 words/s**
+writing (ROCm build: 74 earlier), 5.4 GiB used of 6.3 planned; the ROCm build ran the same with the new
+check; no kernel errors, no crashes. Not tested: NVIDIA, Intel, AMD APUs on real hardware; Vulkan selection
+on a PC with two cards of the same vendor:device id; the cgroup/none fences on other distros.
 
 ## Layout
 - `bin/lodger` - the one command: `lodger plan|run|measure|stress|serve|ask|stress-serve|doctor|setup` (`--help` on each).
