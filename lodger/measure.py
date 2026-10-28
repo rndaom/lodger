@@ -3,7 +3,7 @@ the peaks. Read-only (sysfs + /proc); safe to run any time, even unattended.
 
   lodger measure [--seconds 600] [--interval 2] [--label everyday]
 
-Writes runs/<date>-measure-<label>/samples.jsonl (one line per sample) and summary.md.
+Writes <runs folder>/<date>-measure-<label>/samples.jsonl (one line per sample) and summary.md.
 Ctrl+C stops early and still writes the summary."""
 import argparse
 import json
@@ -11,7 +11,7 @@ import os
 import signal
 import time
 
-from . import sysmem
+from . import config, sysmem
 
 MiB = sysmem.MiB
 
@@ -24,7 +24,7 @@ def main(argv):
     ap.add_argument("--quiet", action="store_true", help="no live table")
     a = ap.parse_args(argv)
 
-    root = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "runs")
+    root = config.runs_dir()
     out = os.path.realpath(os.path.join(root, time.strftime("%Y-%m-%d-%H%M") + "-measure-" + a.label))
     os.makedirs(out, exist_ok=True)
     stop = []

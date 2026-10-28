@@ -22,11 +22,11 @@ import sys
 import threading
 import time
 
-from . import plan as planner, sysmem
+from . import config, engine, plan as planner, sysmem
 from .neighbors import Neighbors
 
 MiB, GiB = sysmem.MiB, sysmem.GiB
-RUNS = os.path.realpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "runs"))
+RUNS = config.runs_dir()
 # watchdog: stop the model if the card has less than this free, or RAM available falls under this.
 # LODGER_KILL_*_MIB can only raise these (used to test the stop path), never lower them.
 KILL_VRAM_FREE = max(1536, int(os.environ.get("LODGER_KILL_VRAM_FREE_MIB", 0))) * MiB
@@ -79,16 +79,11 @@ def fmt_cmd(cmd, env):
 
 
 def llama_cmd(p, a):
-    cmd = [os.path.join(planner.BIN, "llama-cli"), "-m", p["model"], "-c", str(p["ctx"]), "-t", str(p["threads"]),
+    cmd = [engine.tool("llama-cli"), "-m", p["model"], "-c", str(p["ctx"]), "-t", str(p["threads"]),
            "--fit", "off"]
-    if p["ngl"]:
-        cmd += ["--device", "ROCm0", "-ngl", str(p["ngl"])]       # ROCm0 = RX 7800 XT, ROCm1 = built-in graphics
-        if p["n_cpu_moe"]:
-            cmd += ["-ncmoe", str(p["n_cpu_moe"])]
-        env = {"HIP_VISIBLE_DEVICES": "0"}
-    else:
-        cmd += ["--device", "none", "-ngl", "0"]
-        env = {"HIP_VISIBLE_DEVICES": "-1", "ROCR_VISIBLE_DEVICES": "-1"}
+    # only the chosen card is visible to llama.cpp, so it's always device 0 (see engine.py)
+    dargs, env = engine.device_args(p["ngl"], sysmem.dgpu(), p["n_cpu_moe"])
+    cmd += dargs
     if not a.think:
         cmd += ["--reasoning", "off"]
     if a.prompt is not None:
@@ -140,9 +135,10 @@ def read_int(path):
 
 
 class Watchdog(threading.Thread):
-    def __init__(self, unit, on_gpu, out):
+    def __init__(self, unit, on_gpu, out, log=None):
         super().__init__(daemon=True)
         self.unit, self.on_gpu, self.out = unit, on_gpu, out
+        self.log, self.device_seen = log, False   # the engine's log: is it on the card lodger chose?
         self.stop_flag = threading.Event()
         self.reason = None
         self.peak = {"model_vram": 0, "model_gtt": 0, "cgroup_ram": 0}
@@ -162,6 +158,21 @@ class Watchdog(threading.Thread):
                 time.sleep(0.1)
         subprocess.run(["systemctl", "--user", "kill", "-s", "KILL", self.unit + ".service"], capture_output=True)
 
+    def check_device(self):
+        """Stop the engine if llama.cpp says it uses another card than the one lodger chose. True if stopped."""
+        try:
+            with open(self.log, errors="replace") as f:
+                text = f.read(1 << 20)
+        except OSError:
+            return False
+        if self.card and engine.USING.search(text):
+            self.device_seen = True
+            why = engine.check_log(text, self.card)
+            if why:
+                self.kill(why)
+                return True
+        return False
+
     def run(self):
         t0 = time.time()
         last_nb = last_log = 0.0
@@ -179,6 +190,8 @@ class Watchdog(threading.Thread):
                     self.kill(f"only {vf // MiB} MiB of graphics memory left (limit {KILL_VRAM_FREE // MiB})")
                 elif ra < KILL_RAM_AVAIL:
                     self.kill(f"only {ra // MiB} MiB of RAM left (limit {KILL_RAM_AVAIL // MiB})")
+                elif self.on_gpu and self.log and not self.device_seen and self.check_device():
+                    pass
                 elif self.on_gpu and now - last_nb >= 0.25:
                     last_nb = now
                     why = self.neighbors.update() or router_coming()
@@ -258,7 +271,7 @@ def do_run(a):
     with open(os.path.join(out, "plan.json"), "w") as f:
         json.dump({**p, "cmd": cmd, "env": env, "cgroup": props}, f, indent=1)
 
-    wd = Watchdog(unit, bool(p["ngl"]), out)
+    wd = Watchdog(unit, bool(p["ngl"]), out, log=None if interactive else os.path.join(out, "log.txt"))
     wd.start()
     t0 = time.time()
     signal.signal(signal.SIGINT, lambda *_: wd.kill("you pressed Ctrl+C", graceful=True))

@@ -30,7 +30,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import catalog, plan as planner, sysmem
+from . import catalog, engine, plan as planner, sysmem
 from .launch import GAME_GUARD_FLAG, RUNS, Watchdog, gpu_blockers, router_coming, unit_cgroup, unit_props
 from .neighbors import Neighbors
 
@@ -94,15 +94,11 @@ class Engine:
         self.unit = f"lodger-{os.getpid()}-{Engine.count}"
         self.where = "card" if plan["ngl"] else "processor"
         p = plan
-        cmd = [os.path.join(planner.BIN, "llama-server"), "-m", p["model"], "-c", str(p["ctx"]),
+        cmd = [engine.tool("llama-server"), "-m", p["model"], "-c", str(p["ctx"]),
                "-t", str(p["threads"]), "--fit", "off", "-np", "1", "--host", HOST, "--port", str(self.port),
                "--no-webui", "-a", entry.name] + entry.args()
-        if p["ngl"]:
-            cmd += ["--device", "ROCm0", "-ngl", str(p["ngl"])] + (["-ncmoe", str(p["n_cpu_moe"])] if p["n_cpu_moe"] else [])
-            env = {"HIP_VISIBLE_DEVICES": "0"}
-        else:
-            cmd += ["--device", "none", "-ngl", "0"]
-            env = {"HIP_VISIBLE_DEVICES": "-1", "ROCR_VISIBLE_DEVICES": "-1"}
+        dargs, env = engine.device_args(p["ngl"], sysmem.dgpu(), p["n_cpu_moe"])
+        cmd += dargs
         sr = ["systemd-run", "--user", "--quiet", "--collect", f"--unit={self.unit}", "--pipe", "--wait"]
         sr += [f"--property={k}={v}" for k, v in unit_props(p).items()]
         sr += [f"--setenv={k}={v}" for k, v in env.items()]
@@ -112,7 +108,7 @@ class Engine:
         # own session: Ctrl-C in the terminal reaches lodger only, which then stops the engine itself
         self.proc = subprocess.Popen(sr + cmd, stdin=subprocess.DEVNULL, stdout=self.logf, stderr=subprocess.STDOUT,
                                      start_new_session=True)
-        self.wd = Watchdog(self.unit, bool(p["ngl"]), out)
+        self.wd = Watchdog(self.unit, bool(p["ngl"]), out, log=os.path.join(out, "engine.log"))
         self.wd.start()
         self.started = time.time()
         Engine.all.append(self)

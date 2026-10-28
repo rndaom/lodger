@@ -2,7 +2,7 @@
 import os
 import re
 
-from . import gpu, host
+from . import config, gpu, host
 
 MiB = 1 << 20
 GiB = 1 << 30
@@ -28,8 +28,8 @@ def cards():
 
 
 def dgpu():
-    """The card lodger uses (see gpu.choose), or None."""
-    return gpu.choose()
+    """The card lodger uses (see gpu.choose and gpu in config.toml), or None."""
+    return gpu.choose(config.get()["gpu"])
 
 
 def vram_free(dev=None):

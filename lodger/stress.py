@@ -23,12 +23,12 @@ import subprocess
 import sys
 import time
 
-from . import sysmem
+from . import config, sysmem
 
 ROOT = os.path.realpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 LODGER = os.path.join(ROOT, "bin", "lodger")
 EATER = os.path.join(ROOT, "build", "vram-eater")
-RUNS = os.path.join(ROOT, "runs")
+RUNS = config.runs_dir()
 LONG = "Write a long, detailed story about a lighthouse keeper and a storm. At least 3000 words."
 SHORT = "In two short sentences, explain what a mixture-of-experts language model is."
 BAD_KERNEL = ("MES failed", "ring timeout", "GPU reset", "VRAM is lost", "Not enough memory for command",
