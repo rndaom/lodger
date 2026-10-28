@@ -22,6 +22,7 @@ import time
 
 from . import sysmem
 from .launch import RUNS
+from .serve import auth_header, read_key
 from .stress import EATER, STARTED_STEAM, close_game, health, start_game, wait_drawing
 
 MiB, GiB = sysmem.MiB, sysmem.GiB
@@ -31,6 +32,7 @@ LONG = "Write a detailed, numbered list of 40 practical tips for keeping a home 
 class Server:
     def __init__(self, model, port, out):
         self.port = port
+        self.auth = auth_header(read_key())       # the server inherits LODGER_API_KEY, if set
         self.log = open(os.path.join(out, "serve.log"), "w")
         self.proc = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(__file__), "..", "bin", "lodger"),
                                       "serve", model, "--allow-gpu", "--port", str(port)],
@@ -39,7 +41,7 @@ class Server:
     def get(self, path):
         try:
             c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-            c.request("GET", path)
+            c.request("GET", path, headers=self.auth)
             r = c.getresponse()
             return r.status, json.loads(r.read() or b"{}")
         except (OSError, ValueError):
@@ -64,7 +66,7 @@ class Server:
 
     def move(self):
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-        c.request("POST", "/lodger/move", "{}", {"Content-Type": "application/json"})
+        c.request("POST", "/lodger/move", "{}", {"Content-Type": "application/json", **self.auth})
         return json.loads(c.getresponse().read())
 
     def ask(self, question, n=900, res=None):
@@ -76,7 +78,7 @@ class Server:
         body = {"model": "", "stream": True, "max_tokens": n, "messages": [{"role": "user", "content": question}]}
         try:
             c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=900)
-            c.request("POST", "/v1/chat/completions", json.dumps(body), {"Content-Type": "application/json"})
+            c.request("POST", "/v1/chat/completions", json.dumps(body), {"Content-Type": "application/json", **self.auth})
             r = c.getresponse()
             for line in r:
                 s = line.decode(errors="replace").strip()
