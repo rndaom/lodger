@@ -2,13 +2,14 @@
 
   lodger stress-serve MODEL [--game-appid 440] [--port 8182]
 
-Before: stop llama-router (systemctl --user stop llama-router; start it again afterwards).
+With extras.llama_router on: stop llama-router first (systemctl --user stop llama-router; start it again after).
 Phases (each checked for graphics-card errors in the kernel log, crashed programs and a live desktop):
   1. the model starts on the card and answers
   2. asked to move off the card in the middle of an answer: the answer finishes on the processor
   3. grows back onto the card once the card has been quiet
   4. another program takes graphics memory in the middle of an answer: the model steps aside, the answer
-     finishes, the model grows back after the program lets go
+     finishes, the model grows back after the program lets go (needs build/vram-eater: AMD with ROCm only;
+     skipped without it)
   5. (with --game-appid) a game starts in the middle of an answer; a question asked during the game is
      answered on the processor; the model grows back after the game closes"""
 import argparse
@@ -22,7 +23,7 @@ import time
 
 from . import sysmem
 from .launch import RUNS
-from .stress import EATER, STARTED_STEAM, close_game, health, start_game, wait_drawing
+from .stress import EATER, STARTED_STEAM, close_game, eater_env, eater_why, health, router_running, start_game, wait_drawing
 
 MiB, GiB = sysmem.MiB, sysmem.GiB
 LONG = "Write a detailed, numbered list of 40 practical tips for keeping a home vegetable garden healthy."
@@ -147,7 +148,7 @@ def main(argv):
     ap.add_argument("--port", type=int, default=8182)
     ap.add_argument("--game-appid", type=int)
     a = ap.parse_args(argv)
-    if subprocess.run(["systemctl", "--user", "is-active", "-q", "llama-router"]).returncode == 0:
+    if router_running():
         sys.exit("Stop llama-router first: systemctl --user stop llama-router (and start it again afterwards).")
     out = os.path.join(RUNS, time.strftime("%Y-%m-%d-%H%M%S") + "-stress-serve")
     os.makedirs(out)
@@ -199,7 +200,7 @@ def main(argv):
         t, box = srv.ask_bg(LONG)
         wait_started(box)
         time.sleep(4)
-        eater = subprocess.Popen([EATER, "2048", "30"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        eater = subprocess.Popen([EATER, "2048", "30"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=eater_env())
         children.append(eater)
         t.join(900)
         ok, note = answered(box)
@@ -233,7 +234,11 @@ def main(argv):
         if phase("1. starts on the card", p1):
             phase("2. move off the card mid-answer", p2)
             phase("3. grow back", p3)
-            phase("4. another program takes graphics memory mid-answer", p4)
+            no_eater = eater_why()
+            if no_eater:
+                print(f"\n=== 4. another program takes graphics memory mid-answer ===\nSKIPPED: {no_eater}", flush=True)
+            else:
+                phase("4. another program takes graphics memory mid-answer", p4)
             if a.game_appid:
                 phase(f"5. game {a.game_appid} starts mid-answer", p5)
     finally:

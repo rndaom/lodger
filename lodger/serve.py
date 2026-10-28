@@ -7,8 +7,9 @@
 Apps talk to lodger at http://127.0.0.1:8181/v1/chat/completions (the usual OpenAI-style API); only
 this PC can reach it. It serves every model in ~/.config/lodger/models.toml (or the files given), one at
 a time: a request naming another model switches to it once nothing is being written. Behind it, lodger
-runs our llama.cpp build's server on a private port, with the same plan, fence and watchdog as `lodger run`.
-pi lists all of them: `lodger serve` writes a "lodger" provider into pi's models.json.
+runs llama.cpp's server on a private port, with the same plan, fence and watchdog as `lodger run`.
+pi (https://github.com/earendil-works/pi) can list all of them: `lodger pi` writes a "lodger" provider into
+pi's models.json (and `lodger serve` keeps it current when extras.pi is on in config.toml).
 - Steps aside: when another app needs the graphics card, the model is stopped on the card and started
   again on the processor at once. An answer being written continues where it stopped.
 - Grows back: when the card has been quiet for a while and no answer is being written, the model moves
@@ -30,7 +31,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import catalog, engine, fence, plan as planner, reserve, sysmem
+from . import catalog, config, engine, fence, plan as planner, reserve, sysmem
 from .launch import GAME_GUARD_FLAG, RUNS, Watchdog, gpu_blockers, router_coming, unit_cgroup, unit_props
 from .neighbors import Neighbors
 
@@ -227,7 +228,7 @@ class Lodger:
         for e in self.models.values():
             if e.skip:
                 log(f"not served: {e.name}: {e.skip}")
-        if self.a.port == 8181:
+        if self.a.port == 8181 and config.extra("pi"):
             write_pi_config(self.a.port, [model_info(e) for e in ok], self.default)
 
     def make_plan(self, on_card):
@@ -251,7 +252,7 @@ class Lodger:
 
     def others_coming(self):
         """Is another AI server about to need the card? Services in --pause count only while busy."""
-        if os.path.exists(GAME_GUARD_FLAG):
+        if config.extra("llama_router") and os.path.exists(GAME_GUARD_FLAG):
             return "llama-game-guard paused llama-router for a game"
         busy = self.pausable_busy()
         if busy:

@@ -30,7 +30,8 @@ RUNS = config.runs_dir()
 # LODGER_KILL_*_MIB can only raise these (used to test the stop path), never lower them.
 KILL_RAM_AVAIL = max(1536, int(os.environ.get("LODGER_KILL_RAM_AVAIL_MIB", 0))) * MiB
 LOAD_SECONDS = 90          # watch faster while the model loads (its biggest allocations happen then)
-# ~/.local/bin/llama-game-guard leaves this while it has llama-router stopped for a game; the router comes back after
+# The author's own setup (extras.llama_router in config.toml): ~/.local/bin/llama-game-guard leaves this while it
+# has llama-router stopped for a game; the router comes back after
 GAME_GUARD_FLAG = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"),
                                "llama-game-guard.router-stopped")
 
@@ -40,8 +41,10 @@ def router_active():
 
 
 def router_coming():
+    if not config.extra("llama_router"):
+        return None
     if router_active():
-        return ("llama-router is running and the Steam Deck can make it load a big model at any moment; "
+        return ("llama-router is running and can load a big model at any moment; "
                 "stop it first (systemctl --user stop llama-router) and start it again afterwards")
     if os.path.exists(GAME_GUARD_FLAG):
         return "llama-game-guard stopped llama-router for a game and will start it again when the game ends"

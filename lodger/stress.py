@@ -3,19 +3,20 @@
 
   lodger stress MODEL --allow-gpu [--game-appid 440] [--game-seconds 150] [--only-game]
 
-Before: stop llama-router (systemctl --user stop llama-router; start it again afterwards).
+With extras.llama_router on: stop llama-router first (systemctl --user stop llama-router; start it again after).
 
 1. answer:   the model answers on the graphics card while your usual apps are open.
 2. memory:   while the model writes, a test program takes graphics memory the way a game loads its
-             textures (never leaving under 3 GiB free). The model must step aside.
+             textures (never leaving under 3 GiB free). The model must step aside. Needs build/vram-eater
+             (tools/vram-eater.hip, AMD cards with ROCm only): skipped without it.
 With --game-appid (a Steam game; Steam is started and closed again if it wasn't running):
 3. no false alarm: Steam starts while the model writes. Steam is not using the card hard, so the
              model must keep going.
 4. game:     while the model writes, the game starts. The model must give the card back. Then, with the
              game running, the model answers again (on the processor if the game is busy on the card).
 5. race:     the model and the game start at the same moment. Either may get the card; nothing may crash.
-After each phase: kernel log checked for graphics-card errors, crash dumps counted, and Hyprland must
-still be running. A per-app memory log runs the whole time (lodger measure)."""
+After each phase: kernel log checked for graphics-card errors, crash dumps counted, and your desktop's
+compositor must still be running. A per-app memory log runs the whole time (lodger measure)."""
 import argparse
 import os
 import signal
@@ -24,6 +25,7 @@ import sys
 import time
 
 from . import config, sysmem
+from .gpu import amd
 
 ROOT = os.path.realpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 LODGER = os.path.join(ROOT, "bin", "lodger")
@@ -44,18 +46,57 @@ def running(name):
     return subprocess.run(["pgrep", "-x", name], capture_output=True).returncode == 0
 
 
+# XDG_CURRENT_DESKTOP -> the compositor's process name
+COMPOSITORS = {"hyprland": "Hyprland", "sway": "sway", "niri": "niri", "gnome": "gnome-shell", "kde": "kwin_wayland",
+               "cosmic": "cosmic-comp", "wayfire": "wayfire", "river": "river", "labwc": "labwc"}
+
+
+def compositor():
+    """The process name of the desktop's compositor, or None if lodger doesn't know this desktop."""
+    for d in (os.environ.get("XDG_CURRENT_DESKTOP") or "").lower().split(":"):
+        if d in COMPOSITORS:
+            return COMPOSITORS[d]
+    return None
+
+
+COMPOSITOR = compositor()
+
+
+def router_running():
+    """The author's own llama-router service (extras.llama_router) would compete for the card."""
+    return config.extra("llama_router") and \
+        subprocess.run(["systemctl", "--user", "is-active", "-q", "llama-router"]).returncode == 0
+
+
+def eater_why():
+    """None if the test program that takes graphics memory can run on the chosen card, else why not."""
+    if not os.access(EATER, os.X_OK):
+        return f"no {EATER} (build it with  hipcc --offload-arch=<your card> -O2 -o build/vram-eater tools/vram-eater.hip)"
+    dev = sysmem.dgpu()
+    if dev is None or dev.vendor != "AMD" or amd.kfd_index(dev) is None:
+        return "build/vram-eater needs an AMD card that ROCm lists"
+    return None
+
+
+def eater_env():
+    return dict(os.environ, HIP_VISIBLE_DEVICES=str(amd.kfd_index(sysmem.dgpu())))
+
+
 def health(since):
     """Problems since `since` (a 'YYYY-MM-DD HH:MM:SS' time), as a list of plain sentences."""
     bad = []
     klog = sh(["journalctl", "-k", "--since", since, "--no-pager", "-o", "cat"])
-    hits = [l for l in klog.splitlines() if "amdgpu" in l and any(b.lower() in l.lower() for b in BAD_KERNEL)]
+    dev = sysmem.dgpu()
+    driver = dev.driver if dev and dev.driver else None
+    hits = [l for l in klog.splitlines()
+            if (driver is None or driver in l) and any(b.lower() in l.lower() for b in BAD_KERNEL)]
     if hits:
         bad.append("graphics-card errors in the kernel log:\n    " + "\n    ".join(hits[:8]))
     dumps = [l for l in sh(["coredumpctl", "list", "--since", since, "--no-pager", "--no-legend"]).splitlines() if l.strip()]
     if dumps:
         bad.append("programs crashed:\n    " + "\n    ".join(dumps[:8]))
-    if not running("Hyprland"):
-        bad.append("Hyprland is not running")
+    if COMPOSITOR and not running(COMPOSITOR):
+        bad.append(f"{COMPOSITOR} (your desktop) is not running")
     return bad
 
 
@@ -204,10 +245,12 @@ def main(argv):
     a = ap.parse_args(argv)
     if not a.allow_gpu:
         sys.exit("The stress test uses the graphics card: pass --allow-gpu.")
-    if subprocess.run(["systemctl", "--user", "is-active", "-q", "llama-router"]).returncode == 0:
+    if router_running():
         sys.exit("Stop llama-router first: systemctl --user stop llama-router (and start it again afterwards).")
-    if not os.access(EATER, os.X_OK):
-        sys.exit(f"missing {EATER}: build it with  hipcc --offload-arch=gfx1101 -O2 -o build/vram-eater tools/vram-eater.hip")
+    no_eater = eater_why()
+    if COMPOSITOR is None:
+        print(f"(note: lodger doesn't know your desktop ({os.environ.get('XDG_CURRENT_DESKTOP') or 'none set'}), "
+              "so it can't check that its compositor survives)", flush=True)
 
     meas = subprocess.Popen([LODGER, "measure", "--seconds", "3600", "--interval", "1", "--label", "stress", "--quiet"],
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
@@ -230,13 +273,14 @@ def main(argv):
                     p.kill()
                     return False, "model did not start writing within 5 minutes"
                 time.sleep(5)
-                e = subprocess.run([EATER, "3072", "20"], capture_output=True, text=True, timeout=300,
-                                   env=dict(os.environ, HIP_VISIBLE_DEVICES="0"))
+                e = subprocess.run([EATER, "3072", "20"], capture_output=True, text=True, timeout=300, env=eater_env())
                 out = finish(p)
                 why = stop_line(out)
                 return STEPPED_ASIDE in out or "graphics memory left" in out, \
                     (f"model stepped aside ({why}). " if why else "model did NOT step aside. ") + e.stdout.strip().replace("\n", " ")
-            if not phase("2. another app takes graphics memory", memory, results):
+            if no_eater:
+                print(f"\n=== 2. another app takes graphics memory ===\nSKIPPED: {no_eater}", flush=True)
+            elif not phase("2. another app takes graphics memory", memory, results):
                 return report(results, meas)
 
         if a.game_appid:

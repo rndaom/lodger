@@ -9,7 +9,7 @@ STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.
 DATA = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "lodger")
 
 DEFAULTS = {
-    "llama_cpp": None,              # llama.cpp folder (with llama-server, or build/bin/llama-server); env LODGER_LLAMA_CPP
+    "llama_cpp": None,              # llama.cpp folder (its programs in it, in bin/ or in build/bin/); env LODGER_LLAMA_CPP
     "gpu": "auto",                  # "auto", "none", or a PCI address like "0000:03:00.0"
     "desktop_reserve_mib": None,    # graphics memory always left for the desktop, at least; None: by card size
     "gpu_on_battery": False,        # start work on a graphics card while the laptop runs on battery
