@@ -165,7 +165,7 @@ class FakeLodger:
     def find(self, name):
         return self.entry
 
-    def wait_engine(self, entry):
+    def wait_engine(self, entry, limit=None):
         return self.engine
 
     def cooling(self, entry):
@@ -302,6 +302,23 @@ class EngineKeyTest(unittest.TestCase):
             e.finish()
             self.assertFalse(os.path.exists(e.keyfile))
             self.assertNotIn(e, serve.Engine.all)
+
+    def test_no_model_without_its_watchdog(self):
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(serve, "RUNTIME_DIR", d), \
+                mock.patch.object(serve.fence, "Fenced") as fenced, \
+                mock.patch.object(serve.fence, "mode", return_value=("systemd", "")), \
+                mock.patch.object(serve.engine, "tool", side_effect=lambda name: "/llama.cpp/bin/" + name), \
+                mock.patch.object(serve.engine, "device_args", return_value=([], {})), \
+                mock.patch.object(serve.sysmem, "dgpu", return_value=None), \
+                mock.patch.object(serve, "Watchdog", side_effect=ValueError("bad LODGER_KILL_VRAM_FREE_MIB")):
+            plan = {"model": "/m.gguf", "ctx": 4096, "threads": 4, "ngl": 0, "n_cpu_moe": 0, "ram_cap": 1 << 30,
+                    "keep": 1 << 30}
+            with self.assertRaises(ValueError):
+                serve.Engine(plan, SimpleNamespace(name="m", args=lambda: []), d)
+            fenced.return_value.stop.assert_called_once()        # the model was stopped again
+            self.assertEqual([e for e in serve.Engine.all if e.fence is fenced.return_value], [])
+            self.assertEqual([f for f in os.listdir(d) if f.endswith(".key")], [])
 
     def test_failed_start_leaves_no_key(self):
         with tempfile.TemporaryDirectory() as d, \

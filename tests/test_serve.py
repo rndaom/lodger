@@ -335,6 +335,14 @@ class LodgerTest(unittest.TestCase):
         self.assertIsNone(l.cooling(l.models["b"]))         # tried again after the cool-down
         self.assertEqual(l.status()["models"]["b"], "ok")
 
+    def test_engine_the_watchdog_is_stopping_is_not_handed_out(self):
+        l = self.l
+        e = FakeEng(l.models["a"])
+        l.install(e)
+        e.wd.reason = "a game needs the card"                # still alive for a moment while it's stopped
+        self.assertIsNone(l.wait_engine(l.models["a"], limit=0.3))
+        self.assertEqual(l.busy, {})
+
     def test_default_request_skips_a_skipped_model(self):
         l = self.l
         l.models["a"].skip = "can't be read"

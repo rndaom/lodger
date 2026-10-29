@@ -317,10 +317,21 @@ class Fenced:
                              + (systemd_memory()[1] or "no memory controller for this unit"))
         return bool(self._hard)
 
+    def own_memory(self):
+        """RAM only the program holds (not model file pages, which the kernel can drop and read again), bytes."""
+        cg = self.cgroup()
+        stat = _text(cg + "/memory.stat") if cg else None
+        if stat:
+            v = {k: int(n) for k, n in (l.split() for l in stat.splitlines() if l.count(" ") == 1) if n.isdigit()}
+            if "anon" in v:
+                return v["anon"] + v.get("shmem", 0)
+        return sum(_anon(p) for p in self.pids())
+
     def over_cap(self):
         """Over its RAM cap where the kernel doesn't enforce it ('none', or a systemd unit whose cap didn't
-        apply): the watchdog enforces it from this."""
-        return self.cap is not None and not self.hard() and self.memory()[0] > self.cap
+        apply): the watchdog enforces it from this. Like the kernel would, it counts the program's own memory:
+        weights read from the model file are page cache, given back under pressure (a "slow" plan relies on it)."""
+        return self.cap is not None and not self.hard() and self.own_memory() > self.cap
 
     def gone(self):
         return self.proc.poll() is not None and not self.pids()
@@ -515,6 +526,14 @@ def _kill_cgroup(d):
         time.sleep(0.1)
     with contextlib.suppress(OSError):
         os.rmdir(d)
+
+
+def _anon(pid):
+    n = 0
+    for line in (host.read(f"/proc/{pid}/status") or "").splitlines():
+        if line.startswith(("RssAnon:", "RssShmem:")):
+            n += int(line.split()[1]) * 1024
+    return n
 
 
 def _rss(pid):

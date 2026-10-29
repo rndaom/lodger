@@ -37,7 +37,11 @@ PREFER = {"AMD": ("rocm", "vulkan"), "NVIDIA": ("cuda", "vulkan"), "Intel": ("vu
 DEVICE_VARS = ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL", "CUDA_VISIBLE_DEVICES",
                "CUDA_DEVICE_ORDER", "GGML_VK_VISIBLE_DEVICES", "MESA_VK_DEVICE_SELECT",
                "MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE", "DRI_PRIME", "VK_LOADER_DRIVERS_DISABLE",
-               "NODEVICE_SELECT", "VK_LOADER_LAYERS_DISABLE")
+               "NODEVICE_SELECT", "VK_LOADER_LAYERS_DISABLE",
+               # the Vulkan loader's own ways to choose drivers and devices: they can change which card is Vulkan0
+               "VK_ICD_FILENAMES", "VK_ADD_DRIVER_FILES", "VK_DRIVER_FILES", "VK_LOADER_DRIVERS_SELECT",
+               "VK_LOADER_DEVICE_SELECT", "VK_LOADER_DEVICE_ID_FILTER", "VK_LOADER_VENDOR_ID_FILTER",
+               "VK_LOADER_DRIVER_ID_FILTER", "VK_INSTANCE_LAYERS", "VK_LOADER_LAYERS_ENABLE")
 RUNTIME_VARS = ("HSA_", "HIP_", "ROCM_", "ROCBLAS_", "HIPBLASLT_", "AMD_", "GPU_", "RADV_", "ACO_", "MESA_", "VK_",
                 "ANV_", "INTEL_", "CUDA_", "__GL_", "GGML_", "LD_LIBRARY_PATH")
 CLEARED = ("LLAMA_ARG_", "LLAMA_API_KEY")

@@ -266,7 +266,8 @@ class SetupInstallTest(unittest.TestCase):
         import urllib.error
         hdr = email.message.Message()
         hdr["X-RateLimit-Remaining"] = "0"
-        limit = urllib.error.HTTPError(setup.API, 403, "rate limit exceeded", hdr, None)
+        limit = urllib.error.HTTPError(setup.API, 403, "rate limit exceeded", hdr, io.BytesIO(b""))
+        self.addCleanup(limit.close)
         with mock.patch("urllib.request.urlopen", side_effect=limit), self.assertRaises(SystemExit) as ex:
             setup.get_json(setup.API)
         self.assertIn("GITHUB_TOKEN", str(ex.exception))

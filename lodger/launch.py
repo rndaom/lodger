@@ -40,7 +40,10 @@ GAME_GUARD_FLAG = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os
 
 
 def router_active():
-    return subprocess.run(["systemctl", "--user", "is-active", "-q", "llama-router"]).returncode == 0
+    try:   # asked by the watchdog several times a second: it must never hang there
+        return subprocess.run(["systemctl", "--user", "is-active", "-q", "llama-router"], timeout=5).returncode == 0
+    except subprocess.TimeoutExpired:
+        return True                             # can't tell: count it as running (keeps off the card)
 
 
 def router_coming():
@@ -367,8 +370,12 @@ def do_run(a):
     else:
         o, e = open(os.path.join(out, "output.txt"), "w"), open(os.path.join(out, "log.txt"), "w")
         fenced = fence.Fenced(cmd, env, props, stdout=o, stderr=e, name=f"lodger-{os.getpid()}")
-    wd = Watchdog(fenced, bool(p["ngl"]), out, log=None if interactive else os.path.join(out, "log.txt"), keep=p["keep"])
-    wd.start()
+    try:
+        wd = Watchdog(fenced, bool(p["ngl"]), out, log=None if interactive else os.path.join(out, "log.txt"), keep=p["keep"])
+        wd.start()
+    except BaseException:                       # never leave the model running without its watchdog
+        fenced.stop()
+        raise
     signal.signal(signal.SIGINT, lambda *_: wd.kill("you pressed Ctrl+C", graceful=True))
     rc = wait_watched(fenced, wd)
     secs = time.time() - t0

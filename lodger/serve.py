@@ -191,13 +191,20 @@ class Engine:
                 self.logf.close()
             raise
         Engine.all.append(self)                  # from here on, lodger's exit stops it whatever happens next
+        self.proc = self.fence.proc
+        try:
+            self.wd = Watchdog(self.fence, bool(p["ngl"]), out, log=os.path.join(out, "engine.log"), keep=p["keep"])
+            self.wd.start()
+        except BaseException:                    # never leave a model running without its watchdog
+            self.fence.stop()
+            Engine.all.remove(self)
+            self.forget_keyfile()
+            self.logf.close()
+            raise
         try:
             self.card = card_fields(bool(p["ngl"]))   # which card and backend, for calibration
         except (Exception, SystemExit):
             self.card = {}
-        self.proc = self.fence.proc
-        self.wd = Watchdog(self.fence, bool(p["ngl"]), out, log=os.path.join(out, "engine.log"), keep=p["keep"])
-        self.wd.start()
 
     def alive(self):
         return self.proc.poll() is None
@@ -235,10 +242,11 @@ class Engine:
         return False
 
     def stop(self):
-        """Planned stop (not the watchdog): the watchdog is told first so it records no reason."""
+        """Planned stop (not the watchdog). The watchdog keeps watching until the model is really gone: if the
+        stop fails, it still stops the model when memory runs low."""
         self.stopping = True
-        self.wd.stop_flag.set()
         self.fence.stop()
+        self.wd.stop_flag.set()
         self.finish()
 
     def finish(self):
@@ -444,8 +452,9 @@ class Lodger:
         self.note(f"starting {self.cur.name} on the {e.where}"
                   + (f" ({self.why_off_card})" if self.why_off_card and not p["ngl"] else "")
                   + f", context {p['ctx']}" + (f", {p['ngl']} layers on the card" if p["ngl"] else ""))
-        if not e.wait_ready(abort=lambda: self.closing) or self.closing:
-            reason = e.wd.reason or ("lodger is stopping" if self.closing else "it exited while loading (see engine.log)")
+        if not e.wait_ready(abort=lambda: self.closing or not e.watched()) or self.closing or not e.watched():
+            reason = e.wd.reason or ("lodger is stopping" if self.closing else "its watchdog stopped working"
+                                     if not e.watched() else "it exited while loading (see engine.log)")
             if e.alive():
                 e.stop()
             else:
@@ -510,8 +519,8 @@ class Lodger:
                 if entry.skip or self.closing:
                     return None
                 e = self.engine
-                if (self.cur is entry and self.ready and e and e.alive() and not e.stopping
-                        and self.switch_to in (None, entry)):
+                if (self.cur is entry and self.ready and e and e.alive() and not e.stopping and not e.wd.reason
+                        and self.switch_to in (None, entry)):    # not one the watchdog is stopping
                     self.busy[e] = self.busy.get(e, 0) + 1     # under the lock: no switch or sleep can slip in
                     return e
                 if self.cooling(entry):
@@ -698,8 +707,11 @@ class Lodger:
             if old:
                 # new answers go to the card now; one still being written on the processor may finish there
                 # (a tool call cut by a move must be asked again), then the rest continues on the card
+                end = time.time() + GROW_WAIT
                 with self.cv:
-                    self.cv.wait_for(lambda: self.closing or not self.busy.get(old), GROW_WAIT)
+                    while (time.time() < end and self.busy.get(old) and not self.closing
+                           and new.watched() and old.watched()):        # the monitor is busy here: watch them
+                        self.cv.wait(1)
                 old.stop()
 
     def note_desktop(self):
@@ -1052,13 +1064,24 @@ def make_handler(lodger, key=None):
             self.end_headers()
             self.close_connection = True
 
+        def wait_pinging(self, entry):
+            """wait_engine() for a streaming app, pinging it while a model loads or switches (minutes, sometimes):
+            it keeps the app's connection open, and an app that went away ends the wait (OSError)."""
+            end = time.time() + MOVE_WAIT
+            while True:
+                t0, step = time.time(), min(PING, max(0.0, end - time.time()))
+                e = lodger.wait_engine(entry, limit=step)
+                if e or time.time() >= end or time.time() - t0 < step - 0.5:   # ready, too long, or can't run
+                    return e
+                self.event(":")
+
         def stream_error(self, msg):
             self.event(f"data: {json.dumps({'error': {'message': msg}})}")
 
         def relay(self, body, entry, path):
             """A streaming answer of the other kinds (e.g. /v1/completions): passed through; a move ends it."""
             self.start_stream()
-            e = lodger.wait_engine(entry)
+            e = self.wait_pinging(entry)
             if not e:
                 return self.stream_error(self.unavailable(entry))
             c = None
@@ -1102,7 +1125,7 @@ def make_handler(lodger, key=None):
                                      and not last.get("tool_calls")) else None
             try:
                 for attempt in range(6):
-                    e = lodger.wait_engine(entry)
+                    e = self.wait_pinging(entry)
                     if not e:
                         return self.stream_error(self.unavailable(entry))
                     c = None

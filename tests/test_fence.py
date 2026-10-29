@@ -166,11 +166,19 @@ class SystemdCapTest(unittest.TestCase):
         self.assertFalse(f.over_cap())                     # the kernel enforces it, not the watchdog
 
     def test_cap_ignored_means_the_watchdog_enforces_it(self):
-        f = self.fenced({"memory.max": "max", "memory.current": str(2 << 30)})
+        f = self.fenced({"memory.max": "max", "memory.current": str(2 << 30),
+                         "memory.stat": f"anon {2 << 30}\nfile 0\nshmem 0\n"})
         with mock.patch("lodger.fence.systemd_memory", return_value=(False, "not delegated")):
             self.assertFalse(f.hard())
             self.assertIn("not delegated", f.hard_why)
             self.assertTrue(f.over_cap())
+
+    def test_model_file_pages_dont_count_against_an_unenforced_cap(self):
+        # a "slow" plan: weights bigger than the room are read again as needed; the kernel would drop them
+        f = self.fenced({"memory.max": "max", "memory.current": str(3 << 30),
+                         "memory.stat": f"anon {512 << 20}\nfile {(3 << 30) - (512 << 20)}\nshmem 0\n"})
+        with mock.patch("lodger.fence.systemd_memory", return_value=(False, "not delegated")):
+            self.assertFalse(f.over_cap())
 
     def test_no_memory_controller_counts_the_processes(self):
         f = self.fenced({}, pids=(os.getpid(),))
