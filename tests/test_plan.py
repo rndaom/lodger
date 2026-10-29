@@ -12,11 +12,11 @@ from tests.support import machine
 MiB, GiB = 1 << 20, 1 << 30
 
 
-def fake_model(layers=40, dense=100 * MiB, experts=0, embd=500 * MiB, ctx_train=262144):
+def fake_model(layers=40, dense=100 * MiB, experts=0, embd=500 * MiB, ctx_train=262144, other=0):
     m = object.__new__(Model)
     m.path, m.files = "/models/fake.gguf", ["/models/fake.gguf"]
     m.layers = {i: {"dense": dense, "experts": experts} for i in range(layers)}
-    m.token_embd, m.output, m.other = embd, embd, 0
+    m.token_embd, m.output, m.other = embd, embd, other
     m.n_layer = layers
     m.meta = {"name": "Fake", "arch": "fake", "ctx_train": ctx_train,
               "expert_count": 128 if experts else None, "expert_used": 8 if experts else None}
@@ -37,7 +37,7 @@ def fake_build(*libs):
     return d
 
 
-class PlanTest(unittest.TestCase):
+class PlanBase(unittest.TestCase):
     def setUp(self):
         self.runs = tempfile.mkdtemp(prefix="lodger-runs-")
         self.build = fake_build("libggml-hip.so")
@@ -59,6 +59,8 @@ class PlanTest(unittest.TestCase):
         kw.setdefault("threads", 8)
         return plan.make(m, **kw)
 
+
+class PlanTest(PlanBase):
     def test_small_model_goes_on_the_card_whole(self):
         with machine("desktop-amd"):
             p = self.make(fake_model(), vram_free=15 * GiB)
@@ -288,6 +290,208 @@ class ReserveTest(unittest.TestCase):
         self.assertEqual(reserve.kill_line(2 * GiB), 1536 * MiB)     # this PC: as before
         with mock.patch.dict(os.environ, {"LODGER_KILL_VRAM_FREE_MIB": "4096"}):
             self.assertEqual(reserve.kill_line(2 * GiB), 4 * GiB)    # tests may raise it
+
+    def test_config_can_raise_the_floor_but_never_lower_it(self):
+        from lodger import reserve
+        for low in (-4096, 0, 512):
+            cfg = config.load("/nonexistent")
+            cfg["desktop_reserve_mib"] = low
+            config.use(cfg)
+            self.assertEqual(reserve.floor(16 * GiB), 2 * GiB, low)
+        cfg["desktop_reserve_mib"] = "lots"
+        with self.assertRaises(ValueError):
+            reserve.floor(16 * GiB)
+
+    def test_strange_notes_file_counts_as_no_notes(self):
+        from lodger import reserve
+        runs = tempfile.mkdtemp(prefix="lodger-runs-")
+        self.addCleanup(subprocess.run, ["rm", "-rf", runs])
+        cfg = config.load("/nonexistent")
+        cfg["runs_dir"] = runs
+        config.use(cfg)
+        for i, text in enumerate(['[1, 2]', '{"5": 3}', '{"5": [1]}', '{"x": [1, 2]}', '{"5": ["a", "b"]}', 'not json']):
+            pci = f"0000:0{i}:00.0"
+            with open(reserve._path(pci), "w") as f:
+                f.write(text)
+            self.assertEqual(reserve._load(pci), {}, text)
+            self.assertEqual(reserve.reserve(pci, 16 * GiB), (2 * GiB, None))
+        reserve._notes.clear()
+
+
+class LadderTest(unittest.TestCase):
+    def test_the_usual_ladder_is_unchanged(self):
+        self.assertEqual(plan.ladder(131072, 4096, 262144), [131072, 65536, 32768, 16384, 8192, 4096])
+        self.assertEqual(plan.ladder(16384, 16384, 262144), [16384])
+
+    def test_the_minimum_is_always_tried(self):
+        self.assertEqual(plan.ladder(6000, 4096, None), [6000, 4096])
+        self.assertEqual(plan.ladder(131072, 4096, 128000)[-1], 4096)
+
+    def test_never_past_what_the_model_was_trained_for(self):
+        self.assertEqual(plan.ladder(131072, 4096, 2048), [2048])
+        self.assertEqual(plan.ladder(131072, 4096, 128000)[0], 128000)
+
+    def test_zero_or_tiny_contexts_are_refused(self):
+        for target, lo in ((0, 0), (8192, 0), (100, 100)):
+            with self.assertRaises(ValueError):
+                plan.ladder(target, lo, 262144)
+
+
+class PlanSafetyTest(PlanBase):
+    """Things that must make a plan bigger (or refuse), never smaller."""
+
+    def test_no_layers_is_refused(self):
+        p = self.make(fake_model(layers=0), vram_free=15 * GiB, card=None)
+        self.assertIn("no layers", p["refuse"])
+
+    def test_zero_min_ctx_is_refused_not_looped(self):
+        with self.assertRaises(ValueError):
+            self.make(fake_model(), card=None, min_ctx=0)
+
+    def test_pieces_outside_the_layers_count_on_the_card(self):
+        with machine("desktop-amd"):
+            a = self.make(fake_model(), vram_free=15 * GiB, target_ctx=8192)
+            b = self.make(fake_model(other=GiB), vram_free=15 * GiB, target_ctx=8192)
+            c = self.make(fake_model(dense=60 * MiB, experts=400 * MiB, other=GiB), vram_free=12 * GiB)
+        self.assertEqual(b["gpu_est"] - a["gpu_est"], GiB)
+        self.assertGreater(c["n_cpu_moe"], 0)
+        self.assertLessEqual(c["gpu_bytes"], 12 * GiB - c["keep"])
+
+    def test_negative_leave_gpu_doesnt_add_room(self):
+        with machine("desktop-amd"):
+            a = self.make(fake_model(), vram_free=15 * GiB)
+            b = self.make(fake_model(), vram_free=15 * GiB, leave_gpu=-8 * GiB)
+        self.assertEqual(a["vram_budget"], b["vram_budget"])
+
+    def test_context_that_doesnt_grow_is_never_planned_below_llamas_number(self):
+        def probe(model, ctx, gpu=None, extra=(), dev=None):
+            return {"model": 0, "context": (900 if ctx == 4096 else 500) * MiB, "compute": 0}
+        with mock.patch("lodger.plan.probe", side_effect=probe):
+            c = plan.Costs(fake_model(), 4096, 65536)
+        self.assertGreaterEqual(c.context(65536), 900 * MiB)
+
+    def projector(self, size):
+        path = os.path.join(self.runs, "mmproj.gguf")
+        with open(path, "wb") as f:
+            f.truncate(size)
+        return path
+
+    def test_vision_projector_counts_on_the_card(self):
+        seen = []
+
+        def probe(model, ctx, gpu=None, extra=(), dev=None):
+            seen.append(list(extra))
+            return fake_probe(model, ctx)
+        proj = self.projector(800 * MiB)
+        with machine("desktop-amd"), mock.patch("lodger.plan.probe", side_effect=probe):
+            a = self.make(fake_model(), vram_free=15 * GiB, target_ctx=8192)
+            b = self.make(fake_model(), vram_free=15 * GiB, target_ctx=8192, extra=["--mmproj", proj, "--flash-attn", "on"])
+            c = self.make(fake_model(), vram_free=15 * GiB, target_ctx=8192, extra=["--mmproj", proj, "--no-mmproj-offload"])
+        self.assertEqual(b["gpu_est"] - a["gpu_est"], 800 * MiB + plan.MMPROJ_SCRATCH)
+        self.assertEqual(c["gpu_est"], a["gpu_est"])
+        self.assertEqual(c["ram_anon_est"] - a["ram_anon_est"], 800 * MiB + plan.MMPROJ_SCRATCH)
+        self.assertTrue(all("--mmproj" not in e and "--no-mmproj-offload" not in e for e in seen), seen)
+        self.assertIn(["--flash-attn", "on"], seen)                  # the rest still reaches llama.cpp
+
+    def test_vision_projector_counts_in_ram_on_the_processor(self):
+        proj = self.projector(800 * MiB)
+        a = self.make(fake_model(), card=None, target_ctx=8192)
+        b = self.make(fake_model(), card=None, target_ctx=8192, extra=["--mmproj", proj])
+        self.assertEqual(b["ram_anon_est"] - a["ram_anon_est"], 800 * MiB + plan.MMPROJ_SCRATCH)
+
+    def test_weights_held_in_ram_must_fit(self):
+        m = fake_model()
+        a = self.make(m, card=None, target_ctx=8192)
+        for extra in (["--no-mmap"], ["--mlock"], ["--load-mode", "mlock"], ["--load-mode", "none"]):
+            b = self.make(m, card=None, target_ctx=8192, extra=extra)
+            self.assertEqual(b["ram_anon_est"] - a["ram_anon_est"], m.total, extra)
+            self.assertFalse(b["slow"])
+        tight = self.make(m, card=None, target_ctx=8192, ram_avail=a["ram_anon_est"] + 6 * GiB, extra=["--no-mmap"])
+        self.assertIsNotNone(tight["refuse"])
+        self.assertIsNone(self.make(m, card=None, target_ctx=8192, ram_avail=a["ram_anon_est"] + 6 * GiB)["refuse"])
+        self.assertEqual(plan.own_costs(["--load-mode", "mmap", "--no-mmap"]), (["--load-mode", "mmap"], 0, True, True))
+        self.assertEqual(plan.own_costs(["--load-mode", "mmap"])[3], False)
+
+
+class ProbeCacheTest(unittest.TestCase):
+    def setUp(self):
+        self.runs = tempfile.mkdtemp(prefix="lodger-runs-")
+        self.build = fake_build("libggml-hip.so", "libllama.so")
+        self.addCleanup(subprocess.run, ["rm", "-rf", self.runs, self.build])
+        cfg = config.load("/nonexistent")
+        cfg.update(runs_dir=self.runs, llama_cpp=self.build)
+        config.use(cfg)
+        self.addCleanup(config.use, None)
+        self.m = fake_model()
+        self.m.files = []
+        for i in (1, 2):
+            p = os.path.join(self.runs, f"part{i}.gguf")
+            open(p, "w").close()
+            self.m.files.append(p)
+        self.calls = []
+
+    def run_probe(self):
+        def run(cmd, env, props, timeout=300):
+            self.calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="Host 10 20 30 \n", stderr="")
+        with machine("desktop-amd"), mock.patch("lodger.fence.run", side_effect=run):
+            return plan.probe(self.m, 4096)
+
+    def cached(self):
+        return [os.path.join(plan.cache_dir(), n) for n in os.listdir(plan.cache_dir())]
+
+    def test_damaged_cache_file_is_a_miss(self):
+        self.assertEqual(self.run_probe()["context"], 20 * MiB)
+        (cf,) = self.cached()
+        for bad in ('{"model": 1', '[1, 2]', '{"model": 1, "context": 2}', '{"model": "1", "context": 2, "compute": 3}'):
+            with open(cf, "w") as f:
+                f.write(bad)
+            self.assertEqual(self.run_probe(), {"model": 10 * MiB, "context": 20 * MiB, "compute": 30 * MiB}, bad)
+        self.assertEqual(len(self.calls), 5)
+        self.assertEqual(self.cached(), [cf])                       # rewritten in place, no temp files left
+        self.run_probe()
+        self.assertEqual(len(self.calls), 5)                        # a good file is used
+
+    def test_any_part_or_library_changing_asks_again(self):
+        self.run_probe()
+        self.run_probe()
+        self.assertEqual(len(self.calls), 1)
+        os.utime(self.m.files[1], (1, 1))
+        self.run_probe()
+        self.assertEqual(len(self.calls), 2)
+        os.utime(os.path.join(self.build, "build", "bin", "libllama.so"), (1, 1))
+        self.run_probe()
+        self.assertEqual(len(self.calls), 3)
+
+
+class CalibrationTest(unittest.TestCase):
+    def setUp(self):
+        self.runs = tempfile.mkdtemp(prefix="lodger-runs-")
+        self.addCleanup(subprocess.run, ["rm", "-rf", self.runs])
+        cfg = config.load("/nonexistent")
+        cfg["runs_dir"] = self.runs
+        config.use(cfg)
+        self.addCleanup(config.use, None)
+
+    def write(self, *lines):
+        with open(os.path.join(self.runs, "calibration.jsonl"), "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+    def test_bad_lines_are_skipped_one_by_one(self):
+        good = '{"llama_gpu_est": %d, "gpu_real": %d}' % (10 * GiB, 10 * GiB + 900 * MiB)
+        self.write("{not json", "[1, 2]", '"text"', '{"llama_gpu_est": "big", "gpu_real": 5}',
+                   '{"llama_gpu_est": true, "gpu_real": 5}', '{"llama_gpu_est": null, "gpu_real": 5}', good)
+        over, src = plan.learned_overhead()
+        self.assertEqual(over, 900 * MiB + 128 * MiB)              # the good run still counts
+        self.assertIn("1 recent", src)
+
+    def test_runs_on_another_card_or_backend_dont_count(self):
+        self.write('{"llama_gpu_est": %d, "gpu_real": %d, "pci": "0000:03:00.0", "backend": "rocm"}' % (GiB, GiB + 300 * MiB),
+                   '{"llama_gpu_est": %d, "gpu_real": %d, "pci": "0000:09:00.0", "backend": "rocm"}' % (GiB, GiB + 1200 * MiB),
+                   '{"llama_gpu_est": %d, "gpu_real": %d, "pci": "0000:03:00.0", "backend": "vulkan"}' % (GiB, GiB + 1100 * MiB),
+                   '{"llama_gpu_est": %d, "gpu_real": %d}' % (GiB, GiB + 200 * MiB))
+        self.assertEqual(plan.learned_overhead("0000:03:00.0", "rocm")[0], 300 * MiB + 128 * MiB)
+        self.assertEqual(plan.learned_overhead()[0], 1200 * MiB + 128 * MiB)
 
 
 if __name__ == "__main__":
