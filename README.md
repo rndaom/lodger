@@ -131,7 +131,10 @@ curl http://127.0.0.1:8181/v1/chat/completions \
 
 Any app or library that lets you set an OpenAI base URL works: add it as a "custom OpenAI-compatible provider"
 and use the URL above. Streaming and non-streaming both work. The API has `/v1/chat/completions`,
-`/v1/models` and `/health`.
+`/v1/models` and `/health`, and passes `/v1/completions`, `/v1/embeddings` (if the model's settings turn
+embeddings on), `/infill`, `/tokenize`, `/detokenize` and `/apply-template` on to llama.cpp as they are. A chat
+answer that is being written when the model moves continues where it stopped; the others end with an error and
+the app asks again.
 
 lodger's own endpoints:
 

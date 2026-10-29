@@ -53,7 +53,7 @@ When two promises disagree, the earlier one wins.
 
 ## How lodger decides
 1. **Is the card free to use?** Only if you allow it (`--allow-gpu`). Then lodger watches every app
-   for two seconds (see "Who needs the card" below). If one is busy on the card or still loading
+   for about 4.5 seconds (longer than "busy" takes to show; see "Who needs the card" below). If one is busy on the card or still loading
    (free memory falling), it waits for things to settle, or runs on the processor instead.
 2. **Measure what is free now.** VRAM free = card total minus used, from the kernel (`lodger/gpu/`: sysfs
    for AMD, NVML for NVIDIA; the card runtime's own number said ~700 MiB more than really was free here).
@@ -178,6 +178,9 @@ this PC loads models onto the card and lodger uses it freely.
 - **Card scratch space was guessed**: now llama.cpp's own estimate + learned overhead.
 
 ## Later (promise 2 and 3)
+- Non-streaming answers start over after a move (streaming ones continue): stream from the engine inside lodger and
+  build the one JSON answer, so they keep what was written too.
+- Usage numbers (`usage`, `timings`) in a continued streaming answer count only the part after the move.
 - Shrink in place without a restart (grow-back is done, but every move restarts the engine).
 - `lodger serve --think`: continuing a half-written *reasoning* part after a move is untested.
 - Save the stress test's answers, to check the seam of a moved answer by eye on the card too (checked on
@@ -268,7 +271,8 @@ on a PC with two cards of the same vendor:device id; the cgroup/none fences on o
   `doctor.py`, `setup.py`.
 - `tests/` - stdlib unittest; `tests/fixtures/` recorded machines.
 - `systemd/lodger.service` - starts `lodger serve --allow-gpu --idle 10` (all models) with the desktop session;
-  linked into `~/.config/systemd/user/` and enabled.
+  linked into `~/.config/systemd/user/` and enabled. The repo's unit runs an installed `~/.local/bin/lodger`; this PC
+  runs the checkout through the drop-in `~/.config/systemd/user/lodger.service.d/checkout.conf` (since 2026-10-29).
 - `tools/vram-eater.hip` - test program that takes graphics memory like a game loading; built into
   `build/` (not for git).
 - `runs/` - logs from measurements and runs, `calibration.jsonl`, `probe-cache/` (local only, not for git).
@@ -406,3 +410,43 @@ on a PC with two cards of the same vendor:device id; the cgroup/none fences on o
     file with the 35B and listing files with the 9B (lodger switched by itself).
   - Later: vision (the projector files are there, not planned yet); MTP / n-gram speculation for the
     27Bs (the old router got ~58 vs 32 words/s on Heretic with it; llama-fit-params can't size it yet).
+
+- 2026-10-29 **hardening pass** (user: "no gaps left, aim for perfection"). Three audits (serve; planner and
+  watchdog; cards, engine, fence and setup) found ~45 defects; all fixed on `rndaom/serve-hardening` with tests
+  (108 -> 235). The ones that mattered most:
+  - Nothing runs unwatched: the watchdog fails closed (an error in its checks stops the model), `lodger run` and
+    serve stop a model whose watchdog stopped beating (`Watchdog.healthy()`), and serve's monitor carries on after
+    an error instead of dying (which stranded every request).
+  - Nothing outlives lodger: `fence.reap_orphans()` at every `serve`/`run` start stops models a crashed or killed
+    lodger left running (systemd units, cgroups, unfenced programs; never a live lodger's); cgroup/none fences also
+    die with lodger (`setpriv --pdeathsig`, started from one long-lived thread); a second Ctrl-C or TERM no longer
+    cuts shutdown short. Checked live: SIGKILL of serve, then a new serve stopped the leftover unit.
+  - Settings in models.toml that change memory now reach the planner (aliases mapped to llama-server's long names);
+    ones lodger sets itself, or can't plan (draft models, LoRA, ...), make that model "not served" with why. Vision
+    projectors count as their file + 1 GiB. llama-server's RAM prompt cache (8 GiB by default, counted nowhere) is
+    sized to the room left in the fence (`--cache-ram`, 1 GiB for the 2.6B here).
+  - A start that fails (e.g. waking next to a game) is tried again after 5 min instead of disabling the model until
+    restart; after a step-aside whose processor start fails, the monitor retries (10 s doubling to 5 min) and
+    considers the card once it's quiet, instead of looping on the processor forever.
+  - Requests: busy counted under the lock (no switch or sleep slips in); chunked bodies read, bad lengths 400/413;
+    long prompts no longer time out after 600 s (pings keep a streaming app connected, an app that leaves ends the
+    wait); a continued answer keeps one id, respects max_tokens, continues an app's own prefill, isn't continued
+    once finished, and ends with an error for a cut tool call or structured (JSON) answer; broken lines aren't
+    passed on. Also `/v1/completions`, `/v1/embeddings`, `/infill`, `/tokenize`, `/detokenize`, `/apply-template`
+    are passed through; HEAD and query strings work. The engine's key goes out only once the program on its port
+    is known to be the engine (`port_owned`).
+  - pi's files: a models.json or settings.json lodger can't read is left alone (it used to be replaced, losing the
+    other providers); written atomically through links; a lodger model you picked in pi stays your default.
+  - `--pause` flags carry the pausing lodger's pid: one lodger no longer restarts a service another one paused.
+  - Planner: `--ctx 0` looped forever; the probe cache is written atomically (a torn file broke a model for good)
+    and keyed on every split part and the build's libraries; one bad calibration line no longer drops the learned
+    overhead; calibration is per card and backend; `settle` watches long enough to see a busy game.
+  - Cards: AMD memory that can't be read means "no room", not "all free"; card choice ranks only cards whose memory
+    is readable, by real size; xe and NVIDIA polls no longer wake or hold awake a sleeping card; the systemd fence's
+    memory cap is checked to be real (else lodger enforces it); card-picking variables from your shell no longer
+    leak into the engine; Mesa's device-select layer is required for Vulkan when the choice is ambiguous.
+  - setup: staged, all-or-nothing installs with a marker, CUDA 12/13 chosen by driver, `--tag` any release.
+  - config.toml: wrong types and broken TOML give a plain message, unknown keys a warning.
+  Live on the processor (2.6B, port 8383, user's service left alone): answers streamed and whole, completions and
+  tokenize passed through; the engine killed mid-count of 1-120: one answer, no gaps or repeats; double TERM: clean.
+  Not tested on the card yet (the user's service holds it); every card plan of this PC's models is unchanged.

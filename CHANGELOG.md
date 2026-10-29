@@ -30,6 +30,30 @@ All notable changes to lodger are written here. The format follows
 - `lodger stress` and `lodger stress-serve`: tests that grab graphics memory and start games while a model
   answers, to check nothing crashes.
 - `lodger ask` and `lodger pi`: a small client, and a pi provider listing every model.
+- `lodger serve` also passes `/v1/completions`, `/v1/embeddings`, `/infill`, `/tokenize`, `/detokenize` and
+  `/apply-template` through to the model (an answer cut by a move ends with an error), answers HEAD, and reads
+  chunked request bodies.
+- `lodger serve` and `lodger run` stop models that a crashed or killed lodger left running before they start one;
+  `lodger doctor` lists any left behind.
 - Repository files for contributors: README, MIT licence, CONTRIBUTING, Code of Conduct, SECURITY, issue
   forms, pull request template, CI (ruff and unit tests on Python 3.11 to 3.13), `pyproject.toml` for
   installing with pip, pipx and uv, and a `lodger` command (`lodger.cli`) that `bin/lodger` also calls.
+
+### Fixed
+- Nothing runs unwatched: an error in the watchdog's checks stops the model, a watchdog that stops beating gets the
+  model stopped, and `lodger serve`'s monitor carries on after an error.
+- llama-server settings in `models.toml` that change memory are now planned for; settings lodger sets itself, or
+  can't plan for yet, make that model "not served" with the reason. llama-server's RAM prompt cache is sized to fit
+  inside the model's fence.
+- A model that fails to start is tried again after a while instead of being left out until restart.
+- Long prompts on the processor no longer time out; a continued answer keeps one id and its `max_tokens`, continues
+  an app's own start of the answer, and ends with an error when a tool call or JSON answer was cut.
+- pi's `models.json` and `settings.json` are left alone when they aren't valid JSON, instead of being replaced.
+- `--ctx 0` / `--min-ctx 0` no longer loop forever; a damaged probe cache or calibration line no longer breaks
+  planning.
+- Unreadable AMD card memory counts as no room instead of all free; card choice ranks cards by their real size;
+  polling no longer wakes sleeping Intel xe or NVIDIA cards; card-choosing variables from your shell no longer reach
+  the engine; the systemd memory cap is checked to be in force.
+- `lodger setup` installs all-or-nothing, picks CUDA 12 or 13 by the driver, and finds any release by `--tag`.
+- Bad `config.toml` values give a plain message instead of a traceback; unknown keys a warning.
+- `lodger stress` and `stress-serve` work when lodger is installed, and see NVIDIA's `Xid` faults.
