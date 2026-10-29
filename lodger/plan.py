@@ -395,6 +395,9 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
         why.append(f"Weights kept in RAM: {cpu_weights / GiB:.1f} GiB (fits).")
     # RAM fence: own memory + as much of the weights as we can spare; never more than the budget
     plan["ram_cap"] = max(with_margin(anon), min(ram_budget, with_margin(anon) + cached + GiB))
+    # llama-server keeps earlier conversations in RAM to answer them faster later (8 GiB by default, counted
+    # nowhere else): only in the room the fence has left over, so it never pushes the model over its cap
+    plan["cache_ram_mib"] = max(0, min(8192, (plan["ram_cap"] - with_margin(anon) - cached) // MiB))
     why.append(f"RAM fence for the model: {plan['ram_cap'] / GiB:.1f} GiB, no swap. "
                f"Processor threads: {plan['threads']} (leaves cores for your apps).")
     return plan

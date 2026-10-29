@@ -22,7 +22,7 @@ ALIASES = {
     "md": "model-draft", "spec-draft-model": "model-draft", "hfd": "hf-repo-draft",
     "hfrd": "hf-repo-draft", "spec-draft-hf": "hf-repo-draft", "nkvo": "no-kv-offload", "kvo": "kv-offload",
     "ctk": "cache-type-k", "ctv": "cache-type-v", "fa": "flash-attn", "ub": "ubatch-size", "b": "batch-size",
-    "nr": "no-repack", "mm": "mmproj", "lm": "load-mode", "lzm": "lazy-mode", "kvu": "kv-unified",
+    "nr": "no-repack", "cram": "cache-ram", "mm": "mmproj", "lm": "load-mode", "lzm": "lazy-mode", "kvu": "kv-unified",
     "no-kvu": "no-kv-unified", "rea": "reasoning", "ctkd": "cache-type-k-draft", "ctvd": "cache-type-v-draft",
     "otd": "override-tensor-draft", "cmoed": "cpu-moe-draft", "ncmoed": "n-cpu-moe-draft", "devd": "device-draft",
     "ngld": "n-gpu-layers-draft", "td": "threads-draft", "tbd": "threads-batch-draft",
@@ -31,7 +31,8 @@ ALIASES = {
 OWNED = {"n-gpu-layers", "n-cpu-moe", "cpu-moe", "host", "port", "api-key", "api-key-file", "threads",
          "threads-batch", "model", "alias", "fit", "fit-target", "fit-ctx", "fit-print", "parallel", "device",
          "split-mode", "tensor-split", "main-gpu", "override-tensor", "rpc", "model-url", "hf-repo", "hf-file",
-         "hf-token", "docker-repo", "webui", "no-webui", "models-dir", "models-preset", "mmproj-device", "mmproj-url"}
+         "hf-token", "docker-repo", "webui", "no-webui", "models-dir", "models-preset", "mmproj-device", "mmproj-url",
+         "cache-ram"}
 # change memory in ways lodger can't plan yet: a second model, extra weights, or the context moved to RAM
 UNPLANNED = {"model-draft": "a draft model (speculative decoding)", "hf-repo-draft": "a draft model (speculative decoding)",
              "spec-type": "speculative decoding", "lora": "LoRA adapters", "lora-scaled": "LoRA adapters",

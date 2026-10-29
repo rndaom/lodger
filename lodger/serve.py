@@ -42,7 +42,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 from . import catalog, config, engine, fence, plan as planner, reserve, sysmem
-from .launch import GAME_GUARD_FLAG, RUNS, Watchdog, gpu_blockers, router_coming, unit_cgroup, unit_props
+from .launch import GAME_GUARD_FLAG, RUNS, Watchdog, card_fields, gpu_blockers, router_coming, unit_cgroup, unit_props
 from .neighbors import Neighbors
 
 MiB, GiB = sysmem.MiB, sysmem.GiB
@@ -174,7 +174,8 @@ class Engine:
         try:
             cmd = [engine.tool("llama-server"), "-m", p["model"], "-c", str(p["ctx"]),
                    "-t", str(p["threads"]), "--fit", "off", "-np", "1", "--host", HOST, "--port", str(self.port),
-                   "--api-key-file", self.keyfile, "--no-webui", "-a", entry.name] + entry.args()
+                   "--api-key-file", self.keyfile, "--no-webui", "-a", entry.name,
+                   "--cache-ram", str(p.get("cache_ram_mib", 0))] + entry.args()
             dargs, env = engine.device_args(p["ngl"], sysmem.dgpu(), p["n_cpu_moe"])
             cmd += dargs
             with open(os.path.join(out, "plan.json"), "w") as f:
@@ -190,6 +191,10 @@ class Engine:
                 self.logf.close()
             raise
         Engine.all.append(self)                  # from here on, lodger's exit stops it whatever happens next
+        try:
+            self.card = card_fields(bool(p["ngl"]))   # which card and backend, for calibration
+        except (Exception, SystemExit):
+            self.card = {}
         self.proc = self.fence.proc
         self.wd = Watchdog(self.fence, bool(p["ngl"]), out, log=os.path.join(out, "engine.log"), keep=p["keep"])
         self.wd.start()
@@ -199,7 +204,7 @@ class Engine:
 
     def watched(self):
         """Is the watchdog still on duty? (If its thread died, nothing would stop the model in time.)"""
-        return self.wd.is_alive() or bool(self.wd.reason) or self.wd.stop_flag.is_set()
+        return self.wd.healthy(stale=10) or bool(self.wd.reason) or self.wd.stop_flag.is_set()
 
     def auth(self):
         return {"Authorization": f"Bearer {self.key}"}
@@ -256,7 +261,7 @@ class Engine:
                                     "n_cpu_moe": self.plan["n_cpu_moe"], "ctx": self.plan["ctx"],
                                     "gpu_est": self.plan["gpu_est"], "llama_gpu_est": self.plan.get("llama_gpu_est"),
                                     "gpu_real": self.wd.peak["model_vram"] or None, "stopped": self.wd.reason,
-                                    "run": os.path.basename(self.out), "via": "serve"}) + "\n")
+                                    "run": os.path.basename(self.out), "via": "serve", **self.card}) + "\n")
 
 
 class Lodger:
@@ -1200,6 +1205,13 @@ def make_handler(lodger, key=None):
     return H
 
 
+def ctx_arg(v):
+    n = int(v)
+    if n < planner.SMALLEST_CTX:
+        raise argparse.ArgumentTypeError(f"at least {planner.SMALLEST_CTX}")
+    return n
+
+
 def serve(argv):
     ap = argparse.ArgumentParser(prog="lodger serve", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("files", nargs="*", metavar="MODEL.gguf",
@@ -1207,7 +1219,7 @@ def serve(argv):
     ap.add_argument("--default", help="model to load when a request doesn't name one")
     ap.add_argument("--allow-gpu", action="store_true", help="the graphics card may be used")
     ap.add_argument("--port", type=int, default=8181)
-    ap.add_argument("--min-ctx", type=int, default=planner.MIN_CTX)
+    ap.add_argument("--min-ctx", type=ctx_arg, default=planner.MIN_CTX)
     ap.add_argument("--leave-gpu", type=int, default=0, metavar="MiB")
     ap.add_argument("--threads", type=int)
     ap.add_argument("--idle", type=float, default=0, metavar="MIN",
