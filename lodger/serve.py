@@ -19,7 +19,8 @@ pi's models.json (and `lodger serve` keeps it current when extras.pi is on in co
 - Sleeps (with --idle MIN): unloads the model after MIN minutes unused and loads it again on the next
   request, so it holds no memory while you don't use it.
 GET /lodger/status says where the model is and why. POST /lodger/move moves it off the card now
-(it grows back later as usual)."""
+(it grows back later as usual). With --ollama (or `ollama = true` in config.toml), apps that only speak
+Ollama's API find lodger at http://127.0.0.1:11434 too."""
 import argparse
 import http.client
 import json
@@ -41,7 +42,7 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-from . import catalog, config, engine, fence, plan as planner, reserve, sysmem
+from . import catalog, config, engine, fence, ollama, plan as planner, reserve, sysmem
 from .launch import GAME_GUARD_FLAG, RUNS, Watchdog, card_fields, gpu_blockers, router_coming, unit_cgroup, unit_props
 from .neighbors import Neighbors
 
@@ -301,6 +302,7 @@ class Lodger:
         self.failed = {}                      # name -> (time it may be tried again, why it didn't start)
         self.failures = 0                     # the current model's starts that failed in a row
         self.retry_at, self.retry_delay = 0.0, 10
+        self.ollama = None                    # where Ollama's API is answered, or why not
         self.out = os.path.join(RUNS, time.strftime("%Y-%m-%d-%H%M%S") + "-serve")
         os.makedirs(self.out)
 
@@ -739,7 +741,15 @@ class Lodger:
                 "switching_to": self.switch_to.name if self.switch_to else None,
                 "quiet_needed_s": self.quiet_needed, "card_quiet_for_s": round(time.time() - self.quiet_since),
                 "plan": {k: e.plan[k] for k in ("ngl", "n_cpu_moe", "ctx", "gpu_est")} if e else None,
-                "models": models, "events": self.events}
+                "models": models, "ollama": self.ollama, "events": self.events}
+
+    def loaded(self):
+        """(model, graphics memory it uses, when it unloads or None) for the model loaded now, or None."""
+        e = self.engine
+        if not (e and self.ready and e.alive()):
+            return None
+        vram = (e.wd.peak["model_vram"] or e.plan["gpu_bytes"]) if e.where == "card" else 0
+        return e.entry, vram, self.last_used + self.a.idle * 60 if self.a.idle else None
 
 
 def model_info(e):
@@ -806,13 +816,20 @@ def positive_int(v):
     return v if v > 0 else None
 
 
-def make_handler(lodger, key=None):
+OLLAMA_PATHS = ("/api/chat", "/api/generate", "/api/embed", "/api/embeddings", "/api/show")
+
+
+def make_handler(lodger, key=None, ollama_api=False):
+    """The request handler. ollama_api: the Ollama-style listener, which answers /api/... (ollama.py) as well."""
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         timeout = 300                            # a connection that sends nothing for this long is closed
         cors = None                              # the local page's origin to allow in the answer, if any
         head = False                             # HEAD: headers only
         client_gone = False
+        oreq = False                             # this request is Ollama's kind: answered in its shape
+        nd = None                                # an Ollama answer being streamed (ollama.Answer)
+        conv = None                              # turns a whole answer into Ollama's shape
 
         def log_message(self, *args):
             pass
@@ -831,7 +848,17 @@ def make_handler(lodger, key=None):
         def send_error_json(self, code, msg, close=False):
             if close:
                 self.close_connection = True
-            self.send_json(code, {"error": {"message": msg, "code": code}}, [("Connection", "close")] if close else ())
+            self.send_json(code, {"error": msg} if self.oreq else {"error": {"message": msg, "code": code}},
+                           [("Connection", "close")] if close else ())
+
+        def send_text(self, code, text):
+            body = text.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if not self.head:
+                self.wfile.write(body)
 
         def end_headers(self):
             if self.cors:
@@ -843,6 +870,7 @@ def make_handler(lodger, key=None):
             """Answer a request that may not reach lodger (see check()); True if it was refused."""
             origin = self.headers.get("Origin")
             self.cors = origin if origin and local_origin(origin) else None
+            self.oreq = ollama_api and self.route().startswith("/api/")
             why = check(self.command, self.path, self.headers, key)
             if not why:
                 return False
@@ -851,8 +879,8 @@ def make_handler(lodger, key=None):
             self.close_connection = True
             if code == 401:
                 extra.append(("WWW-Authenticate", 'Bearer realm="lodger"'))
-            self.send_json(code, {"error": {"message": msg, "type": "forbidden" if code == 403 else "unauthorized"}},
-                           extra)
+            self.send_json(code, {"error": msg} if self.oreq else
+                           {"error": {"message": msg, "type": "forbidden" if code == 403 else "unauthorized"}}, extra)
             return True
 
         def route(self):
@@ -889,6 +917,15 @@ def make_handler(lodger, key=None):
                 return self.send_json(200, {"object": "list", "data": [model_info(e) for e in lodger.available()]})
             if path == "/lodger/status":
                 return self.send_json(200, lodger.status())
+            if ollama_api and path == "/":
+                return self.send_text(200, "Ollama is running")     # what apps look for
+            if self.oreq and path == "/api/version":
+                return self.send_json(200, {"version": ollama.VERSION})
+            if self.oreq and path == "/api/tags":
+                return self.send_json(200, {"models": [ollama.listed(e) for e in lodger.available()]})
+            if self.oreq and path == "/api/ps":
+                now = lodger.loaded()
+                return self.send_json(200, {"models": [ollama.running(*now)] if now else []})
             self.send_error_json(404, "not found")
 
         def body(self):
@@ -930,9 +967,24 @@ def make_handler(lodger, key=None):
                 return None
             return raw
 
+        def json_body(self, raw):
+            """The request's JSON object, or None after answering a broken one."""
+            try:
+                body = json.loads(raw or b"{}")
+            except ValueError:
+                return self.send_error_json(400, "body is not JSON")
+            if not isinstance(body, dict):
+                return self.send_error_json(400, "body must be a JSON object")
+            return body
+
+        def no_model(self, name):
+            names = ", ".join(e.name for e in lodger.available())
+            self.send_error_json(404, f"lodger has no model called {name!r}; it has: {names}")
+
         def do_POST(self):
             if self.refused():
                 return
+            self.nd = self.conv = None
             raw = self.body()
             if raw is None:
                 return
@@ -941,14 +993,13 @@ def make_handler(lodger, key=None):
                 on_card = bool(lodger.engine and lodger.engine.where == "card" and lodger.ready)
                 lodger.force_off_card = on_card
                 return self.send_json(200, {"moving": on_card, "where": lodger.engine.where if lodger.engine else None})
+            if self.oreq:
+                return self.ollama_post(raw, path)
             if path not in CHAT_PATHS + PASS_PATHS:
                 return self.send_error_json(404, "not found")
-            try:
-                body = json.loads(raw or b"{}")
-            except ValueError:
-                return self.send_error_json(400, "body is not JSON")
-            if not isinstance(body, dict):
-                return self.send_error_json(400, "body must be a JSON object")
+            body = self.json_body(raw)
+            if body is None:
+                return
             name = body.get("model")
             if name is not None and not isinstance(name, str):
                 return self.send_error_json(400, "'model' must be a string")
@@ -956,23 +1007,61 @@ def make_handler(lodger, key=None):
                 return self.send_error_json(400, "'messages' must be a list")
             entry = lodger.find(name)
             if not entry:
-                names = ", ".join(e.name for e in lodger.available())
-                return self.send_json(404, {"error": {"message": f"lodger has no model called {name!r}; it has: {names}"}})
+                return self.no_model(name)
+            self.answer(body, entry, path if path in PASS_PATHS else "/v1/chat/completions")
+
+        def answer(self, body, entry, path):
+            """Answer `body` with `entry`'s engine at llama-server's `path` (chat answers continue after a move)."""
             with lodger.cv:
                 lodger.active += 1
             try:
                 if not body.get("stream"):
-                    self.whole(body, entry, path if path in PASS_PATHS else "/v1/chat/completions")
-                elif path in CHAT_PATHS:
+                    self.whole(body, entry, path)
+                elif path == "/v1/chat/completions":
                     self.stream(body, entry)
                 else:
                     self.relay(body, entry, path)
+                if self.nd and body.get("stream") and not self.client_gone:
+                    self.send_lines(self.nd.close())   # llama-server's own kinds of stream end without [DONE]
             except OSError:                          # the app went away while lodger answered it
                 self.close_connection = True
             finally:
                 with lodger.cv:
                     lodger.active -= 1
                     lodger.last_used = time.time()
+
+        def ollama_post(self, raw, path):
+            """Ollama's POST /api/...: translated to llama-server's kind and answered as the others are."""
+            if path.startswith(ollama.UNSUPPORTED):
+                return self.send_error_json(501, f"{path} is not supported by lodger: it serves the GGUF files "
+                                                 f"listed in {catalog.CONFIG} (add models there)")
+            if path not in OLLAMA_PATHS:
+                return self.send_error_json(404, "not found")
+            body = self.json_body(raw)
+            if body is None:
+                return
+            name = body.get("model") or body.get("name")    # /api/show: older apps send "name"
+            if name is not None and not isinstance(name, str):
+                return self.send_error_json(400, "'model' must be a string")
+            entry = lodger.find(name) or lodger.find(ollama.plain(name))
+            if not entry:
+                return self.no_model(name)
+            if path == "/api/show":
+                return self.send_json(200, ollama.show(entry))
+            try:
+                target, req, ans = ollama.request(path, body, entry.name)
+            except ValueError as ex:
+                return self.send_error_json(400, str(ex))
+            if req is None:                          # nothing to write: load the model (or, keep_alive 0, nothing)
+                if body.get("keep_alive") in (0, "0", "0s", "0m"):
+                    return self.send_json(200, ans.loaded(load=False))
+                e = lodger.wait_engine(entry)
+                if not e:
+                    return self.send_error_json(503, self.unavailable(entry))
+                lodger.release(e)
+                return self.send_json(200, ans.loaded())
+            self.conv, self.nd = ans.whole, ans if req.get("stream") else None
+            self.answer(req, entry, target)
 
         def app_gone(self):
             """Has the app closed its connection? (Checked while it waits for an answer without streaming.)"""
@@ -1048,6 +1137,8 @@ def make_handler(lodger, key=None):
                 if r.status != 200 and not self.running(e):
                     time.sleep(1)                   # an error from an engine being stopped: ask the next one
                     continue
+                if self.conv:
+                    return self.send_json(*self.conv(r.status, data))
                 self.send_response(r.status)
                 self.send_header("Content-Type", r.getheader("Content-Type") or "application/json")
                 self.send_header("Content-Length", str(len(data)))
@@ -1058,7 +1149,7 @@ def make_handler(lodger, key=None):
 
         def start_stream(self):
             self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Type", "application/x-ndjson" if self.nd else "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "close")
             self.end_headers()
@@ -1218,8 +1309,18 @@ def make_handler(lodger, key=None):
             self.event("data: [DONE]")
 
         def event(self, s):
+            """One server-sent event to the app (an Ollama app gets what it turns into instead)."""
+            if self.nd:
+                return self.send_lines(self.nd.feed(s))
+            self.write((s + "\n\n").encode())
+
+        def send_lines(self, objs):
+            if objs:
+                self.write(b"".join(json.dumps(o, ensure_ascii=False).encode() + b"\n" for o in objs))
+
+        def write(self, data):
             try:
-                self.wfile.write((s + "\n\n").encode())
+                self.wfile.write(data)
                 self.wfile.flush()
             except OSError:
                 self.client_gone = True
@@ -1255,6 +1356,10 @@ def serve(argv):
     ap.add_argument("--api-key-file", metavar="PATH",
                     help="apps must send the key in this file (Authorization: Bearer KEY); LODGER_API_KEY does the "
                          "same. Default: no key (web pages still can't use lodger; other programs on this PC can)")
+    ap.add_argument("--ollama", action="store_true",
+                    help="also answer Ollama's API, for apps that only speak it, at http://127.0.0.1:11434 "
+                         "(`ollama = true` in config.toml does the same); not if that port is taken, by Ollama say")
+    ap.add_argument("--ollama-port", type=int, default=11434, metavar="PORT")
     a = ap.parse_args(argv)
     a.api_key = read_key(a.api_key_file)
     models, default = catalog.load(a.files or None)
@@ -1267,6 +1372,7 @@ def serve(argv):
     unpause_all()                                # left over from a crash
     httpd = ThreadingHTTPServer((HOST, a.port), make_handler(lodger, a.api_key))
     httpd.daemon_threads = True
+    ohttpd = ollama_listener(lodger, a) if a.ollama or config.get().get("ollama") else None
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
     signal.signal(signal.SIGINT, signal.default_int_handler)   # also when started in the background of a script
     log(f"lodger serving {len(models)} models at http://{HOST}:{a.port}/v1 (only this PC"
@@ -1294,12 +1400,42 @@ def serve(argv):
         with lodger.cv:
             lodger.cv.notify_all()
         httpd.shutdown()
+        if ohttpd:
+            ohttpd.shutdown()
         stop_all()
         if monitor.is_alive():
             monitor.join(20)                     # it may be starting one right now
             stop_all()
         lodger.unpause()
     return 0
+
+
+def port_taken(port):
+    """Does a program answer on this port of this PC (IPv4 or IPv6)?"""
+    for family, addr in ((socket.AF_INET, HOST), (socket.AF_INET6, "::1")):
+        with contextlib.suppress(OSError), socket.socket(family) as s:
+            s.settimeout(1)
+            if s.connect_ex((addr, port)) == 0:
+                return True
+    return False
+
+
+def ollama_listener(lodger, a):
+    """Ollama's API (ollama.py) on HOST:a.ollama_port, with the same checks as the main port; None if the port
+    is taken (by Ollama itself, say: its apps then keep talking to it)."""
+    try:
+        if port_taken(a.ollama_port):
+            raise OSError("another program answers there (Ollama itself?)")
+        h = ThreadingHTTPServer((HOST, a.ollama_port), make_handler(lodger, a.api_key, ollama_api=True))
+    except OSError as ex:
+        lodger.ollama = f"not started: port {a.ollama_port} is taken ({ex.strerror or ex})"
+        log(f"Ollama's API {lodger.ollama}")
+        return None
+    h.daemon_threads = True
+    threading.Thread(target=h.serve_forever, daemon=True).start()
+    lodger.ollama = f"http://{HOST}:{a.ollama_port}"
+    log(f"Ollama's API at {lodger.ollama} too")
+    return h
 
 
 def stop_all():

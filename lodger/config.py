@@ -21,6 +21,7 @@ DEFAULTS = {
     "gpu_on_battery": False,        # start work on a graphics card while the laptop runs on battery
     "wake_gpu": False,              # use a card that is asleep (power saving), waking it
     "runs_dir": None,               # logs, learned numbers, caches; None: ~/.local/state/lodger
+    "ollama": False,                # `lodger serve` also answers Ollama's API on 127.0.0.1:11434 (as --ollama)
     "extras": {
         "llama_router": False,      # watch a llama-router service and llama-game-guard's marker (the author's PC)
         "pi": False,                # `lodger serve` on port 8181 writes a "lodger" provider into pi's config
@@ -29,7 +30,7 @@ DEFAULTS = {
 
 # what each setting may be (None: may be left unset); extras are all true/false
 KINDS = {"llama_cpp": (str, None), "gpu": (str,), "desktop_reserve_mib": (int, None), "gpu_on_battery": (bool,),
-         "wake_gpu": (bool,), "runs_dir": (str, None), "extras": (dict,)}
+         "wake_gpu": (bool,), "runs_dir": (str, None), "ollama": (bool,), "extras": (dict,)}
 _NAMES = {str: "text in quotes", int: "a whole number", bool: "true or false", dict: "a [table]"}
 GPU = re.compile(r"^(auto|none|([0-9a-f]{4}:)?[0-9a-f]{2}:[0-9a-f]{2}\.[0-7])$")
 

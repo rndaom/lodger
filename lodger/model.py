@@ -50,9 +50,13 @@ def parts(path):
 _SIZES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}   # GGUF value types -> bytes
 
 
-def architecture(path, keys=64):
-    """general.architecture from a GGUF file's header ("clip" for a vision projector), reading only the first
-    few settings; None if the file isn't GGUF or it isn't there. Needs no gguf package (the catalog uses it)."""
+_KINDS = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
+
+
+def header(path, keys=64, until=None):
+    """A GGUF file's plain settings (numbers and text, not lists) from its header, reading only the first few
+    and stopping at `until` or at the tokenizer's (long lists); {} if the file isn't GGUF or it isn't there.
+    Needs no gguf package (the catalog uses it)."""
     def num(f, fmt):
         b = f.read(struct.calcsize(fmt))
         return struct.unpack(fmt, b)[0]
@@ -75,20 +79,35 @@ def architecture(path, keys=64):
                     skip(f, sub)
         else:
             f.seek(_SIZES[kind], 1)
+    out = {}
     try:
         with open(path, "rb") as f:
             if f.read(4) != b"GGUF":
-                return None
+                return out
             wide = "<I" if num(f, "<I") == 1 else "<Q"          # version 1 counted in 32 bits
             num(f, wide)                                        # number of tensors
             for _ in range(min(num(f, wide), keys)):
                 k, kind = text(f), num(f, "<I")
-                if k == "general.architecture" and kind == 8:
-                    return text(f)
-                skip(f, kind)
+                if k.startswith("tokenizer."):
+                    break
+                if kind == 8:
+                    out[k] = text(f)
+                elif kind in _KINDS:
+                    out[k] = num(f, _KINDS[kind])
+                else:
+                    skip(f, kind)
+                if k == until:
+                    break
     except (OSError, struct.error, KeyError, ValueError, RecursionError):
         pass
-    return None
+    return out
+
+
+def architecture(path, keys=64):
+    """general.architecture from a GGUF file's header ("clip" for a vision projector); None if the file isn't
+    GGUF or it isn't there."""
+    v = header(path, keys, until="general.architecture").get("general.architecture")
+    return v if isinstance(v, str) else None
 
 
 def _field(reader, key):

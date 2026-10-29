@@ -144,6 +144,35 @@ lodger's own endpoints:
 If you use [pi](https://github.com/earendil-works/pi), `lodger pi` adds lodger as a provider listing every model
 and opens pi (your other providers are kept).
 
+### Apps that only speak Ollama
+
+Raycast, Home Assistant, Open WebUI's Ollama connection and many editor plugins talk only Ollama's API. Start
+lodger with `--ollama` (or set `ollama = true` in `~/.config/lodger/config.toml`) and it answers that API too,
+at Ollama's usual address:
+
+| | |
+|---|---|
+| Ollama URL | `http://127.0.0.1:11434` (`--ollama-port` for another) |
+| Model name | any name from `GET /api/tags`, with or without `:latest` |
+
+```bash
+curl http://127.0.0.1:11434/api/chat \
+  -d '{"model": "qwen3.5-9b", "messages": [{"role": "user", "content": "Hello!"}]}'
+```
+
+It has `/api/chat` and `/api/generate` (streamed or with `"stream": false`; `format` as `"json"` or a schema,
+tools, images for models with a vision projector, `think`), `/api/embed` and `/api/embeddings`, `/api/show`,
+`/api/tags`, `/api/ps` and `/api/version`, plus the OpenAI-style API above. A chat or generate answer that is being
+written when the model moves continues where it stopped, as on port 8181. What lodger decides itself is left out:
+`num_ctx` and the other memory options are ignored (`/api/show` reports the context lodger gives the model), as is
+`keep_alive` (use `--idle`); embedding input longer than the model's context gets an error rather than being
+cut short; and `/api/pull`, `/api/push`, `/api/create`, `/api/copy` and `/api/delete` answer
+that lodger doesn't do them: add GGUF files to `models.toml` instead.
+
+If Ollama itself already uses port 11434, lodger leaves it alone and says so in its log and in
+`/lodger/status`. The same rules apply as on port 8181: only this PC, no web pages from other sites, and the API
+key if you set one (the app must then be able to send `Authorization: Bearer KEY`).
+
 An answer being written when the model moves continues where it stopped. The exception is a tool call in the
 middle of a move: that answer ends with an error, and well-behaved clients retry.
 
@@ -151,7 +180,7 @@ middle of a move: that answer ends with an error, and well-behaved clients retry
 
 | Command | What it does |
 |---|---|
-| `lodger serve [MODEL.gguf ...]` | Keep models ready for apps on this PC. Steps aside, grows back. `--allow-gpu`, `--idle MIN`, `--port` |
+| `lodger serve [MODEL.gguf ...]` | Keep models ready for apps on this PC. Steps aside, grows back. `--allow-gpu`, `--idle MIN`, `--port`, `--ollama` |
 | `lodger ask "question"` | Ask the model lodger is serving |
 | `lodger pi` | Open [pi](https://github.com/earendil-works/pi) with lodger's models |
 | `lodger plan MODEL` | Show what would go where and why, without running anything |

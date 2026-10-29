@@ -7,6 +7,12 @@ All notable changes to lodger are written here. The format follows
 ## [Unreleased]
 
 ### Added
+- `lodger serve --ollama` (or `ollama = true` in config.toml): Ollama's API on `127.0.0.1:11434` for apps that
+  only speak it (Raycast, Home Assistant, Open WebUI, editor plugins): `/api/chat` and `/api/generate` (NDJSON
+  streaming or whole; `options`, `format`, tools, images, `think`), `/api/embed`, `/api/embeddings`,
+  `/api/show`, `/api/tags`, `/api/ps`, `/api/version`. Answers continue after a move as on port 8181; the same
+  Host, Origin and API key checks apply. Not started if the port is taken (by Ollama, say). `num_ctx` and
+  `keep_alive` are lodger's to decide; pull, push, create, copy and delete answer that lodger doesn't do them.
 - `lodger serve`: a local server for apps on this PC at `http://127.0.0.1:8181/v1` (OpenAI-style
   `/v1/chat/completions` with or without streaming, `/v1/models`, `/health`), plus `GET /lodger/status` and
   `POST /lodger/move`.

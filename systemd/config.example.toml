@@ -23,6 +23,10 @@ wake_gpu = false
 # Logs, what lodger learned about your PC, and caches. Default: ~/.local/state/lodger
 # runs_dir = "~/.local/state/lodger"
 
+# `lodger serve` also answers Ollama's API at http://127.0.0.1:11434, for apps that only speak it (Raycast,
+# Home Assistant, Open WebUI's Ollama mode). Not started if that port is taken (by Ollama itself, say).
+ollama = false
+
 [extras]
 # The author's own setup: keep off the card while a `llama-router` systemd user service runs, or while
 # llama-game-guard has it paused for a game.

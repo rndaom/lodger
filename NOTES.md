@@ -136,6 +136,20 @@ nothing is lost.
   `--api-key-file PATH` or `LODGER_API_KEY` makes every path but `/health` need `Authorization: Bearer KEY`
   (401). `lodger ask --api-key-file`/`LODGER_API_KEY` send it; the pi provider gets `!cat PATH` (pi reads the
   file) or the key itself, and `models.json` is written 0600.
+- **Ollama's API** (2026-10-29; `lodger/ollama.py`, tests in `tests/test_ollama.py`): `--ollama` or `ollama = true`
+  starts a second listener on `127.0.0.1:11434` (`--ollama-port`) with the same handler and `check()`; it
+  answers `/api/...` and everything port 8181 does. Not started (status `ollama: "not started: ..."`) if
+  anything answers on that port on 127.0.0.1 or [::1]. Requests are translated to llama-server's OpenAI-style
+  paths and go through `whole()`, `stream()` (continuation after a move) or `relay()`; `event()` turns each SSE
+  line into NDJSON (`ollama.Answer.feed`), pings become empty pieces, tool-call pieces are collected and sent
+  whole with object arguments. `/api/generate` becomes a chat request (so it continues after a move); `raw`
+  goes to `/v1/completions`, `suffix` to `/infill`. Tool calls get 9-digit ids (Mistral's templates want them),
+  handed in order to the tool answers. `think: false` sets `enable_thinking: false`, but thinking is still
+  passed on: LFM2.5's template ignores it, and hiding it left empty answers. Names: `x:latest` is `x`.
+  Version answered: Ollama 0.12.0. Digest: sha256 of path, size and mtime (not the content). Checked live
+  2026-10-29 on the processor (LFM2.5-2.6B, spare ports) with the `ollama` Python client: list, show, ps,
+  chat/generate streamed and whole, JSON schema, tools round trip, embed (needs `embeddings` and `pooling`
+  in models.toml for a chat model), pull and unknown-model errors.
 - **Engine**: our build's `llama-server` on a random private port (127.0.0.1), one at a time, in the same
   fenced unit with the same plan and watchdog as `lodger run`. Each engine gets its own random key through
   `--api-key-file` in `$XDG_RUNTIME_DIR` (0600, removed once it's up; never on the command line), and lodger
@@ -208,7 +222,7 @@ Roadmap, in order:
    on PyPI (needs the user's login), then `uv tool install lodger` works.
 4. **Model picker**: a small built-in list of Apache-2.0 models per memory size, checked download, license shown.
    The Sybil registry could be an optional extra source later.
-5. **Ollama-compatible shim** on 11434 (Raycast, Home Assistant).
+5. **Ollama-compatible shim** - done 2026-10-29 (branch `rndaom/ollama-api`; see Server, "Ollama's API").
 6. AUR package; test on other people's machines (8 GB card, NVIDIA, APU laptop).
 
 ## Any Linux PC (vendor-neutral base, 2026-10-28; roadmap item 1 of the open-source release)
