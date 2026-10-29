@@ -26,3 +26,12 @@ jobs:
         run: ruff check .
       - name: Test (no GPU needed)
         run: python -m unittest discover tests
+      - name: The installed package runs from another folder (no GPU, no checkout on the path)
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install .
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/venv/bin/lodger" --help
+          "$RUNNER_TEMP/venv/bin/lodger" doctor
+          "$RUNNER_TEMP/venv/bin/python" -m lodger.cli --help
+          "$RUNNER_TEMP/venv/bin/lodger" setup --help

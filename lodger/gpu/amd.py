@@ -1,27 +1,56 @@
 """AMD cards (amdgpu). Memory comes from the driver's sysfs files, per-app use from fdinfo. Both are safe
 to read while the card sleeps."""
+import os
+
 from .. import host
 from . import fdinfo
 
 
+# kernels from 6.7 show board_info on every card but APUs (amdgpu hides it when adev->flags & AMD_IS_APU)
+BOARD_INFO_SINCE = (6, 7)
+
+
+def _kernel():
+    rel = (host.read("/proc/sys/kernel/osrelease") or "").strip()
+    try:
+        return tuple(int(x) for x in rel.split("-")[0].split(".")[:2])
+    except ValueError:
+        return None
+
+
 def integrated(dev):
-    """A processor's built-in graphics (APU) shares the PC's RAM. amdgpu shows mem_info_vram_vendor only on
-    cards with their own memory chips; on APUs "VRAM" is just a small piece of RAM the BIOS set aside."""
-    return not host.read(f"{dev.sys}/mem_info_vram_vendor")
+    """A processor's built-in graphics (APU) shares the PC's RAM; on APUs "VRAM" is just a piece of RAM the
+    BIOS set aside. Signs of a card with its own memory chips, sturdiest first:
+    - board_info: amdgpu shows it on every card but APUs (kernels since 6.7, where its absence decides;
+      only its presence is checked: reading it asks the card);
+    - mem_info_vram_vendor: only on cards with their own memory, but hidden when the card doesn't report the
+      chips' maker (some older GCN cards);
+    - on an older kernel showing neither: a "VRAM" under 1 GiB is an APU's carve-out (cards had 2 GiB+).
+    Taking an APU for a card is the safe mistake (lodger then uses only the carve-out); the other way round
+    would budget a card's memory from RAM, so the size rule only calls tiny ones built-in."""
+    if os.path.exists(host.path(f"{dev.sys}/board_info")) or host.read(f"{dev.sys}/mem_info_vram_vendor"):
+        return False
+    k = _kernel()
+    if k and k >= BOARD_INFO_SINCE:
+        return True
+    total = host.read_int(f"{dev.sys}/mem_info_vram_total")
+    return 0 < total < (1 << 30)
 
 
 def memory(dev):
-    """{total, used, gtt_total, gtt_used} in bytes (GTT: system RAM the card may borrow), or None."""
-    total = host.read_int(f"{dev.sys}/mem_info_vram_total")
-    if not total:
-        return None
-    return {"total": total, "used": host.read_int(f"{dev.sys}/mem_info_vram_used"),
-            "gtt_total": host.read_int(f"{dev.sys}/mem_info_gtt_total"),
-            "gtt_used": host.read_int(f"{dev.sys}/mem_info_gtt_used")}
+    """{total, used, gtt_total, gtt_used} in bytes (GTT: system RAM the card may borrow), or None unless every
+    number reads (a missing "used" must never look like a free card)."""
+    vals = {}
+    for k, f in (("total", "vram_total"), ("used", "vram_used"), ("gtt_total", "gtt_total"), ("gtt_used", "gtt_used")):
+        s = (host.read(f"{dev.sys}/mem_info_{f}") or "").strip()
+        if not s.isdigit():
+            return None
+        vals[k] = int(s)
+    return vals if vals["total"] else None
 
 
 def why_unknown(dev):
-    return None if memory(dev) else "amdgpu doesn't show this card's memory in sysfs"
+    return None if memory(dev) else "amdgpu doesn't show all of this card's memory numbers in sysfs (mem_info_*)"
 
 
 def usage(dev, pids):

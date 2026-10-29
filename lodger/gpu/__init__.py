@@ -5,6 +5,8 @@ Adding a kind of card: write lodger/gpu/<vendor>.py with
   integrated(dev)     True for a processor's built-in graphics (shares the PC's RAM)
   memory(dev)         {total, used, gtt_total, gtt_used} in bytes, or None (unknown, or asleep: never wake it)
   why_unknown(dev)    plain words for why memory() is None
+  reads_when_awake    (optional) True if memory() is None only while the card sleeps (NVML): such a card
+                      still counts for `gpu = "auto"`, ranked by the size seen while it was awake
   usage(dev, pids)    {pid: {vram, gtt, busy_ns, cycles}} (for drivers with DRM fdinfo: fdinfo.usage, plus
                       a row in fdinfo.DRIVERS)
 add its kernel driver to BACKENDS, and tell lodger/engine.py how llama.cpp finds the card."""
@@ -129,20 +131,37 @@ def normalize(pci):
     return pci if pci.count(":") == 2 else "0000:" + pci
 
 
+_seen = {}              # pci -> the card's memory size when it was last readable (a sleeping NVIDIA card)
+
+
+def _rank_total(d):
+    """The card's memory size for ranking, vendor-neutral (built-in graphics: what it may borrow), or None
+    if lodger can't read its memory (such a card can't be planned for, so it never wins)."""
+    m = d.memory()
+    if m is not None:
+        t = d.total(m)
+        _seen[d.pci] = t
+        return t
+    if d.asleep() and getattr(d.backend, "reads_when_awake", False):
+        return _seen.get(d.pci, 0)
+    return None
+
+
 def choose(want="auto", devs=None):
-    """The card lodger uses: want = 'auto', 'none' or a PCI address. Auto prefers a card with its own memory
-    over built-in graphics, then the most memory (where sysfs tells without waking it), then the one the PC
-    started on. Only cards lodger has a backend for. None: processor only."""
+    """The card lodger uses: want = 'auto', 'none' or a PCI address. Auto takes only cards lodger has a
+    backend for and can read the memory of (a sleeping NVIDIA card counts: it is read once awake), and
+    prefers a card with its own memory over built-in graphics, then the most memory, then the one the PC
+    started on. None: processor only."""
     devs = devices() if devs is None else devs
     want = (want or "auto").strip().lower()
     if want == "none":
         return None
     if want != "auto":
         return next((d for d in devs if d.pci == normalize(want)), None)
-    cands = [d for d in devs if d.known]
+    cands = [(d, t) for d in devs if d.known for t in [_rank_total(d)] if t is not None]
     if not cands:
         return None
-    return max(cands, key=lambda d: (not d.integrated, host.read_int(f"{d.sys}/mem_info_vram_total"), d.boot_vga))
+    return max(cands, key=lambda c: (not c[0].integrated, c[1], c[0].boot_vga))[0]
 
 
 def why_none(want="auto", devs=None):
@@ -155,7 +174,8 @@ def why_none(want="auto", devs=None):
         return f"no graphics card at {normalize(want)} (the settings' gpu = \"{want}\")"
     if not devs:
         return "no graphics card found"
-    return "no graphics card lodger knows how to use (" + ", ".join(f"{d.pci}: driver {d.driver or 'none'}" for d in devs) + ")"
+    return "no graphics card lodger can use (" + ", ".join(
+        f"{d.pci}: " + (d.why_unknown() or "?" if d.known else f"driver {d.driver or 'none'}") for d in devs) + ")"
 
 
 def power_source():

@@ -9,15 +9,34 @@ Three kinds, the strongest the PC offers:
 - none:    neither: no hard cap. The program gets oom_score_adj 1000 (the kernel stops it first when memory
            runs out), no crash dumps and nice 10, and the watchdog stops it when it goes over its RAM cap.
            lodger says so when it starts. (Never RLIMIT_AS: it breaks memory-mapped models and GPU runtimes.)
-LODGER_FENCE=cgroup|none picks a weaker kind on purpose (to test it)."""
+LODGER_FENCE=cgroup|none picks a weaker kind on purpose (to test it).
+
+systemd only caps memory where the user manager has the memory controller (cgroup v2, delegated to it):
+elsewhere MemoryMax is silently ignored. So each Fenced checks its unit's memory.max once it runs, and if
+the cap isn't there the watchdog enforces it like for 'none' (Fenced.hard(), over_cap()).
+
+The engine's environment is the same under every kind (engine.child_env: card-picking variables set or
+removed, driver and runtime settings passed on from where lodger runs).
+
+Left behind (fence.find_orphans, reap_orphans): a model outlives lodger if lodger is killed or crashes (a
+systemd unit runs on; cgroup and 'none' programs run in their own session). Units and cgroups are named
+lodger-<pid> or lodger-<pid>-<n> after the lodger process that made them, and cgroup/'none' programs carry
+LODGER_FENCE_NAME, so a model whose lodger is gone can be found and stopped: `lodger serve` and `lodger run`
+should call reap_orphans() before they start a model; `lodger doctor` lists them. Where util-linux's setpriv
+can, cgroup/'none' programs also get a parent-death signal: the kernel kills them when lodger dies. That
+signal follows the *thread* that started the program, and lodger serve starts engines from threads that end,
+so every fenced program is started from one spawner thread that lives as long as lodger."""
+import contextlib
 import os
+import queue
+import re
 import shutil
 import signal
 import subprocess
 import threading
 import time
 
-from . import host
+from . import engine, host
 
 CGROOT = "/sys/fs/cgroup"
 KINDS = ("systemd", "cgroup", "none")
@@ -30,6 +49,7 @@ _mode = None
 _live = set()
 _count = 0
 _lock = threading.Lock()
+NAME = re.compile(r"^lodger-(\d+)(?:-\d+)?$")       # a fence lodger made: lodger-<pid> or lodger-<pid>-<n>
 
 
 def _systemd_user():
@@ -68,6 +88,24 @@ def delegated():
     return None, "no cgroup this user may write to with the memory controller (not delegated)"
 
 
+def systemd_memory():
+    """(True, None) if the systemd user manager can cap its services' memory (it has the memory controller),
+    else (False, why). Each unit is checked again once it runs (Fenced.hard)."""
+    if not os.path.exists(host.path(CGROOT + "/cgroup.controllers")):
+        return False, "cgroup v1 or hybrid: the systemd user manager can't cap memory"
+    uid = os.getuid()
+    mgr = f"{CGROOT}/user.slice/user-{uid}.slice/user@{uid}.service"
+    m = re.match(rf"^(.*/user@{uid}\.service)(?:/|$)", own_cgroup() or "")
+    if m:
+        mgr = CGROOT + m.group(1)
+    ctl = host.read(mgr + "/cgroup.controllers")
+    if ctl is None:
+        return True, None                   # an unusual layout: each unit's own check decides
+    if "memory" not in ctl.split():
+        return False, "the memory controller isn't delegated to the systemd user manager"
+    return True, None
+
+
 def mode():
     """(kind, plain words). Decided once per process."""
     global _mode
@@ -76,7 +114,10 @@ def mode():
         if forced and forced not in KINDS:
             raise SystemExit(f"LODGER_FENCE must be one of {', '.join(KINDS)}")
         if forced in (None, "systemd") and _systemd_user():
-            _mode = ("systemd", "systemd user session")
+            capped, why = systemd_memory()
+            _mode = ("systemd", "systemd user session" if capped else
+                     f"systemd user session, but NO HARD MEMORY CAP ({why}): the watchdog stops the model over "
+                     "its RAM cap, and the kernel stops it first if memory runs out")
         else:
             d, why = delegated() if forced in (None, "systemd", "cgroup") else (None, "LODGER_FENCE=none")
             if d:
@@ -85,6 +126,12 @@ def mode():
                 _mode = ("none", f"NO HARD MEMORY FENCE ({why}): the watchdog stops the model over its RAM cap, "
                                  "and the kernel stops it first if memory runs out")
     return _mode
+
+
+def hard_cap():
+    """Does this PC's fence kind make the kernel hold the model to its RAM cap? (Per program: Fenced.hard.)"""
+    kind, _ = mode()
+    return kind == "cgroup" or (kind == "systemd" and systemd_memory()[0])
 
 
 def our_pids():
@@ -101,9 +148,55 @@ def _size(v):
     return str(int(v)) if str(v).isdigit() else str(v)
 
 
+_pdeath = None
+_jobs = queue.Queue()
+_spawner = None
+
+
+def pdeathsig():
+    """['setpriv', '--pdeathsig', 'KILL'] where util-linux's setpriv has it (2.33 and newer), else []."""
+    global _pdeath
+    if _pdeath is None:
+        _pdeath = []
+        if shutil.which("setpriv"):
+            try:
+                r = subprocess.run(["setpriv", "--help"], capture_output=True, text=True, timeout=10)
+                if "--pdeathsig" in r.stdout:
+                    _pdeath = ["setpriv", "--pdeathsig", "KILL"]
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+    return _pdeath
+
+
+def _spawn_loop():
+    while True:
+        fn, box, done = _jobs.get()
+        try:
+            box["value"] = fn()
+        except BaseException as ex:            # handed back to the caller's thread
+            box["error"] = ex
+        done.set()
+
+
+def _spawn(fn):
+    """Run fn (it starts a program) on the spawner thread, which lives as long as lodger (see the top)."""
+    global _spawner
+    with _lock:
+        if _spawner is None or not _spawner.is_alive():
+            _spawner = threading.Thread(target=_spawn_loop, name="lodger-spawner", daemon=True)
+            _spawner.start()
+    box, done = {}, threading.Event()
+    _jobs.put((fn, box, done))
+    done.wait()
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
 class Fenced:
     """One program inside a fence. props are systemd unit properties (MemoryMax, MemorySwapMax, LimitCORE,
-    CPUWeight, IOWeight, Nice, PrivateDevices, RuntimeMaxSec); the other kinds apply what they can."""
+    CPUWeight, IOWeight, Nice, PrivateDevices, RuntimeMaxSec); the other kinds apply what they can.
+    env: what lodger sets for it (see engine.child_env for the rest of its environment)."""
 
     def __init__(self, cmd, env, props, stdin=subprocess.DEVNULL, stdout=None, stderr=None, pty=False,
                  new_session=False, name=None):
@@ -118,18 +211,25 @@ class Fenced:
         self.cg = None
         self.peak = 0
         self._timer = None
+        self._hard = True if self.kind == "cgroup" else (False if self.kind == "none" else None)
+        self.hard_why = None if self.kind == "cgroup" else ("no hard fence" if self.kind == "none" else "not checked yet")
+        put, drop = engine.child_env(env)
         if self.kind == "systemd":
             sr = ["systemd-run", "--user", "--quiet", "--collect", f"--unit={self.name}", "--pty" if pty else "--pipe", "--wait"]
             sr += [f"--property={k}={v}" for k, v in self.props.items()]
-            sr += [f"--setenv={k}={v}" for k, v in env.items()]
+            sr += [f"--setenv={k}={v}" for k, v in put.items()]
+            if drop:
+                sr.append("--property=UnsetEnvironment=" + " ".join(drop))
             full, penv = sr + list(cmd), None
         else:
             cgpath = self._make_cgroup() if self.kind == "cgroup" else ""
-            full = ["sh", "-c", WRAP, "lodger-fence", cgpath or ""] + list(cmd)
-            penv = dict(os.environ, **env)
+            full = pdeathsig() + ["sh", "-c", WRAP, "lodger-fence", cgpath or ""] + list(cmd)
+            penv = {k: v for k, v in os.environ.items() if k not in drop}
+            penv.update(put)
+            penv["LODGER_FENCE_NAME"] = self.name   # how find_orphans knows it if lodger dies
             new_session = True                      # its own process group: how 'none' finds and stops it
-        self.proc = subprocess.Popen(full, stdin=stdin, stdout=stdout, stderr=stderr, env=penv,
-                                     start_new_session=new_session)
+        self.proc = _spawn(lambda: subprocess.Popen(full, stdin=stdin, stdout=stdout, stderr=stderr, env=penv,
+                                                    start_new_session=new_session))
         if self.kind != "systemd" and self.props.get("RuntimeMaxSec"):
             self._timer = threading.Timer(float(self.props["RuntimeMaxSec"]), self.kill, (signal.SIGKILL,))
             self._timer.daemon = True
@@ -183,19 +283,44 @@ class Fenced:
         return []
 
     def memory(self):
-        """(current, peak) RAM of everything in the fence, bytes (cgroup numbers: page cache counts too)."""
+        """(current, peak) RAM of everything in the fence, bytes (cgroup numbers: page cache counts too;
+        where the cgroup has no memory controller, the processes' resident memory)."""
         cg = self.cgroup()
-        if cg:
-            cur = _first_int(cg + "/memory.current")
-            peak = _first_int(cg + "/memory.peak") or cur
+        cur = _read_int(cg + "/memory.current") if cg else None
+        if cur is not None:
+            peak = _read_int(cg + "/memory.peak") or cur
             return cur, peak
         cur = sum(_rss(p) for p in self.pids())
         self.peak = max(self.peak, cur)
         return cur, self.peak
 
+    def hard(self):
+        """Does the kernel hold this program to its RAM cap? cgroup kind: yes (lodger wrote memory.max and
+        refuses to run without it); none: no; systemd: its unit's memory.max is read once it runs (until then,
+        no). self.hard_why says why not."""
+        if self._hard is not None:
+            return self._hard
+        cg = self.cgroup()
+        if not cg:
+            return False
+        mx = (_text(cg + "/memory.max") or "").strip()
+        if mx.isdigit() and self.cap and 0 < int(mx) <= self.cap:
+            self._hard, self.hard_why = True, None
+            swap = _text(cg + "/memory.swap.max")
+            if "MemorySwapMax" in self.props and swap is not None and swap.strip() != "0":
+                self.hard_why = "RAM capped, but swap isn't (memory.swap.max " + swap.strip() + ")"
+        elif self.cap is None:
+            self._hard, self.hard_why = True, None
+        elif self.pids():                       # it runs, so systemd has set what it could
+            self._hard = False
+            self.hard_why = (f"systemd didn't apply MemoryMax (memory.max is {mx or 'missing'}): "
+                             + (systemd_memory()[1] or "no memory controller for this unit"))
+        return bool(self._hard)
+
     def over_cap(self):
-        """Only the 'none' kind has no kernel cap: the watchdog enforces it from this."""
-        return self.kind == "none" and self.cap is not None and self.memory()[0] > self.cap
+        """Over its RAM cap where the kernel doesn't enforce it ('none', or a systemd unit whose cap didn't
+        apply): the watchdog enforces it from this."""
+        return self.cap is not None and not self.hard() and self.memory()[0] > self.cap
 
     def gone(self):
         return self.proc.poll() is not None and not self.pids()
@@ -273,11 +398,123 @@ def run(cmd, env, props, timeout=300):
 
 
 def _first_int(path):
+    return _read_int(path) or 0
+
+
+def _text(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _read_int(path):
+    """The first number in a file, or None if it isn't there."""
     try:
         with open(path) as f:
             return int(f.read().split()[0])
     except (OSError, ValueError, IndexError):
-        return 0
+        return None
+
+
+# ---------- models lodger left behind ----------
+
+def owner_alive(pid):
+    """Is the lodger process that made fence lodger-<pid>-... still running? (A reused pid running something
+    else doesn't count.)"""
+    if pid == os.getpid():
+        return True
+    cmd = host.read(f"/proc/{pid}/cmdline")
+    if cmd is None:
+        return False
+    args = [a for a in cmd.split("\0") if a][:4]
+    return any(os.path.basename(a) == "lodger" or a == "lodger.cli" for a in args)
+
+
+def find_orphans():
+    """Fences whose lodger is gone, with the model maybe still in them: [{kind, name, owner, where}]. Reads
+    only (systemctl list-units, the delegated cgroup folder, /proc)."""
+    out, seen = [], set()
+    if shutil.which("systemctl"):
+        try:
+            r = subprocess.run(["systemctl", "--user", "list-units", "--all", "--plain", "--no-legend", "--full",
+                                "lodger-*.service"], capture_output=True, text=True, timeout=10)
+            lines = r.stdout.splitlines() if r.returncode == 0 else []
+        except (OSError, subprocess.TimeoutExpired):
+            lines = []
+        for line in lines:
+            parts = [p for p in line.split() if p not in ("●", "*")]
+            if len(parts) < 3 or not parts[0].endswith(".service"):
+                continue
+            unit, active = parts[0], parts[2]
+            m = NAME.match(unit[:-len(".service")])        # never lodger.service itself
+            if m and active in ("active", "activating", "deactivating", "reloading") and not owner_alive(int(m.group(1))):
+                out.append({"kind": "systemd", "name": unit[:-len(".service")], "owner": int(m.group(1)), "where": unit})
+                seen.add(unit[:-len(".service")])
+    parent, _ = delegated()
+    for n in (os.listdir(parent) if parent and os.path.isdir(parent) else []):
+        m = NAME.match(n)
+        if m and os.path.isdir(os.path.join(parent, n)) and not owner_alive(int(m.group(1))):
+            out.append({"kind": "cgroup", "name": n, "owner": int(m.group(1)), "where": os.path.join(parent, n)})
+            seen.add(n)
+    procs = {}
+    for p in host.listdir("/proc"):
+        if p.isdigit():
+            env = host.read(f"/proc/{p}/environ") or ""
+            i = env.find("LODGER_FENCE_NAME=")
+            if i >= 0 and (i == 0 or env[i - 1] == "\0"):
+                procs.setdefault(env[i + len("LODGER_FENCE_NAME="):].split("\0", 1)[0], []).append(int(p))
+    for name, pids in sorted(procs.items()):
+        m = NAME.match(name)
+        if m and name not in seen and not owner_alive(int(m.group(1))):
+            out.append({"kind": "process", "name": name, "owner": int(m.group(1)), "where": sorted(pids)})
+    return out
+
+
+def reap_orphans(log=None):
+    """Stop every model a lodger that is gone left running (see find_orphans); returns plain words for each.
+    `lodger serve` and `lodger run` should call this before starting a model: an orphan holds memory and
+    has no watchdog. log(text) is called for each one stopped."""
+    done = []
+    for o in find_orphans():
+        if o["kind"] == "systemd":
+            unit = o["where"]
+            for cmd in (["kill", "-s", "KILL", unit], ["stop", unit]):
+                try:
+                    subprocess.run(["systemctl", "--user"] + cmd, capture_output=True, timeout=30)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+        elif o["kind"] == "cgroup":
+            _kill_cgroup(o["where"])
+        else:
+            for pid in o["where"]:
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
+        msg = f"stopped a model lodger {o['owner']} left running ({o['kind']} {o['name']})"
+        done.append(msg)
+        if log:
+            log(msg)
+    return done
+
+
+def _kill_cgroup(d):
+    """Kill everything in a lodger-* cgroup and remove it."""
+    t0 = time.time()
+    while time.time() - t0 < 5:
+        pids = [int(x) for x in (_text(d + "/cgroup.procs") or "").split()]
+        if not pids:
+            break
+        if os.path.exists(d + "/cgroup.kill"):
+            with contextlib.suppress(OSError), open(d + "/cgroup.kill", "w") as f:
+                f.write("1")
+        else:
+            for pid in pids:
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
+        time.sleep(0.1)
+    with contextlib.suppress(OSError):
+        os.rmdir(d)
 
 
 def _rss(pid):

@@ -1,8 +1,11 @@
 import os
+import shutil
 import unittest
+from unittest import mock
 
+from lodger import host
 from lodger.gpu import fdinfo
-from tests.support import FIXTURES, machine
+from tests.support import FIXTURES, machine, write
 
 MiB, KiB = 1 << 20, 1 << 10
 
@@ -72,7 +75,7 @@ class GenericTest(unittest.TestCase):
                           "drm-engine-panthor:\t1000 ns\ndrm-resident-memory:\t4 MiB\n")
         r = fdinfo.client(kv)
         self.assertEqual(r["busy_ns"], 1000)
-        self.assertEqual((r["vram"], r["gtt"]), (0, 0))
+        self.assertEqual((r["vram"], r["gtt"]), (0, 4 * MiB))    # "memory" is the spec's name for system RAM
 
 
 class UsageTest(unittest.TestCase):
@@ -86,6 +89,49 @@ class UsageTest(unittest.TestCase):
         with machine("desktop-amd"):
             u = fdinfo.usage("0000:11:00.0", [100, 200, 300, 400])
         self.assertEqual(set(u), {300})
+
+
+class FdFilterTest(unittest.TestCase):
+    """Only fds pointing at /dev/dri are read, and never those of a sleeping card whose driver could wake."""
+
+    def test_only_card_fds_are_read(self):
+        with machine("desktop-amd"):
+            self.assertEqual(sorted(fdinfo.drm_fds(100)), ["38", "39"])            # not fd 0 (/dev/null)
+            self.assertEqual(fdinfo.drm_fds(400), [])                              # a pipe
+            self.assertEqual(fdinfo.drm_fds(300, "0000:03:00.0"), [])              # its card is the other one
+            self.assertEqual(fdinfo.node_card("renderD129"), ("0000:11:00.0", "amdgpu"))
+
+    def test_without_fd_links_every_fdinfo_is_read(self):
+        with machine("desktop-amd", writable=True) as root:
+            shutil.rmtree(os.path.join(root, "proc/100/fd"))
+            self.assertEqual(sorted(fdinfo.drm_fds(100)), ["0", "38", "39"])
+
+    def test_sleeping_xe_card_is_not_read(self):
+        with machine("desktop-arc", writable=True) as root:
+            self.assertEqual(set(fdinfo.usage("0000:03:00.0", [700])), {700})
+            write(root, "/sys/bus/pci/devices/0000:03:00.0/power/runtime_status", "suspended\n")
+            with mock.patch("lodger.host.read", wraps=host.read) as rd:
+                self.assertEqual(fdinfo.usage("0000:03:00.0", [700]), {})
+            self.assertFalse([c for c in rd.call_args_list if "fdinfo" in c.args[0]])
+
+    def test_sleeping_amd_card_is_still_read(self):
+        with machine("desktop-amd", writable=True) as root:
+            write(root, "/sys/bus/pci/devices/0000:03:00.0/power/runtime_status", "suspended\n")
+            self.assertEqual(set(fdinfo.usage("0000:03:00.0", [100])), {100})   # amdgpu's fdinfo doesn't wake it
+
+
+class RegionTest(unittest.TestCase):
+    def test_total_when_no_resident(self):
+        kv = fdinfo.parse("drm-driver:\tv3d\ndrm-client-id:\t1\ndrm-total-memory:\t8 MiB\ndrm-shared-memory:\t0\n")
+        self.assertEqual(fdinfo.client(kv)["gtt"], 8 * MiB)
+
+    def test_resident_wins_over_total(self):
+        kv = fdinfo.parse("drm-driver:\tmsm\ndrm-client-id:\t1\ndrm-total-memory:\t8 MiB\ndrm-resident-memory:\t3 MiB\n")
+        self.assertEqual(fdinfo.client(kv)["gtt"], 3 * MiB)
+
+    def test_amdgpu_unchanged(self):
+        r = fdinfo.client(load("desktop-amd", 300, 58))
+        self.assertEqual((r["vram"], r["gtt"]), (12 * KiB, 2 * MiB))
 
 
 if __name__ == "__main__":

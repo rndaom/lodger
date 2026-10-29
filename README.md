@@ -109,8 +109,9 @@ Then connect an app at **`http://127.0.0.1:8181/v1`** (see below), or just try i
 lodger ask "Why is the sky blue?"
 ```
 
-To start lodger at login today, use [`systemd/lodger.service`](systemd/lodger.service) as a starting point for
-a user unit in `~/.config/systemd/user/` (it is the author's own, with paths for the author's PC).
+To start lodger at login, copy [`systemd/lodger.service`](systemd/lodger.service) to `~/.config/systemd/user/`
+and `systemctl --user enable --now lodger`. It runs `~/.local/bin/lodger` (where pipx, `uv tool` and `pip --user`
+put it); the file says how to point it elsewhere.
 
 ## Connect an app
 
