@@ -205,11 +205,13 @@ class Watchdog(threading.Thread):
 
     def check(self, now, dev_due):
         """One round of safety checks; stops the model if one fails. Returns (free VRAM, available RAM)."""
-        vf = sysmem.vram_free(self.card) if self.card else 0                # cheap: checked every tick
+        # cheap: checked every tick, but only for a model on the card (asking NVIDIA's driver keeps its card awake)
+        vf = sysmem.vram_free(self.card) if self.card and self.on_gpu else None
         ra = sysmem.meminfo()["MemAvailable"]
-        self.low["vram_free"] = vf if self.low["vram_free"] is None else min(self.low["vram_free"], vf)
+        if vf is not None:
+            self.low["vram_free"] = vf if self.low["vram_free"] is None else min(self.low["vram_free"], vf)
         self.low["ram_avail"] = ra if self.low["ram_avail"] is None else min(self.low["ram_avail"], ra)
-        if self.on_gpu and vf < self.kill_vram:         # stopping a processor-only model frees no VRAM
+        if self.on_gpu and (vf or 0) < self.kill_vram:  # stopping a processor-only model frees no VRAM
             self.kill(f"only {vf // MiB} MiB of graphics memory left (limit {self.kill_vram // MiB})"
                       if self.card else "the graphics card the model is on can't be found")
         elif ra < KILL_RAM_AVAIL:
@@ -351,8 +353,10 @@ def do_run(a):
     props = unit_props(p, a.runtime)
     interactive = a.prompt is None
     kind, why = fence.mode()
-    if kind != "systemd":
+    if not fence.hard_cap():
         print(f"\n(fence: {why})")
+    for line in fence.reap_orphans():           # a model a crashed lodger left running holds memory, unwatched
+        print(f"(cleaned up: {line})")
     with open(os.path.join(out, "plan.json"), "w") as f:
         json.dump({**p, "cmd": cmd, "env": env, "cgroup": props, "fence": kind}, f, indent=1)
 

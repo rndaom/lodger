@@ -336,7 +336,7 @@ class Lodger:
             try:
                 e, card = self.engine, sysmem.dgpu()
                 mine = (e.wd.peak["model_vram"] or e.plan["gpu_bytes"]) if e and e.where == "card" and e.alive() else 0
-                free = sysmem.vram_free(card) if card else None
+                free = card.free() if card else None    # None: can't be read, so plan from what's there now
                 p = planner.make(entry.path, leave_gpu=self.a.leave_gpu * MiB, threads=self.a.threads,
                                  extra=entry.planning_args(), vram_free=free + mine if free is not None else None)
                 if not p["refuse"] and p["ngl"]:
@@ -1239,6 +1239,8 @@ def serve(argv):
         sys.exit(f"no models found: add folders or files to {catalog.CONFIG}")
     default = a.default or (default if default in models else None) or next(iter(models))
     lodger = Lodger(a, models, default)
+    for line in fence.reap_orphans():            # models a crashed lodger left running: they hold memory, unwatched
+        log(f"cleaned up after an earlier lodger: {line}")
     unpause_all()                                # left over from a crash
     httpd = ThreadingHTTPServer((HOST, a.port), make_handler(lodger, a.api_key))
     httpd.daemon_threads = True
