@@ -9,6 +9,7 @@ import platform
 import sys
 
 from . import config, engine, fence, gpu, host, reserve
+from .gpu import nvidia
 
 GiB = 1 << 30
 
@@ -61,8 +62,13 @@ def main(argv):
     if argv and argv[0] in ("-h", "--help"):
         print(__doc__)
         return 0
-    cfg = config.get()
-    problems = []
+    checked, errors, warnings = config.check()
+    try:
+        cfg = config.get()
+    except SystemExit:
+        cfg = checked                       # a broken setting keeps its default here, and is listed
+        config.use(cfg)
+    problems = list(errors)
     print("lodger doctor (reads only; wakes nothing)\n")
     print("System:   " + system())
     print("Memory:   " + memory())
@@ -70,6 +76,10 @@ def main(argv):
     print("Power:    " + detail)
     cfgnote = "" if os.path.exists(config.PATH) else " (not there: defaults)"
     print(f"Settings: {config.PATH}{cfgnote}")
+    for e in errors:
+        print("          problem: " + e)
+    for w in warnings:
+        print("          warning: " + w)
     on = [k for k, v in cfg["extras"].items() if v]
     if on:
         print("          extras on: " + ", ".join(on))
@@ -117,6 +127,19 @@ def main(argv):
             else:
                 env = " ".join(f"{k}={v}" for k, v in t["env"].items())
                 print(f"  reaches the chosen card as {t['name']} ({env})")
+        if "vulkan" in e["backends"]:
+            layer = engine.vulkan_layer()
+            print("  Vulkan: " + (f"Mesa's device-select layer found ({layer})" if layer else
+                                  "Mesa's device-select layer NOT found (VkLayer_MESA_device_select.json): lodger uses "
+                                  "Vulkan only where one card is listed"))
+        if "cuda" in e["backends"]:
+            drv = nvidia.driver_version()
+            ok = nvidia.cuda_ok(e["cuda"], drv) if e["cuda"] else None
+            print(f"  CUDA: build for CUDA {e['cuda'] or '? (uses the system CUDA)'}, NVIDIA driver "
+                  + (".".join(map(str, drv)) if drv else "not loaded")
+                  + {True: " (fine)", False: " (TOO OLD for this build)", None: ""}[ok])
+            if ok is False:
+                problems.append(f"NVIDIA driver too old for this llama.cpp's CUDA {e['cuda']} build")
 
     from . import model
     try:
@@ -129,10 +152,22 @@ def main(argv):
     kind, why = fence.mode()
     print(f"\nFence:    {kind}: {why}")
     if kind == "systemd":
+        capped, cwhy = fence.systemd_memory()
+        print("          memory cap: " + ("the user manager has the memory controller (each unit's cap is checked "
+                                         "again once it runs)" if capped else f"NOT applied ({cwhy}): the watchdog enforces it"))
+        if not capped:
+            problems.append("no hard memory fence")
         d, nwhy = fence.delegated()
         print("          without systemd lodger would use " + (f"its own cgroups under {d}" if d else f"no hard fence ({nwhy})"))
     elif kind == "none":
         problems.append("no hard memory fence")
+    left = fence.find_orphans()
+    for o in left:
+        where = o["where"] if isinstance(o["where"], str) else "processes " + ", ".join(map(str, o["where"]))
+        print(f"          LEFT BEHIND: {o['name']} ({o['kind']}: {where}); the lodger that started it ({o['owner']}) is gone")
+    if left:
+        problems.append(f"{len(left)} model fence(s) left behind by a lodger that is gone (the next `lodger serve` "
+                        "or `lodger run` stops them)")
 
     from . import catalog
     try:

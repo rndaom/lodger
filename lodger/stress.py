@@ -28,13 +28,32 @@ from . import config, sysmem
 from .gpu import amd
 
 ROOT = os.path.realpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
-LODGER = os.path.join(ROOT, "bin", "lodger")
+LODGER = [sys.executable, "-m", "lodger.cli"]      # this same lodger, from a checkout or installed
 EATER = os.path.join(ROOT, "build", "vram-eater")
 RUNS = config.runs_dir()
 LONG = "Write a long, detailed story about a lighthouse keeper and a storm. At least 3000 words."
 SHORT = "In two short sentences, explain what a mixture-of-experts language model is."
+# graphics-card trouble in the kernel log, per driver: (what a line must hold to be that driver's, signs of trouble)
 BAD_KERNEL = ("MES failed", "ring timeout", "GPU reset", "VRAM is lost", "Not enough memory for command",
-              "page fault", "job timedout", "GPU recovery")
+              "page fault", "job timedout", "job_timedout", "timeout, signaled seq", "GPU recovery")
+KERNEL = {
+    "amdgpu": (("amdgpu",), BAD_KERNEL),
+    "i915": (("i915",), BAD_KERNEL + ("GPU HANG", "Resetting", "hung")),
+    "xe": (("xe ",), BAD_KERNEL + ("GT reset", "Timedout job", "hang")),
+    # NVIDIA's driver logs "NVRM: Xid (PCI:0000:01:00): 79, ..." (Xid: its error events) without its own name
+    "nvidia": (("NVRM",), ("Xid", "GPU has fallen off the bus", "RmInitAdapter failed")),
+}
+
+
+def kernel_trouble(klog, driver):
+    """Lines of the kernel log that show trouble on a card with this driver (any driver when None)."""
+    rules = [KERNEL[driver]] if driver in KERNEL else list(KERNEL.values())
+    out = []
+    for line in klog.splitlines():
+        low = line.lower()
+        if any(any(m.lower() in low for m in marks) and any(b.lower() in low for b in bad) for marks, bad in rules):
+            out.append(line)
+    return out
 STEPPED_ASIDE = "giving the graphics card back"
 
 
@@ -87,9 +106,7 @@ def health(since):
     bad = []
     klog = sh(["journalctl", "-k", "--since", since, "--no-pager", "-o", "cat"])
     dev = sysmem.dgpu()
-    driver = dev.driver if dev and dev.driver else None
-    hits = [l for l in klog.splitlines()
-            if (driver is None or driver in l) and any(b.lower() in l.lower() for b in BAD_KERNEL)]
+    hits = kernel_trouble(klog, dev.driver if dev and dev.driver else None)
     if hits:
         bad.append("graphics-card errors in the kernel log:\n    " + "\n    ".join(hits[:8]))
     dumps = [l for l in sh(["coredumpctl", "list", "--since", since, "--no-pager", "--no-legend"]).splitlines() if l.strip()]
@@ -100,9 +117,16 @@ def health(since):
     return bad
 
 
-def launch(model, prompt, n, env=None, background=False, extra=()):
-    cmd = [LODGER, "run", model, "--allow-gpu", "--prompt", prompt, "-n", str(n), "--runtime", "900", *extra]
+def child_env(env=None):
+    """The environment for a lodger started by the test: it finds this same lodger package (a checkout too)."""
     e = dict(os.environ, **(env or {}))
+    e["PYTHONPATH"] = os.pathsep.join(p for p in (ROOT, e.get("PYTHONPATH")) if p)
+    return e
+
+
+def launch(model, prompt, n, env=None, background=False, extra=()):
+    cmd = LODGER + ["run", model, "--allow-gpu", "--prompt", prompt, "-n", str(n), "--runtime", "900", *extra]
+    e = child_env(env)
     if background:
         return subprocess.Popen(cmd, env=e, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     return subprocess.run(cmd, env=e, capture_output=True, text=True)
@@ -128,6 +152,25 @@ def finish(p, timeout=120):
     except subprocess.TimeoutExpired:
         p.send_signal(signal.SIGINT)                  # lodger stops its model on Ctrl+C
         return p.communicate(timeout=30)[0]
+
+
+def end(p):
+    """Stop a `lodger run` so that it stops its model too: Ctrl+C, then TERM; KILL only as the last resort
+    (that would leave the model's fence behind: fence.reap_orphans clears it)."""
+    for sig, wait in ((signal.SIGINT, 30), (signal.SIGTERM, 15)):
+        if p.poll() is not None:
+            break
+        p.send_signal(sig)
+        try:
+            p.communicate(timeout=wait)
+        except subprocess.TimeoutExpired:
+            continue
+    if p.poll() is None:
+        p.kill()
+        p.communicate()
+        from . import fence
+        for line in fence.reap_orphans():
+            print("  (" + line + ")", flush=True)
 
 
 def stop_line(out):
@@ -252,8 +295,8 @@ def main(argv):
         print(f"(note: lodger doesn't know your desktop ({os.environ.get('XDG_CURRENT_DESKTOP') or 'none set'}), "
               "so it can't check that its compositor survives)", flush=True)
 
-    meas = subprocess.Popen([LODGER, "measure", "--seconds", "3600", "--interval", "1", "--label", "stress", "--quiet"],
-                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    meas = subprocess.Popen(LODGER + ["measure", "--seconds", "3600", "--interval", "1", "--label", "stress", "--quiet"],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=child_env())
     results = []
     try:
         if not a.only_game:
@@ -270,7 +313,7 @@ def main(argv):
                 p = launch(a.model, LONG, 6000, env={"LODGER_KILL_VRAM_FREE_MIB": "4096"}, background=True,
                            extra=["--leave-gpu", "4096"])
                 if not wait_writing(t0, p):
-                    p.kill()
+                    end(p)
                     return False, "model did not start writing within 5 minutes"
                 time.sleep(5)
                 e = subprocess.run([EATER, "3072", "20"], capture_output=True, text=True, timeout=300, env=eater_env())
@@ -289,7 +332,7 @@ def main(argv):
                     t0 = time.time()
                     p = launch(a.model, LONG, 6000, background=True)
                     if not wait_writing(t0, p):
-                        p.kill()
+                        end(p)
                         return False, "model did not start writing within 5 minutes"
                     secs = start_steam()
                     alive = p.poll() is None
@@ -306,11 +349,11 @@ def main(argv):
                 t0 = time.time()
                 p = launch(a.model, LONG, 6000, background=True)
                 if not wait_writing(t0, p):
-                    p.kill()
+                    end(p)
                     return False, "model did not start writing within 5 minutes"
                 g = start_game(a.game_appid)
                 if g:
-                    p.kill()
+                    end(p)
                     return False, g
                 tg = time.time()
                 out = finish(p)

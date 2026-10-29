@@ -1,16 +1,23 @@
-# lodger serve for this PC: http://127.0.0.1:8181/v1 (only this PC can reach it).
+# lodger serve: http://127.0.0.1:8181/v1 (only this PC can reach it).
 # Starts with your desktop session and stops when you log out. Serves every model in
-# ~/.config/lodger/models.toml, one at a time (pi lists them all). A model loads on the first request
-# for it and unloads after 10 minutes unused, so lodger holds no memory while you don't use it.
-# Install: ln -s ~/Projects/sybil/lodger/systemd/lodger.service ~/.config/systemd/user/
-#          systemctl --user daemon-reload && systemctl --user enable --now lodger
+# ~/.config/lodger/models.toml, one at a time. A model loads on the first request for it and unloads
+# after 10 minutes unused, so lodger holds no memory while you don't use it.
+#
+# Install (lodger installed with pipx, uv tool or pip --user, which put it in ~/.local/bin):
+#   cp systemd/lodger.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now lodger
+# lodger somewhere else (a package in /usr/bin, or a checkout's bin/lodger): keep this file and point
+# ExecStart there with `systemctl --user edit lodger`:
+#   [Service]
+#   ExecStart=
+#   ExecStart=/path/to/lodger serve --allow-gpu --idle 10
 [Unit]
 Description=lodger: local AI that steps aside for your apps
 PartOf=graphical-session.target
 After=graphical-session.target
 
 [Service]
-ExecStart=%h/Projects/sybil/lodger/bin/lodger serve --allow-gpu --idle 10
+ExecStart=%h/.local/bin/lodger serve --allow-gpu --idle 10
 Environment=PYTHONUNBUFFERED=1
 # lodger stops its model itself on SIGTERM; give it time to
 TimeoutStopSec=40
