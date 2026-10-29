@@ -35,9 +35,11 @@ class Server:
         self.port = port
         self.auth = auth_header(read_key())       # the server inherits LODGER_API_KEY, if set
         self.log = open(os.path.join(out, "serve.log"), "w")
-        self.proc = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(__file__), "..", "bin", "lodger"),
-                                      "serve", model, "--allow-gpu", "--port", str(port)],
-                                     stdout=self.log, stderr=subprocess.STDOUT)
+        # this lodger, installed or not (the package's folder goes first on the path)
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [root, os.environ.get("PYTHONPATH")])))
+        self.proc = subprocess.Popen([sys.executable, "-m", "lodger.cli", "serve", model, "--allow-gpu", "--port", str(port)],
+                                     stdout=self.log, stderr=subprocess.STDOUT, env=env)
 
     def get(self, path):
         try:
@@ -109,9 +111,9 @@ class Server:
         if self.proc.poll() is None:
             self.proc.send_signal(2)            # Ctrl-C: stops its engine cleanly
             try:
-                self.proc.wait(30)
+                self.proc.wait(90)
             except subprocess.TimeoutExpired:
-                self.proc.kill()
+                self.proc.kill()                # its model runs outside it: the next lodger cleans up after it
         self.log.close()
 
 
@@ -126,6 +128,19 @@ class LowWatch(threading.Thread):
             v = sysmem.vram_free(self.card)
             self.low = v if self.low is None else min(self.low, v)
             time.sleep(0.1)
+
+
+def serving():
+    """Another lodger serve running (the login service, or one on the usual port)?"""
+    if subprocess.run(["systemctl", "--user", "is-active", "-q", "lodger"]).returncode == 0:
+        return "lodger.service"
+    try:
+        c = http.client.HTTPConnection("127.0.0.1", 8181, timeout=2)
+        c.request("GET", "/health")
+        c.getresponse().read()
+        return "the lodger serve on port 8181"
+    except (OSError, http.client.HTTPException):
+        return None
 
 
 def wait_started(box, limit=120):
@@ -152,6 +167,10 @@ def main(argv):
     a = ap.parse_args(argv)
     if router_running():
         sys.exit("Stop llama-router first: systemctl --user stop llama-router (and start it again afterwards).")
+    other = serving()
+    if other:
+        sys.exit(f"Stop {other} first (systemctl --user stop lodger; start it again afterwards): two lodgers on one "
+                 "card see each other's model as an app that needs the card, so the results would mean nothing.")
     out = os.path.join(RUNS, time.strftime("%Y-%m-%d-%H%M%S") + "-stress-serve")
     os.makedirs(out)
     low = LowWatch()

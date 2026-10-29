@@ -168,6 +168,9 @@ class FakeLodger:
     def wait_engine(self, entry):
         return self.engine
 
+    def cooling(self, entry):
+        return None
+
     @contextlib.contextmanager
     def using(self, e):
         yield
@@ -295,9 +298,24 @@ class EngineKeyTest(unittest.TestCase):
                 self.assertNotIn(e.key, f.read())
             self.assertEqual(e.auth(), {"Authorization": f"Bearer {e.key}"})
             self.assertGreaterEqual(len(e.key), 32)
+            self.assertIn(e, serve.Engine.all)
             e.finish()
             self.assertFalse(os.path.exists(e.keyfile))
-            serve.Engine.all.remove(e)
+            self.assertNotIn(e, serve.Engine.all)
+
+    def test_failed_start_leaves_no_key(self):
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(serve, "RUNTIME_DIR", d), \
+                mock.patch.object(serve.fence, "Fenced", side_effect=SystemExit("no fence")), \
+                mock.patch.object(serve.fence, "mode", return_value=("systemd", "")), \
+                mock.patch.object(serve.engine, "tool", side_effect=lambda name: "/llama.cpp/bin/" + name), \
+                mock.patch.object(serve.engine, "device_args", return_value=([], {})), \
+                mock.patch.object(serve.sysmem, "dgpu", return_value=None):
+            plan = {"model": "/m.gguf", "ctx": 4096, "threads": 4, "ngl": 0, "n_cpu_moe": 0, "ram_cap": 1 << 30,
+                    "keep": 1 << 30}
+            with self.assertRaises(SystemExit):
+                serve.Engine(plan, SimpleNamespace(name="m", args=lambda: []), d)
+            self.assertEqual([f for f in os.listdir(d) if f.endswith(".key")], [])
 
 
 if __name__ == "__main__":
