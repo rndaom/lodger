@@ -1259,7 +1259,7 @@ def serve(argv):
     a.api_key = read_key(a.api_key_file)
     models, default = catalog.load(a.files or None)
     if not models:
-        sys.exit(f"no models found: add folders or files to {catalog.CONFIG}")
+        sys.exit(f"no models found: add folders or files to {catalog.CONFIG}, or download one: `lodger models`")
     default = a.default or (default if default in models else None) or next(iter(models))
     lodger = Lodger(a, models, default)
     for line in fence.reap_orphans():            # models a crashed lodger left running: they hold memory, unwatched

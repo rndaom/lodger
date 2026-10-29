@@ -38,6 +38,13 @@ All notable changes to lodger are written here. The format follows
 - Repository files for contributors: README, MIT licence, CONTRIBUTING, Code of Conduct, SECURITY, issue
   forms, pull request template, CI (ruff and unit tests on Python 3.11 to 3.13), `pyproject.toml` for
   installing with pip, pipx and uv, and a `lodger` command (`lodger.cli`) that `bin/lodger` also calls.
+- `lodger models`: a built-in list of ten Apache-2.0 and MIT chat models (dense and mixture of experts, about 2 to
+  18 GiB) and which of them fit this PC right now, planned by lodger's own planner from each file's header before
+  anything is downloaded. `lodger models get NAME` downloads one into `~/.local/share/lodger/models` (size and
+  licence shown first; resumable; SHA-256 checked before it counts as done), `lodger models info NAME` shows
+  where it comes from, and `lodger models rm NAME` moves it to the Trash.
+- `lodger serve` serves the models `lodger models get` downloaded when `models.toml` lists no `folders` (or there
+  is none); when it lists its own, `lodger models get` adds the download folder to them.
 
 ### Fixed
 - Nothing runs unwatched: an error in the watchdog's checks stops the model, a watchdog that stops beating gets the
