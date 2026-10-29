@@ -37,7 +37,9 @@ class Neighbors:
         apps = {}
         if not self.card:
             return apps
-        pids = sysmem.pids() if full else list(self.gpu_pids)
+        # always in pid order, as a full scan is: a client shared by two processes then always counts for the
+        # same one, and never looks like one app suddenly taking another's memory
+        pids = sysmem.pids() if full else sorted(self.gpu_pids, key=int)
         use = self.card.usage(pids)
         ours = set(self.ours())
         for pid in pids:
