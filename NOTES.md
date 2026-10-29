@@ -220,9 +220,14 @@ Roadmap, in order:
 3. **Repo for contributors** - done 2026-10-28: README, LICENSE, CONTRIBUTING, SECURITY, conduct, issue forms
    (hardware report from `lodger doctor`), CI (ruff + unittest on 3.11-3.13), pyproject. Left: claim `lodger`
    on PyPI (needs the user's login), then `uv tool install lodger` works.
-4. **Model picker**: a small built-in list of Apache-2.0 models per memory size, checked download, license shown.
-   The Sybil registry could be an optional extra source later.
-5. **Ollama-compatible shim** - done 2026-10-29 (branch `rndaom/ollama-api`; see Server, "Ollama's API").
+4. **Model picker** - done 2026-10-29 (merged into main) (`lodger/picker.py`, `lodger models`): ten
+   Apache-2.0/MIT models (granite-4.2-3b, qwen3.5-4b/9b, ling-3.0-tiny, gemma-4-12b, ministral-3-14b,
+   gpt-oss-20b, gemma-4-26b-a4b, qwen3.6-35b-a3b, qwen3.8-27b) pinned by HF commit, size and LFS SHA-256 (checked
+   2026-10-29; Gemma 4 is plain Apache 2.0, unlike Gemma 1-3). Fit = plan.make() on a sparse "header stub"
+   (the real header, a hole to the full size) so llama-fit-params plans it without the weights. Downloads
+   resumable (.part), .ok note before the rename, into ~/.local/share/lodger/models = catalog.DOWNLOADS (scanned
+   when models.toml has no `folders`). The Sybil registry could be an optional extra source later.
+5. **Ollama-compatible shim** - done 2026-10-29 (merged into main; see Server, "Ollama's API").
 6. AUR package; test on other people's machines (8 GB card, NVIDIA, APU laptop).
 
 ## Any Linux PC (vendor-neutral base, 2026-10-28; roadmap item 1 of the open-source release)

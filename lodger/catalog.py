@@ -1,15 +1,18 @@
 """The models lodger serves: every .gguf file in the folders named in ~/.config/lodger/models.toml (see
-that file), with names and llama-server settings from it."""
+that file), with names and llama-server settings from it. Without `folders` there (or without the file), the
+folder `lodger models get` downloads into: ~/.local/share/lodger/models."""
 import fnmatch
 import os
 import re
 import tomllib
 
+from . import config as settings
 from .model import architecture
 
 CONFIG = os.environ.get("LODGER_MODELS") or os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "lodger", "models.toml")
 SPLIT = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 SMALLEST_CTX = 256                                   # plan.SMALLEST_CTX
+DOWNLOADS = os.path.join(settings.DATA, "models")    # where `lodger models get` puts models (picker.py)
 
 # llama-server's other names (llama.cpp common/arg.cpp) for the options lodger looks at, so a setting is
 # known whichever name it is written with; it is passed on under the long name
@@ -135,7 +138,7 @@ def load(paths=None, config=CONFIG):
     files = [os.path.abspath(os.path.expanduser(p)) for p in paths] if paths else []
     if not paths:
         files = list(named)
-        for folder in listed(cfg, "folders"):
+        for folder in listed(cfg, "folders") if "folders" in cfg else [DOWNLOADS]:
             for root, dirs, names in os.walk(os.path.expanduser(folder)):
                 dirs.sort()
                 for n in sorted(names):

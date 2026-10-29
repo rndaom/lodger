@@ -87,6 +87,8 @@ whether it worked or not.
 uv tool install lodger        # or: pipx install lodger
 lodger doctor                 # what lodger sees on this PC, and what will work
 lodger setup                  # download llama.cpp (Vulkan by default)
+lodger models                 # no models yet? see which of lodger's list fit this PC
+lodger models get qwen3.5-9b  # download one (size and licence shown first, SHA-256 checked)
 lodger serve --allow-gpu      # keep a model ready for apps on this PC
 ```
 
@@ -96,9 +98,10 @@ Not on PyPI yet? Install from source instead:
 uv tool install git+https://github.com/rndaom/lodger
 ```
 
-lodger serves every model it finds in the folders listed in `~/.config/lodger/models.toml`. Copy
-[`systemd/models.example.toml`](systemd/models.example.toml) there and point `folders` at your models. You can
-also name files directly: `lodger serve ~/models/MyModel.gguf --allow-gpu`.
+lodger serves every model it finds in the folders listed in `~/.config/lodger/models.toml`, or, without that
+file, the models `lodger models get` downloaded. Already have models? Copy
+[`systemd/models.example.toml`](systemd/models.example.toml) there and point `folders` at them. You can also
+name files directly: `lodger serve ~/models/MyModel.gguf --allow-gpu`.
 
 Without `--allow-gpu` lodger runs on the processor only. With it, lodger uses the card while it is free and
 steps aside when it is not.
@@ -112,6 +115,32 @@ lodger ask "Why is the sky blue?"
 To start lodger at login, copy [`systemd/lodger.service`](systemd/lodger.service) to `~/.config/systemd/user/`
 and `systemctl --user enable --now lodger`. It runs `~/.local/bin/lodger` (where pipx, `uv tool` and `pip --user`
 put it); the file says how to point it elsewhere.
+
+## Models to start with
+
+No models yet? `lodger models` shows a short built-in list and what fits this PC right now:
+
+```
+  NAME                   KIND         SIZE  LICENCE     FITS
+  qwen3.5-9b             dense     5.3 GiB  Apache-2.0  yes: all on the graphics card, 128K context
+  gpt-oss-20b            MoE      11.3 GiB  Apache-2.0  yes: on the graphics card, experts of 5 of 24 layers in RAM, 128K context
+  qwen3.8-27b            dense    17.7 GiB  Apache-2.0  slowly: 36 of 64 layers on the graphics card, but RAM can't hold the rest ...
+```
+
+- **The list**: ten general chat models from about 2 to 18 GiB, for roughly 4 to 24 GiB of free graphics memory
+  and RAM, dense and mixture of experts (MoE), from IBM Granite, Qwen, Gemma, Mistral, Ling and gpt-oss. Every
+  one is under the **Apache-2.0 or MIT** licence (checked on its repository and on the model it was made from),
+  pinned to one file on Hugging Face by commit, size and SHA-256.
+- **Does it fit**: the same plan `lodger plan` makes, for the memory free right now (a model lodger is already
+  serving counts as used). To plan before downloading, lodger fetches only each file's header, a few MB, into
+  `~/.cache/lodger/headers`. Without llama.cpp or the network you get a rough guess, marked as one.
+- **Download**: only when you run `lodger models get NAME` (`lodger models info NAME` shows the details first).
+  It lands in `~/.local/share/lodger/models` as `NAME.gguf`, so `lodger serve` serves it as NAME. An interrupted
+  download continues when you run the command again, and the file counts as downloaded only once its SHA-256
+  matches. If your `models.toml` lists its own `folders`, lodger adds that folder to them.
+- **Remove**: `lodger models rm NAME` moves the file to the Trash (`gio trash` when available).
+
+Restart `lodger serve` (`systemctl --user restart lodger`) after a download or removal to see the change.
 
 ## Connect an app
 
@@ -190,6 +219,7 @@ middle of a move: that answer ends with an error, and well-behaved clients retry
 | `lodger stress MODEL`, `lodger stress-serve MODEL` | Tests that grab the card on purpose. See [Safety](#safety) |
 | `lodger doctor` | What lodger sees on this PC (cards, power, memory, llama.cpp, fence), read-only. Paste it into hardware reports |
 | `lodger setup` | Download a llama.cpp release (Vulkan, ROCm, CUDA or CPU) into `~/.local/share/lodger`, checksum checked |
+| `lodger models` | Models to start with and which fit this PC; `get NAME` downloads one (checked), `rm NAME` moves it to the Trash. See [Models to start with](#models-to-start-with) |
 
 `lodger <command> --help` shows the options. `lodger plan` is the safest first step: it only reads and prints.
 

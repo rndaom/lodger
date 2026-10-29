@@ -2,6 +2,8 @@
 # and pi lists them all. A [models.NAME] section names a file and gives it settings; files without one
 # get a name from their file name. Settings are llama-server options (temp = 0.7 -> --temp 0.7).
 # After editing: systemctl --user restart lodger
+# Without `folders` lodger serves what `lodger models get` downloaded (~/.local/share/lodger/models); with them,
+# `lodger models get` adds that folder here.
 # (This example is the one used on the PC lodger was built on; the live copy is ~/.config/lodger/models.toml.)
 
 folders = ["~/models", "~/LocalAI/llama/models", "~/.cache/omarchy/local-ai/models"]
