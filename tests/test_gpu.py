@@ -1,10 +1,13 @@
+import os
+import shutil
+import time
 import unittest
 from unittest import mock
 
 from lodger import gpu, sysmem
 from lodger.gpu import amd, nvidia
 from lodger.neighbors import Neighbors
-from tests.support import FakeNVML, machine, read, write
+from tests.support import FIXTURES, FakeNVML, machine, read, write
 
 GiB, MiB = 1 << 30, 1 << 20
 
@@ -136,7 +139,7 @@ class LaptopApuTest(unittest.TestCase):
 class ArcTest(unittest.TestCase):
     def test_arc_memory_is_a_todo_and_says_so(self):
         with machine("desktop-arc"):
-            d = gpu.choose()
+            d = gpu.choose("03:00.0")
             self.assertFalse(d.integrated)
             self.assertIsNone(d.free())
             self.assertIn("Arc", d.why_unknown())
@@ -149,7 +152,7 @@ class ArcTest(unittest.TestCase):
 class NeighborsTest(unittest.TestCase):
     def test_busy_app_on_xe_counted_in_cycles(self):
         with machine("desktop-arc", writable=True) as root:
-            nb = Neighbors(gpu.choose())
+            nb = Neighbors(gpu.choose("03:00.0"))
             fd = "/proc/700/fdinfo/5"
             text = read(root, fd)
             clock = [1000.0]
@@ -172,6 +175,124 @@ class NeighborsTest(unittest.TestCase):
         with machine("desktop-amd"):
             nb = Neighbors(gpu.choose(), ours=lambda: [100])
             self.assertEqual(nb._sample(), {})
+
+
+def add_card(root, src_machine, src_pci, pci):
+    """Copy a recorded card into another recorded machine at `pci`."""
+    shutil.copytree(os.path.join(FIXTURES, src_machine, "sys/bus/pci/devices", src_pci),
+                    os.path.join(root, "sys/bus/pci/devices", pci), symlinks=True)
+
+
+class ChoiceTest(unittest.TestCase):
+    """gpu = "auto" ranks only cards whose memory lodger can read, by the same size for every vendor."""
+
+    def test_unreadable_arc_does_not_beat_the_built_in_graphics(self):
+        with machine("desktop-arc", writable=True) as root:
+            add_card(root, "laptop-nvidia", "0000:00:02.0", "0000:00:02.0")
+            self.assertEqual(gpu.choose().pci, "0000:00:02.0")
+            self.assertIn("Arc", gpu.why_none("auto", [gpu.Device("0000:03:00.0")]))
+
+    def test_bigger_nvidia_beats_smaller_amd(self):
+        with machine("laptop-nvidia", writable=True) as root:
+            add_card(root, "desktop-amd", "0000:03:00.0", "0000:02:00.0")
+            write(root, "/sys/bus/pci/devices/0000:02:00.0/mem_info_vram_total", str(8 * GiB))
+            write(root, "/sys/bus/pci/devices/0000:01:00.0/power/runtime_status", "active\n")
+            nvidia._nvml = FakeNVML(total=24 * GiB, used=GiB)
+            self.assertEqual(gpu.choose().pci, "0000:01:00.0")
+            nvidia._nvml = FakeNVML(total=6 * GiB, used=GiB)
+            self.assertEqual(gpu.choose().pci, "0000:02:00.0")
+
+    def test_sleeping_nvidia_still_counts(self):
+        with machine("laptop-nvidia", writable=True) as root:
+            add_card(root, "desktop-amd", "0000:03:00.0", "0000:02:00.0")
+            write(root, "/sys/bus/pci/devices/0000:02:00.0/mem_info_vram_total", str(8 * GiB))
+            write(root, "/sys/bus/pci/devices/0000:01:00.0/power/runtime_status", "active\n")
+            nvidia._nvml = FakeNVML(total=24 * GiB, used=GiB)
+            gpu.choose()                                            # seen awake once: 24 GiB
+            write(root, "/sys/bus/pci/devices/0000:01:00.0/power/runtime_status", "suspended\n")
+            self.assertEqual(gpu.choose().pci, "0000:01:00.0")      # its size is remembered, it isn't woken
+
+    def test_this_pc_unchanged(self):
+        with machine("desktop-amd"):
+            self.assertEqual(gpu.choose().pci, "0000:03:00.0")
+
+
+class AmdTest(unittest.TestCase):
+    def test_unreadable_used_is_unknown_not_free(self):
+        with machine("desktop-amd", writable=True) as root:
+            os.remove(os.path.join(root, "sys/bus/pci/devices/0000:03:00.0/mem_info_vram_used"))
+            card = gpu.Device("0000:03:00.0")
+            self.assertIsNone(card.memory())
+            self.assertIsNone(card.free())
+            self.assertIn("mem_info", card.why_unknown())
+            self.assertEqual(sysmem.vram_free(card), 0)             # the watchdog reads 0 free: it stops the model
+            self.assertEqual(gpu.choose().pci, "0000:11:00.0")      # not planned for
+
+    def test_garbage_is_unknown(self):
+        with machine("desktop-amd", writable=True) as root:
+            write(root, "/sys/bus/pci/devices/0000:03:00.0/mem_info_gtt_used", "oops\n")
+            self.assertIsNone(gpu.Device("0000:03:00.0").memory())
+
+    def test_integrated(self):
+        with machine("desktop-amd", writable=True) as root:
+            card = "/sys/bus/pci/devices/0000:03:00.0"
+            os.remove(os.path.join(root, card.lstrip("/"), "mem_info_vram_vendor"))
+            self.assertFalse(gpu.Device("0000:03:00.0").integrated)  # board_info: never on an APU (6.7+)
+            os.remove(os.path.join(root, card.lstrip("/"), "board_info"))
+            self.assertTrue(gpu.Device("0000:03:00.0").integrated)   # 6.7+ and no board_info: an APU
+            write(root, "/proc/sys/kernel/osrelease", "6.1.0-18-amd64\n")
+            self.assertFalse(gpu.Device("0000:03:00.0").integrated)  # older kernel: 16 GiB is no carve-out
+            self.assertTrue(gpu.Device("0000:11:00.0").integrated)   # 512 MiB is
+        with machine("laptop-apu"):
+            self.assertTrue(gpu.choose().integrated)
+
+
+class NvmlLifeTest(unittest.TestCase):
+    def test_failure_is_retried_later(self):
+        clock = [100.0]
+        with machine("laptop-nvidia"), mock.patch("lodger.gpu.nvidia.NVML", side_effect=OSError("no lib")) as make, \
+                mock.patch("lodger.gpu.nvidia.time.monotonic", side_effect=lambda: clock[0]):
+            self.assertIsNone(nvidia.nvml())
+            clock[0] += 1
+            self.assertIsNone(nvidia.nvml())                   # within 5 s: not tried again
+            self.assertEqual(make.call_count, 1)
+            clock[0] += 5
+            self.assertIsNone(nvidia.nvml())                   # after 5 s: tried again, next wait 10 s
+            self.assertEqual(make.call_count, 2)
+            self.assertEqual(nvidia._nvml_error[2], 10.0)
+            self.assertIn("no lib", nvidia.why_unknown(gpu.Device("0000:00:02.0")))
+
+    def test_session_closed_where_the_card_may_sleep(self):
+        class Real(nvidia.NVML):
+            def __init__(self):
+                self.handles, self.closed = {}, False
+
+            def shutdown(self):
+                self.closed = True
+
+            def memory(self, pci):
+                return 8 * GiB, 6 * GiB, 2 * GiB
+        with machine("laptop-nvidia", writable=True) as root, mock.patch.object(nvidia, "LINGER", 0.05):
+            dev = "/sys/bus/pci/devices/0000:01:00.0"
+            write(root, dev + "/power/runtime_status", "active\n")
+            card = gpu.Device("0000:01:00.0")
+            for control, closed in (("on\n", False), ("auto\n", True)):
+                write(root, dev + "/power/control", control)
+                s = nvidia._nvml = Real()
+                self.assertEqual(card.free(), 6 * GiB)
+                time.sleep(0.2)
+                self.assertEqual(s.closed, closed)
+                self.assertEqual(nvidia._nvml is None, closed)
+
+    def test_driver_version_and_cuda(self):
+        with machine("laptop-nvidia"):
+            self.assertEqual(nvidia.driver_version(), (570, 153, 2))
+            self.assertTrue(nvidia.cuda_ok(12))
+            self.assertFalse(nvidia.cuda_ok(13))
+        with machine("desktop-amd"):
+            self.assertIsNone(nvidia.driver_version())
+            self.assertIsNone(nvidia.cuda_ok(13))
+        self.assertTrue(nvidia.cuda_ok(13, (580, 65, 6)))
 
 
 if __name__ == "__main__":

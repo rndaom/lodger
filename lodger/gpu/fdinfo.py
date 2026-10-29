@@ -1,11 +1,15 @@
 """What each process does on a graphics card, from /proc/<pid>/fdinfo, for every driver that follows the
 kernel's DRM usage stats (https://docs.kernel.org/gpu/drm-usage-stats.html): amdgpu, i915, xe, msm, panthor ...
-Read-only; reading fdinfo never wakes a sleeping card.
+Read-only. Only file descriptors that point at /dev/dri/* are read (a browser holds thousands of others), and
+never those of a card that is asleep when its driver's fdinfo may wake it (xe takes a runtime power reference
+to read its engine counters; amdgpu and i915 don't; drivers lodger doesn't know are treated like xe).
 
 A driver only needs a row in DRIVERS: which engines mean "the card is working for this app" (3D and
 compute, not video or copy) and which memory regions are on the card itself vs in system RAM."""
 import collections
+import os
 import re
+import time
 
 from .. import host
 
@@ -16,11 +20,15 @@ DRIVERS = {
     "i915": Table(engines=("render", "compute"), card=("local",), system=("system",)),
     "xe": Table(engines=("rcs", "ccs"), card=("vram",), system=("system", "gtt")),
 }
-# any other driver: every engine counts, and regions are guessed from their names
-GENERIC = Table(engines=None, card=("vram", "local"), system=("gtt", "system"))
+# any other driver: every engine counts, and regions are guessed from their names ("memory" is the spec's
+# name for system RAM, used by drm_show_memory_stats in msm, panfrost, panthor, v3d ...)
+GENERIC = Table(engines=None, card=("vram", "local"), system=("gtt", "system", "memory"))
+# drivers whose fdinfo is safe to read while the card sleeps (checked in their sources, kernel 7.x)
+NO_WAKE = {"amdgpu", "i915"}
 
 UNITS = {"": 1, "B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}
-_REGION = re.compile(r"^drm-(?:resident|memory)-(.+)$")
+_REGION = re.compile(r"^drm-(resident|memory|total)-(.+)$")
+_NODE = re.compile(r"^(?:card|renderD)\d+$")
 
 
 def parse(text):
@@ -72,12 +80,14 @@ def client(kv):
     table = DRIVERS.get(driver, GENERIC)
     rec = {"driver": driver, "pci": kv.get("drm-pdev", "?"), "id": kv.get("drm-client-id"),
            "vram": 0, "gtt": 0, "busy_ns": 0, "cycles": {}}
-    # resident memory is what is really there; drm-memory-* is the older name for the same number
-    regions = {}
+    # resident memory is what is really there; drm-memory-* is the older name for the same number; a driver
+    # that prints neither for a region (resident is optional in the spec) is counted by its total
+    regions, rank = {}, {"resident": 3, "memory": 2, "total": 1}
     for k, v in kv.items():
         m = _REGION.match(k)
-        if m and (k.startswith("drm-resident-") or m.group(1) not in regions):
-            regions[m.group(1)] = size(v)
+        if m and rank[m.group(1)] > regions.get(m.group(2), (0, 0))[0]:
+            regions[m.group(2)] = (rank[m.group(1)], size(v))
+    regions = {r: n for r, (_, n) in regions.items()}
     for region, n in regions.items():
         kind = _region_kind(table, region)
         if kind == "card":
@@ -99,12 +109,56 @@ def client(kv):
     return rec
 
 
-def clients(pid):
-    """DRM clients a process holds: {(pci, client_id): record}. An app often opens the same client through
-    several file descriptors; it is counted once."""
+_nodes = {}             # (host.ROOT, "renderD128") -> (time, pci, driver)
+
+
+def node_card(node):
+    """(pci, driver) of a /dev/dri node like renderD128, from sysfs (cached for a minute), or (None, None)."""
+    key = (host.ROOT, node)
+    hit = _nodes.get(key)
+    if hit and time.monotonic() - hit[0] < 60:
+        return hit[1:]
+    pci = host.realname(f"/sys/class/drm/{node}/device")
+    driver = host.realname(f"/sys/bus/pci/devices/{pci}/driver") if pci else None
+    _nodes[key] = (time.monotonic(), pci, driver)
+    return pci, driver
+
+
+def asleep(pci):
+    return (host.read(f"/sys/bus/pci/devices/{pci}/power/runtime_status") or "").strip() in ("suspended", "suspending")
+
+
+def drm_fds(pid, pci=None):
+    """The process's file descriptors that point at a graphics card (/dev/dri/*), skipping cards other than
+    `pci` (when given) and sleeping cards whose driver could be woken by reading. If the fd links can't be
+    listed, every fdinfo entry (the kernel's access rules for both are the same, so this is rare)."""
+    fds = host.listdir(f"/proc/{pid}/fd")
+    if not fds:
+        return host.listdir(f"/proc/{pid}/fdinfo")
+    out = []
+    for fd in fds:
+        try:
+            target = os.readlink(host.path(f"/proc/{pid}/fd/{fd}"))
+        except OSError:
+            continue
+        node = target.rsplit("/", 1)[-1]
+        if not (target.startswith("/dev/dri/") or "/dri/" in target) or not _NODE.match(node):
+            continue
+        card, driver = node_card(node)
+        if card and pci and card != pci:
+            continue
+        if card and driver not in NO_WAKE and asleep(card):
+            continue
+        out.append(fd)
+    return out
+
+
+def clients(pid, pci=None):
+    """DRM clients a process holds: {(pci, client_id): record} (only on `pci` when given). An app often opens
+    the same client through several file descriptors; it is counted once."""
     out = {}
     base = f"/proc/{pid}/fdinfo"
-    for fd in host.listdir(base):
+    for fd in drm_fds(pid, pci):
         kv = parse(host.read(f"{base}/{fd}"))
         if not kv:
             continue
@@ -130,7 +184,7 @@ def usage(pci, pids):
     between processes is counted once, for the first process holding it."""
     seen, out = set(), {}
     for pid in pids:
-        for key, rec in clients(pid).items():
+        for key, rec in clients(pid, pci).items():
             if key[0] != pci or key in seen:
                 continue
             seen.add(key)
