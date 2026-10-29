@@ -1,8 +1,10 @@
 """Decide where each piece of a model goes, from live free memory minus margins.
 Every number is in bytes. Each choice records a plain-words reason in plan["why"]."""
+import contextlib
 import hashlib
 import json
 import os
+import threading
 
 from . import config, engine, fence, reserve, sysmem
 from . import gpu as gpus
@@ -19,10 +21,16 @@ RAM_KEEP_FREE_MIN = 4 * GiB      # RAM left for everything else: at least this .
 RAM_KEEP_FREE_FRAC = 0.15        # ... or this share of all RAM
 PROC_OVERHEAD = 512 * MiB        # the program itself, tokenizer, buffers outside llama.cpp's estimate
 MIN_CTX = 4096
+SMALLEST_CTX = 256               # shorter than this isn't a usable context (and 0 would never end the ladder)
 # Context when you don't name one: as long as the model can take, up to CTX_CAP, as long as it costs no
 # more than CTX_SHARE of the memory the model may use there (the rest is better spent on the model itself).
 CTX_CAP = 131072
 CTX_SHARE = 0.25
+MMPROJ_SCRATCH = GiB             # a vision projector's working space for pictures, on top of its file size
+# --load-mode values that keep the weights in the program's own memory instead of the page cache (older builds:
+# --no-mmap, --mlock): then Linux can't drop them again, so they must fit in RAM
+HELD = {"none", "mlock", "mmap+mlock", "dio"}
+PROBE_KEYS = ("model", "context", "compute")
 
 
 def cache_dir():
@@ -38,18 +46,18 @@ def probe(model, ctx, gpu=None, extra=(), dev=None):
     Returns {model, context, compute} in bytes for the device. Cached (per llama.cpp build)."""
     cache = cache_dir()
     os.makedirs(cache, exist_ok=True)
-    st = os.stat(model.files[0])
     fit = engine.tool("llama-fit-params")
     if gpu is not None:
         dev = dev or sysmem.dgpu()
         dargs, denv = engine.device_args(gpu[0], dev, gpu[1])
         name = dargs[1]
-    key = hashlib.sha1((f"{model.path}:{st.st_size}:{st.st_mtime}:{ctx}:{gpu}" + (f":{list(extra)}" if extra else "")
-                        + f":{fit}:{os.stat(fit).st_mtime}" + (f":{name}" if gpu is not None else "")).encode()).hexdigest()[:16]
+    # every part of the model and every library of the build: a changed one means a new estimate
+    key = hashlib.sha1((f"{model.path}:{stamp(model.files)}:{ctx}:{gpu}" + (f":{list(extra)}" if extra else "")
+                        + f":{fit}:{stamp([fit] + build_libs(fit))}" + (f":{name}" if gpu is not None else "")).encode()).hexdigest()[:16]
     cf = os.path.join(cache, key + ".json")
-    if os.path.exists(cf):
-        with open(cf) as f:
-            return json.load(f)
+    hit = read_cached(cf)
+    if hit:
+        return hit
     props = {"MemoryMax": "4G", "MemorySwapMax": "0", "LimitCORE": "0"}
     args = [fit, "-m", model.files[0], "-c", str(ctx), "--fit-print", "on"] + list(extra)
     if gpu is None:
@@ -66,23 +74,73 @@ def probe(model, ctx, gpu=None, extra=(), dev=None):
         raise SystemExit(f"llama-fit-params failed (exit {r.returncode}):\n{r.stderr[-2000:]}")
     _, mdl, ctx_mib, comp_mib = line.split()
     out = {"model": int(mdl) * MiB, "context": int(ctx_mib) * MiB, "compute": int(comp_mib) * MiB}
-    with open(cf, "w") as f:
-        json.dump(out, f)
+    tmp = f"{cf}.{os.getpid()}-{threading.get_ident()}.tmp"     # two plans may probe at once
+    try:
+        with open(tmp, "w") as f:
+            json.dump(out, f)
+        os.replace(tmp, cf)                     # never a half-written file under the real name
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
     return out
 
 
-def learned_overhead():
+def stamp(paths):
+    """Size and change time of each file: what a cached probe depends on."""
+    out = []
+    for p in paths:
+        st = os.stat(p)
+        out.append(f"{st.st_size}:{st.st_mtime}")
+    return ",".join(out)
+
+
+def build_libs(tool):
+    """The llama.cpp libraries next to a program (or in ../lib): most of a build's code lives in them."""
+    d = os.path.dirname(tool)
+    out = []
+    for lib in (d, os.path.join(os.path.dirname(d), "lib")):
+        with contextlib.suppress(OSError):
+            out += sorted(os.path.join(lib, n) for n in os.listdir(lib)
+                          if n.startswith("lib") and ".so" in n and os.path.isfile(os.path.join(lib, n)))
+    return out
+
+
+def read_cached(path):
+    """A cached probe result, or None if there is none or it is damaged (then llama.cpp is asked again)."""
+    try:
+        with open(path) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict) or not all(type(d.get(k)) is int and d[k] >= 0 for k in PROBE_KEYS):
+        return None
+    return {k: d[k] for k in PROBE_KEYS}
+
+
+def _number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0
+
+
+def learned_overhead(pci=None, backend=None):
     """What the card really used beyond llama.cpp's own estimate in recent runs (HIP runtime, memory pools,
-    staging). Until there is data: HIP_OVERHEAD."""
+    staging). Until there is data: HIP_OVERHEAD. Runs that say which card (pci) and engine backend they used
+    count only for that card and backend; older runs that don't say count for every one. A damaged line is
+    skipped on its own (stopping at it would drop the newest runs, and with them the highest overhead)."""
     path = os.path.join(config.runs_dir(), "calibration.jsonl")
     seen = []
     try:
-        with open(path) as f:
+        with open(path, errors="replace") as f:
             for line in f:
-                d = json.loads(line)
-                if d.get("llama_gpu_est") and d.get("gpu_real"):
-                    seen.append(d["gpu_real"] - d["llama_gpu_est"])
-    except (OSError, ValueError):
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(d, dict) or not (_number(d.get("llama_gpu_est")) and _number(d.get("gpu_real"))):
+                    continue
+                if (pci and d.get("pci", pci) != pci) or (backend and d.get("backend", backend) != backend):
+                    continue
+                seen.append(d["gpu_real"] - d["llama_gpu_est"])
+    except OSError:
         pass
     if not seen:
         return HIP_OVERHEAD, "no runs measured yet"
@@ -96,8 +154,10 @@ class Costs:
 
     def __init__(self, model, lo, hi, extra=()):
         a, b = probe(model, lo, extra=extra), probe(model, hi, extra=extra)
-        self.per_tok = max(0.0, (b["context"] - a["context"]) / (hi - lo)) if hi > lo else 0.0
-        self.base = a["context"] - self.per_tok * lo
+        grow = b["context"] - a["context"]
+        self.per_tok = grow / (hi - lo) if hi > lo and grow > 0 else 0.0
+        # no growth measured: the larger of the two, so neither length is planned below llama.cpp's own number
+        self.base = a["context"] - self.per_tok * lo if self.per_tok else max(a["context"], b["context"])
         self.compute = max(a["compute"], b["compute"])
 
     def context(self, ctx):
@@ -118,13 +178,41 @@ def physical_cores():
 
 
 def ladder(target, lo, ctx_train):
-    target = min(target, ctx_train or target)
-    out = []
-    c = target
-    while c >= lo:
+    """Context lengths to try, longest first: `target` halved step by step, ending at exactly `lo`, never
+    longer than the model was trained for."""
+    if target < SMALLEST_CTX or lo < SMALLEST_CTX:
+        raise ValueError(f"a context shorter than {SMALLEST_CTX} words isn't usable (asked for {min(target, lo)})")
+    top = min(target, int(ctx_train)) if ctx_train and int(ctx_train) > 0 else target
+    lo = min(lo, top)
+    out, c = [], top
+    while c > lo:
         out.append(c)
         c //= 2
-    return out or [lo]
+    return out + [lo]
+
+
+def own_costs(extra):
+    """llama-server options that change memory but that llama-fit-params can't size (see catalog.py) are
+    counted here. Returns (options for llama-fit-params, vision projector bytes, projector on the card,
+    weights held in RAM)."""
+    fit, proj, proj_card, held = [], 0, True, False
+    args = iter(extra)
+    for a in args:
+        if a == "--mmproj":
+            proj = os.path.getsize(next(args))
+        elif a in ("--mmproj-offload", "--no-mmproj-offload"):
+            proj_card = a == "--mmproj-offload"
+        elif a in ("--no-mmap", "--mlock"):
+            held = True
+        elif a == "--mmap":
+            pass
+        elif a == "--load-mode":
+            v = next(args)
+            held = v in HELD
+            fit += [a, v]
+        else:
+            fit.append(a)
+    return fit, proj, proj_card, held
 
 
 def with_margin(x):
@@ -137,15 +225,23 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
     """Return a plan dict, or one with plan["refuse"] set to the reason.
     target_ctx: context to aim for; None = automatic (see CTX_CAP, CTX_SHARE).
     device_check: also ask llama.cpp for its own estimate on the card (starts the card's driver briefly).
+    extra: llama-server options that change memory (catalog.Entry.planning_args()); see own_costs for the ones
+    lodger counts itself.
     card: the graphics card (default: the one lodger chose; None: there is none); mem: /proc/meminfo numbers;
     keep: graphics memory to leave for the desktop (default: reserve.py). model_path may also be a Model."""
     m = model_path if isinstance(model_path, Model) else Model(model_path)
     L = m.n_layer
     why = []
+    if not L:
+        return {"model": m.path, "name": m.meta.get("name"), "why": why, "refuse":
+                f"lodger can't place this model: it has no layers it knows ({m.meta.get('arch') or 'unknown'} design)"}
+    leave_gpu = max(0, leave_gpu)
+    extra, proj, proj_card, held = own_costs(extra)
     card = sysmem.dgpu() if card is AUTO else card
     mem = sysmem.meminfo() if mem is None else mem
     cfg = config.get()
     live = vram_free is None                    # not a --pretend plan
+    backend = None
     if card is None:
         no_card = gpus.why_none(cfg["gpu"])
     elif live and card.asleep() and not cfg["wake_gpu"]:
@@ -155,7 +251,8 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
     elif live and card.free(meminfo=mem) is None:
         no_card = card.why_unknown() or "its free memory can't be read"
     else:
-        no_card = engine.for_device(card).get("why")
+        t = engine.for_device(card)
+        no_card, backend = t.get("why"), t.get("backend")
     if live:
         vram_free = (card.free(meminfo=mem) or 0) if card else 0
     ram_avail = mem["MemAvailable"] if ram_avail is None else ram_avail
@@ -201,28 +298,35 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
                + f", {ram_keep / GiB:.1f} GiB RAM for everything else. "
                f"Our estimates get +{EST_MARGIN:.0%} + {EST_MARGIN_FIXED // MiB} MiB extra on top.")
 
+    # a vision projector (mmproj) is loaded whole, on the card with the model unless told otherwise, and needs
+    # room for the pictures; llama-fit-params doesn't count it
+    proj_need = proj + MMPROJ_SCRATCH if proj else 0
+    if proj:
+        why.append(f"Vision projector: {proj / GiB:.1f} GiB + {MMPROJ_SCRATCH / GiB:.1f} GiB for pictures, counted "
+                   + ("on the graphics card when the model is there, else in RAM." if proj_card else "in RAM (no-mmproj-offload)."))
     gpu = None
     if cpu_only or no_card or why_gpu_off:
         why.append("Graphics card not used: " + (why_gpu_off or ("you asked for processor only" if cpu_only else no_card)) + ".")
     else:
-        overhead, src = learned_overhead()
+        overhead, src = learned_overhead(card.pci, backend)
+        more = overhead + (proj_need if proj_card else 0)      # on the card besides llama.cpp's own estimate
         budget, w = vram_budget, []
-        gpu = place_on_gpu(m, costs, fair(budget), budget, w, overhead)
+        gpu = place_on_gpu(m, costs, fair(budget), budget, w, more)
         for _ in range(3):
             if not (gpu and device_check):
                 break
             d = probe(m, gpu["ctx"], (gpu["ngl"], gpu["n_cpu_moe"]), extra, dev=card)
             llama = d["model"] + d["context"] + d["compute"]
             plan["llama_gpu_est"] = llama
-            if llama + overhead <= gpu["gpu_est"]:
+            if llama + more <= gpu["gpu_est"]:
                 break                                   # our own estimate is the higher one: keep it
-            short = with_margin(llama + overhead) - gpu["gpu_bytes"]
-            if with_margin(llama + overhead) <= vram_budget:   # the real limit, not the shrunk working budget
-                gpu.update(gpu_est=llama + overhead, gpu_bytes=with_margin(llama + overhead))
+            short = with_margin(llama + more) - gpu["gpu_bytes"]
+            if with_margin(llama + more) <= vram_budget:   # the real limit, not the shrunk working budget
+                gpu.update(gpu_est=llama + more, gpu_bytes=with_margin(llama + more))
                 break
             budget -= short                             # llama.cpp says more than we thought: plan smaller
             w = [f"llama.cpp's own estimate for the card was {short // MiB} MiB higher than ours; planned smaller."]
-            gpu = place_on_gpu(m, costs, fair(vram_budget), budget, w, overhead)
+            gpu = place_on_gpu(m, costs, fair(vram_budget), budget, w, more)
         else:
             if gpu and device_check:
                 w.append("Couldn't get our plan and llama.cpp's estimate to agree; not using the graphics card.")
@@ -245,26 +349,31 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
                        f"{max(0, ram_budget) / GiB:.1f} GiB RAM is left for the rest.")
     on_cpu_layers = set(range(L - plan["ngl_layers"]))
     experts_on_cpu = on_cpu_layers | set(range(plan["n_cpu_moe"]))
+    cpu_weights = (m.token_embd + m.other + m.dense(on_cpu_layers) + m.experts(experts_on_cpu)
+                   + (0 if plan["output_on_gpu"] else m.output))
 
     # RAM: weights not on the card are read from the model file through the page cache. Linux can drop
     # those pages again at any time, so they can't crash anything (if they don't fit they are read from
     # the SSD again: slow, not dangerous). Memory llama.cpp allocates itself can't be dropped: that part
-    # must fit or we refuse.
+    # must fit or we refuse. Weights held in RAM (no-mmap, mlock) and a projector off the card count as that.
+    own = PROC_OVERHEAD + (proj_need if gpu is None or not proj_card else 0) + (cpu_weights if held else 0)
+    if held:
+        why.append(f"The weights kept in RAM ({cpu_weights / GiB:.1f} GiB) are held there (no-mmap or mlock), "
+                   "so they count as the model's own memory.")
     if gpu is None:
-        ctx = next((c for c in fair(ram_budget) if costs.context(c) + costs.compute + PROC_OVERHEAD <= ram_budget), None)
+        ctx = next((c for c in fair(ram_budget) if costs.context(c) + costs.compute + own <= ram_budget), None)
         if ctx is None:
             plan["refuse"] = (f"Not enough RAM even on the processor: context + scratch need "
-                              f"{(costs.context(ctxs[-1]) + costs.compute + PROC_OVERHEAD) / GiB:.1f} GiB, "
+                              f"{(costs.context(ctxs[-1]) + costs.compute + own) / GiB:.1f} GiB, "
                               f"{max(0, ram_budget) / GiB:.1f} GiB can be spared.")
             return plan
         plan["ctx"] = ctx
-        anon = costs.context(ctx) + costs.compute + PROC_OVERHEAD
+        anon = costs.context(ctx) + costs.compute + own
         why.append(f"Running on the processor only, context {ctx} words.")
     else:
         cpu_ctx_share = costs.context(plan["ctx"]) * len(on_cpu_layers) / L if plan["ngl_layers"] < L else 0
-        anon = int(cpu_ctx_share) + (costs.compute if plan["n_cpu_moe"] or plan["ngl_layers"] < L else 0) + PROC_OVERHEAD
-    cpu_weights = (m.token_embd + m.other + m.dense(on_cpu_layers) + m.experts(experts_on_cpu)
-                   + (0 if plan["output_on_gpu"] else m.output))
+        anon = int(cpu_ctx_share) + (costs.compute if plan["n_cpu_moe"] or plan["ngl_layers"] < L else 0) + own
+    cached = 0 if held else cpu_weights             # held weights are counted above: none of it is page cache
     if auto:
         why.append(f"Context chosen automatically: {plan['ctx']} words (this model can take up to "
                    f"{m.meta.get('ctx_train') or '?'}; lodger aims for at most {CTX_CAP} and lets the context use "
@@ -277,7 +386,7 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
                           f"(with margin) and only {max(0, ram_budget) / GiB:.1f} GiB can be spared.")
         return plan
     room_for_weights = ram_budget - with_margin(anon)
-    if cpu_weights > room_for_weights:
+    if cached > room_for_weights:
         plan["slow"] = True
         why.append(f"Weights kept in RAM: {cpu_weights / GiB:.1f} GiB, but only {room_for_weights / GiB:.1f} GiB fits "
                    "next to your apps. The rest is read from the SSD again as needed: safe, but slower.")
@@ -285,18 +394,19 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
         plan["slow"] = False
         why.append(f"Weights kept in RAM: {cpu_weights / GiB:.1f} GiB (fits).")
     # RAM fence: own memory + as much of the weights as we can spare; never more than the budget
-    plan["ram_cap"] = max(with_margin(anon), min(ram_budget, with_margin(anon) + cpu_weights + GiB))
+    plan["ram_cap"] = max(with_margin(anon), min(ram_budget, with_margin(anon) + cached + GiB))
     why.append(f"RAM fence for the model: {plan['ram_cap'] / GiB:.1f} GiB, no swap. "
                f"Processor threads: {plan['threads']} (leaves cores for your apps).")
     return plan
 
 
 def place_on_gpu(m, costs, ctxs, budget, why, overhead):
-    """Best placement on the card, or None. Order of preference (NOTES.md step 4)."""
+    """Best placement on the card, or None. Order of preference (NOTES.md step 4). overhead: what the card holds
+    beyond the model's pieces, context and scratch (its runtime, a vision projector)."""
     L = m.n_layer
     # 1. everything, longest context first
     for c in ctxs:
-        need = m.dense() + m.experts() + m.output + costs.context(c) + costs.compute + overhead
+        need = m.dense() + m.experts() + m.output + m.other + costs.context(c) + costs.compute + overhead
         if with_margin(need) <= budget:
             why.append(f"Everything fits on the graphics card with a {c}-word context "
                        f"({with_margin(need) / GiB:.1f} GiB of {budget / GiB:.1f} GiB usable, margin included).")
@@ -305,7 +415,7 @@ def place_on_gpu(m, costs, ctxs, budget, why, overhead):
     #    llama.cpp's --n-cpu-moe N keeps the experts of the FIRST N layers in RAM)
     if m.is_moe:
         for c in ctxs:
-            fixed = m.dense() + m.output + costs.context(c) + costs.compute + overhead
+            fixed = m.dense() + m.output + m.other + costs.context(c) + costs.compute + overhead
             if with_margin(fixed) > budget:
                 continue
             k, need = 0, fixed
@@ -322,7 +432,7 @@ def place_on_gpu(m, costs, ctxs, budget, why, overhead):
     # 3. fewer whole layers on the card (all experts in RAM)
     for c in ctxs:
         per_layer_ctx = costs.context(c) / L
-        need = costs.compute + overhead
+        need = costs.compute + overhead + m.other         # pieces outside the layers: counted on the card to be safe
         n = 0
         while n < L:
             i = L - 1 - n                       # llama.cpp puts the LAST layers on the card

@@ -1,22 +1,28 @@
 """The watchdog's wrong-card check, from the kernel's fdinfo (recorded desktop: pids 100/200 share a client
 on the RX 7800 XT at 03:00.0 with ~413 MiB; pid 300 has ~2 MiB on the built-in graphics at 11:00.0)."""
+import argparse
 import contextlib
 import io
 import os
+import signal
+import subprocess
 import tempfile
+import time
 import unittest
 from unittest import mock
 
 from lodger import config, launch
 from lodger.gpu import fdinfo
+from lodger.neighbors import Neighbors
 from tests.support import machine
 
 MiB = 1 << 20
 
 
 class FakeFence:
-    def __init__(self, pids):
-        self._pids, self.signals = pids, []
+    def __init__(self, pids, gone=True):
+        self._pids, self.signals, self._gone = pids, [], gone
+        self.cap = None
 
     def pids(self):
         return self._pids
@@ -25,7 +31,169 @@ class FakeFence:
         self.signals.append(sig)
 
     def gone(self):
-        return True
+        return self._gone
+
+    def over_cap(self):
+        return False
+
+    def memory(self):
+        return 0, 0
+
+
+def wait_for(cond, limit=3.0):
+    t0 = time.time()
+    while time.time() - t0 < limit and not cond():
+        time.sleep(0.01)
+    return cond()
+
+
+class FailClosedTest(unittest.TestCase):
+    """The watchdog never leaves a model unwatched: a check it can't make stops the model."""
+
+    def setUp(self):
+        config.use(config.load(os.devnull))
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(config.use, None)
+        self.quiet = contextlib.redirect_stderr(io.StringIO())
+        self.quiet.__enter__()
+        self.addCleanup(self.quiet.__exit__, None, None, None)
+
+    def start(self, fence, out=None):
+        w = launch.Watchdog(fence, False, out or self.tmp.name)
+        w.start()
+        self.addCleanup(w.join, 2)
+        self.addCleanup(w.stop_flag.set)
+        return w
+
+    def test_an_error_in_a_check_stops_the_model_and_keeps_watching(self):
+        f = FakeFence([], gone=False)
+        with machine("desktop-amd"), mock.patch.object(launch.sysmem, "meminfo", return_value={}):
+            w = self.start(f)
+            self.assertTrue(wait_for(lambda: w.reason and f.signals.count(signal.SIGKILL) >= 3))
+            self.assertIn("couldn't check", w.reason)
+            self.assertIn("KeyError", w.reason)
+            self.assertTrue(w.is_alive())
+            self.assertTrue(w.healthy())
+
+    def test_kill_is_retried_until_the_fence_is_empty(self):
+        f = FakeFence([], gone=False)
+        with machine("desktop-amd"):
+            w = launch.Watchdog(f, False, self.tmp.name)
+            w.kill("first")
+            w.kill("second")
+        self.assertEqual(w.reason, "first")
+        self.assertEqual(f.signals, [signal.SIGKILL, signal.SIGKILL])
+
+    def test_logging_trouble_never_stops_the_watching(self):
+        f = FakeFence([1234])
+        low = {"MemTotal": 32 << 30, "MemAvailable": 100 * MiB}
+        with machine("desktop-amd"), mock.patch.object(launch.sysmem, "gpu_use", side_effect=OSError("disk full")):
+            w = self.start(f, out=os.path.join(self.tmp.name, "missing", "folder"))     # watch.tsv can't be made
+            time.sleep(0.3)
+            self.assertTrue(w.healthy())
+            self.assertIsNone(w.reason)
+            with mock.patch.object(launch.sysmem, "meminfo", return_value=low):
+                self.assertTrue(wait_for(lambda: w.reason))
+        self.assertIn("RAM left", w.reason)
+
+    def test_healthy_says_when_nobody_is_watching(self):
+        with machine("desktop-amd"):
+            w = launch.Watchdog(FakeFence([]), False, self.tmp.name)
+            self.assertFalse(w.healthy())                       # not started
+            w.start()
+            self.assertTrue(w.healthy())
+            w.beat -= 60                                        # stuck
+            self.assertFalse(w.healthy())
+            self.assertTrue(wait_for(w.healthy))                # it comes back once a check finishes
+            w.stop_flag.set()
+            w.join(2)
+            self.assertFalse(w.healthy())
+
+    def test_run_stops_the_model_when_the_watchdog_is_dead(self):
+        class Proc(FakeFence):
+            def wait(self, timeout=None):
+                if signal.SIGKILL in self.signals:
+                    return -9
+                time.sleep(timeout)
+                raise subprocess.TimeoutExpired("llama", timeout)
+        f = Proc([])
+        with machine("desktop-amd"):
+            w = launch.Watchdog(f, False, self.tmp.name)        # never started: as good as dead
+            self.assertEqual(launch.wait_watched(f, w, every=0.01), -9)
+        self.assertIn("stopped watching", w.reason)
+
+
+class SettleTest(unittest.TestCase):
+    """An app already busy on the card is seen before lodger loads anything."""
+
+    class Clock:
+        def __init__(self):
+            self.t = 1000.0
+
+        def time(self):
+            return self.t
+
+        def sleep(self, s):
+            self.t += s
+
+    class Card:
+        pci = "0000:03:00.0"
+
+        def __init__(self, clock, busy):
+            self.clock, self.busy = clock, busy
+
+        def usage(self, pids):
+            return {p: {"vram": 300 * MiB, "gtt": 0, "busy_ns": int(self.clock.t * 1e9 * self.busy), "cycles": {}}
+                    for p in pids}
+
+        def free(self, meminfo=None):
+            return 12 << 30
+
+    def settle(self, busy):
+        clock = self.Clock()
+        with mock.patch("lodger.launch.time", clock), mock.patch("lodger.neighbors.time", clock), \
+                mock.patch.object(launch.sysmem, "pids", return_value=[4242]), \
+                mock.patch.object(launch.sysmem, "app_name", return_value="game"), \
+                mock.patch.object(launch.fence, "our_pids", return_value=[]):
+            return launch.settle(self.Card(clock, busy))
+
+    def test_a_busy_app_is_seen(self):
+        self.assertIn("game is keeping the graphics card busy", self.settle(0.6) or "")
+
+    def test_a_calm_card_is_free(self):
+        self.assertIsNone(self.settle(0.01))
+
+
+class AllowGpuTest(unittest.TestCase):
+    def test_yes_at_the_question_also_asks_llama_cpp(self):
+        a = argparse.Namespace(model="/m.gguf", ctx=None, min_ctx=4096, cpu_only=False, allow_gpu=False, leave_gpu=0,
+                               threads=None, pretend_vram_free=None, pretend_ram_avail=None)
+        with mock.patch.object(launch.sysmem, "dgpu", return_value=None), \
+                mock.patch.object(launch.sys.stdin, "isatty", return_value=True), \
+                mock.patch("builtins.input", return_value="y"), \
+                mock.patch.object(launch, "gpu_blockers", return_value=None) as blockers, \
+                mock.patch.object(launch.planner, "make", return_value={}) as make:
+            launch.build_plan(a, True)
+        self.assertTrue(blockers.call_args[0][0])
+        self.assertTrue(make.call_args.kwargs["device_check"])
+
+
+class NeighborsOrderTest(unittest.TestCase):
+    def test_partial_scans_go_in_pid_order(self):
+        seen = []
+
+        class Card:
+            pci = "0000:03:00.0"
+
+            def usage(self, pids):
+                seen.append(list(pids))
+                return {p: fdinfo.empty() for p in pids}
+        nb = Neighbors(Card(), ours=lambda: ())
+        nb.gpu_pids = {200: "b", 100: "a", 30: "c"}            # found in this order by earlier full scans
+        nb.scanned = time.time()
+        nb._sample()
+        self.assertEqual(seen, [[30, 100, 200]])
 
 
 class WrongCardTest(unittest.TestCase):

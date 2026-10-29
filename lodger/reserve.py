@@ -25,23 +25,38 @@ _notes = {}            # pci -> {minute: [lowest, highest]}
 
 
 def floor(total):
-    cfg = config.get().get("desktop_reserve_mib")
-    if cfg:
-        return int(cfg) * MiB
+    """desktop_reserve_mib from config.toml can raise the reserve above the one for the card's size, never
+    lower it: a smaller number (or 0, or a negative one) leaves the reserve for the card's size."""
     step = 256 * MiB                                   # a "16 GB" card has 15.98 GiB: round up
-    return min(2 * GiB, max(GiB, -(-(total or 0) // 8 // step) * step))
+    auto = min(2 * GiB, max(GiB, -(-(total or 0) // 8 // step) * step))
+    cfg = config.get().get("desktop_reserve_mib")
+    if cfg is None:
+        return auto
+    if isinstance(cfg, bool) or not isinstance(cfg, (int, float)):
+        raise ValueError(f"desktop_reserve_mib in config.toml must be a number of MiB, like 2048 (it is {cfg!r})")
+    return max(auto, int(cfg * MiB))
 
 
 def _path(pci):
     return os.path.join(config.runs_dir(), f"desktop-{pci}.json")
 
 
+def _valid(v):
+    return (isinstance(v, list) and len(v) == 2 and all(isinstance(x, (int, float)) and not isinstance(x, bool)
+                                                        and x >= 0 for x in v))
+
+
 def _load(pci):
+    """The notes for a card; a damaged or strange file counts as no notes (the floor still holds)."""
     if pci not in _notes:
         try:
             with open(_path(pci)) as f:
-                _notes[pci] = {int(k): v for k, v in json.load(f).items()}
-        except (OSError, ValueError, AttributeError):
+                d = json.load(f)
+            notes = {int(k): v for k, v in d.items()}
+            if not all(_valid(v) for v in notes.values()):
+                raise ValueError("not [lowest, highest] pairs")
+            _notes[pci] = notes
+        except (OSError, ValueError, AttributeError, TypeError):
             _notes[pci] = {}
     return _notes[pci]
 

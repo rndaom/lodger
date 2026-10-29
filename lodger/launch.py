@@ -20,8 +20,9 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 
-from . import config, engine, fence, plan as planner, reserve, sysmem
+from . import config, engine, fence, neighbors, plan as planner, reserve, sysmem
 from .gpu import fdinfo
 from .neighbors import Neighbors
 
@@ -53,9 +54,11 @@ def router_coming():
     return None
 
 
-def settle(card, seconds=2.0, limit=30.0):
+def settle(card, seconds=None, limit=30.0):
     """Before taking memory on the card: is another app busy on it, or still loading (free memory
-    falling)? Returns a reason the card is taken, or None once it has been calm for `seconds`."""
+    falling)? Returns a reason the card is taken, or None once it has been calm for `seconds` (default: long
+    enough to see an app that is busy for BUSY_SECONDS in a row, measured over 1-second windows)."""
+    seconds = max(seconds or 0, neighbors.BUSY_SECONDS + 1.5)
     nb = Neighbors(card, ours=fence.our_pids)
     t0 = time.time()
     while time.time() - t0 < limit:
@@ -131,6 +134,12 @@ def unit_cgroup(unit):
 
 
 class Watchdog(threading.Thread):
+    """Watches a running model and stops it when memory gets low or another app needs the card.
+    It fails closed: an error in its checks stops the model too, and once it has decided to stop the model it
+    keeps killing it every tick until the fence is empty. healthy() says whether it is still watching; a
+    caller that finds it isn't must stop the model itself (do_run does)."""
+    STALE = 3.0                                 # seconds without a finished check before healthy() says no
+
     def __init__(self, fenced, on_gpu, out, log=None, keep=None):
         super().__init__(daemon=True)
         self.kill_vram = reserve.kill_line(keep if keep is not None else reserve.floor(0))
@@ -143,17 +152,29 @@ class Watchdog(threading.Thread):
         self.low = {"vram_free": None, "ram_avail": None}
         self.card = sysmem.dgpu()
         self.neighbors = Neighbors(self.card, ours=fence.our_pids) if on_gpu else None
+        self.beat = time.time()                 # when the safety checks last finished (time.time())
+        self.last_nb = 0.0
+        self._lock = threading.Lock()
+
+    def healthy(self, stale=None):
+        """True while the thread runs and its last round of checks finished within `stale` seconds."""
+        return self.is_alive() and time.time() - self.beat < (stale or self.STALE)
 
     def kill(self, why, graceful=False):
-        if self.reason:
-            return
-        self.reason = why
-        print(f"\n[lodger] STOPPING THE MODEL: {why}", file=sys.stderr, flush=True)
-        if graceful:
-            self.fenced.kill(signal.SIGTERM)
-            t0 = time.time()
-            while time.time() - t0 < 1.5 and not self.fenced.gone():
-                time.sleep(0.1)
+        """Stop the model (the first reason given is kept). Every call sends SIGKILL again, so a kill that
+        didn't land (systemctl failed, say) is retried."""
+        with self._lock:
+            first = self.reason is None
+            if first:
+                self.reason = why
+        if first:
+            print(f"\n[lodger] STOPPING THE MODEL: {why}", file=sys.stderr, flush=True)
+            if graceful:
+                self.fenced.kill(signal.SIGTERM)
+                t0 = time.time()
+                while time.time() - t0 < 1.5 and not self.fenced.gone():
+                    time.sleep(0.1)
+                    self.beat = time.time()     # waiting on purpose, not stuck
         self.fenced.kill(signal.SIGKILL)
 
     def check_device(self):
@@ -182,50 +203,105 @@ class Watchdog(threading.Thread):
                 return True
         return False
 
+    def check(self, now, dev_due):
+        """One round of safety checks; stops the model if one fails. Returns (free VRAM, available RAM)."""
+        vf = sysmem.vram_free(self.card) if self.card else 0                # cheap: checked every tick
+        ra = sysmem.meminfo()["MemAvailable"]
+        self.low["vram_free"] = vf if self.low["vram_free"] is None else min(self.low["vram_free"], vf)
+        self.low["ram_avail"] = ra if self.low["ram_avail"] is None else min(self.low["ram_avail"], ra)
+        if self.on_gpu and vf < self.kill_vram:         # stopping a processor-only model frees no VRAM
+            self.kill(f"only {vf // MiB} MiB of graphics memory left (limit {self.kill_vram // MiB})"
+                      if self.card else "the graphics card the model is on can't be found")
+        elif ra < KILL_RAM_AVAIL:
+            self.kill(f"only {ra // MiB} MiB of RAM left (limit {KILL_RAM_AVAIL // MiB})")
+        elif self.fenced.over_cap():                    # no kernel fence on this PC: we are the fence
+            self.kill(f"the model went over its RAM cap ({self.fenced.cap // MiB} MiB)")
+        elif dev_due and self.check_device():
+            pass
+        elif self.on_gpu and now - self.last_nb >= 0.25:
+            self.last_nb = now
+            why = self.neighbors.update() or router_coming()
+            if why:
+                self.kill(why + "; giving the graphics card back", graceful=True)
+        return vf, ra
+
+    def note(self, f, t, vf, ra):
+        """The model's own use, for the log and for learning (not a safety check)."""
+        mv = mg = 0
+        ram = None
+        pids = self.fenced.pids()
+        if pids:
+            use = sysmem.gpu_use(self.card, pids)
+            mv, mg = use["vram"], use["gtt"]
+            ram, peak = self.fenced.memory()
+            self.peak["cgroup_ram"] = max(self.peak["cgroup_ram"], peak or ram or 0)
+        self.now = {"vram": mv, "gtt": mg}
+        self.peak["model_vram"] = max(self.peak["model_vram"], mv)
+        self.peak["model_gtt"] = max(self.peak["model_gtt"], mg)
+        if f:
+            f.write(f"{t:.1f}\t{(vf or 0) // MiB}\t{(ra or 0) // MiB}\t{mv // MiB}\t{mg // MiB}\t{(ram or 0) // MiB}\n")
+            f.flush()
+
     def run(self):
         t0 = time.time()
-        last_nb = last_log = last_dev = 0.0
-        with open(os.path.join(self.out, "watch.tsv"), "w") as f:
+        last_log = last_dev = 0.0
+        f = None
+        try:                                    # the log is a nice-to-have: watching goes on without it
+            f = open(os.path.join(self.out, "watch.tsv"), "w")
             f.write("t\tvram_free_MiB\tram_avail_MiB\tmodel_vram_MiB\tmodel_gtt_MiB\tmodel_ram_MiB\n")
-            while not self.stop_flag.is_set():
-                now = time.time()
-                loading = now - t0 < LOAD_SECONDS
-                dev_due = now - last_dev >= (0.1 if loading else 1.0)   # which card is the model on?
-                if dev_due:
-                    last_dev = now
-                vf = sysmem.vram_free(self.card)                       # cheap: checked every tick
-                ra = sysmem.meminfo()["MemAvailable"]
-                self.low["vram_free"] = vf if self.low["vram_free"] is None else min(self.low["vram_free"], vf)
-                self.low["ram_avail"] = ra if self.low["ram_avail"] is None else min(self.low["ram_avail"], ra)
-                if self.on_gpu and self.card and vf < self.kill_vram:   # stopping a processor-only model frees no VRAM
-                    self.kill(f"only {vf // MiB} MiB of graphics memory left (limit {self.kill_vram // MiB})")
-                elif ra < KILL_RAM_AVAIL:
-                    self.kill(f"only {ra // MiB} MiB of RAM left (limit {KILL_RAM_AVAIL // MiB})")
-                elif self.fenced.over_cap():                           # no kernel fence on this PC: we are the fence
-                    self.kill(f"the model went over its RAM cap ({self.fenced.cap // MiB} MiB)")
-                elif dev_due and self.check_device():
+        except OSError:
+            pass
+        while not self.stop_flag.is_set():
+            now = time.time()
+            loading = now - t0 < LOAD_SECONDS
+            dev_due = now - last_dev >= (0.1 if loading else 1.0)          # which card is the model on?
+            if dev_due:
+                last_dev = now
+            vf = ra = None
+            try:
+                if self.reason:
+                    if not self.fenced.gone():
+                        self.fenced.kill(signal.SIGKILL)                    # until it's really gone
+                else:
+                    vf, ra = self.check(now, dev_due)
+            except Exception as ex:                                         # can't check: don't guess, stop it
+                traceback.print_exc()
+                try:
+                    self.kill(f"the watchdog couldn't check the model ({type(ex).__name__}: {ex}); stopped to be safe")
+                except Exception:
+                    traceback.print_exc()
+            self.beat = time.time()
+            if now - last_log >= 0.5:                                       # logged twice a second
+                last_log = now
+                try:
+                    self.note(f, now - t0, vf, ra)
+                except Exception:
                     pass
-                elif self.on_gpu and now - last_nb >= 0.25:
-                    last_nb = now
-                    why = self.neighbors.update() or router_coming()
-                    if why:
-                        self.kill(why + "; giving the graphics card back", graceful=True)
-                if now - last_log >= 0.5:                              # model's own use, logged twice a second
-                    last_log = now
-                    mv = mg = 0
-                    ram = None
-                    pids = self.fenced.pids()
-                    if pids:
-                        use = sysmem.gpu_use(self.card, pids)
-                        mv, mg = use["vram"], use["gtt"]
-                        ram, peak = self.fenced.memory()
-                        self.peak["cgroup_ram"] = max(self.peak["cgroup_ram"], peak or ram or 0)
-                    self.now = {"vram": mv, "gtt": mg}
-                    self.peak["model_vram"] = max(self.peak["model_vram"], mv)
-                    self.peak["model_gtt"] = max(self.peak["model_gtt"], mg)
-                    f.write(f"{now - t0:.1f}\t{vf // MiB}\t{ra // MiB}\t{mv // MiB}\t{mg // MiB}\t{(ram or 0) // MiB}\n")
-                    f.flush()
-                self.stop_flag.wait(0.1 if loading else 0.25)
+            self.stop_flag.wait(0.1 if loading else 0.25)
+        if f:
+            f.close()
+
+
+def card_fields(on_card):
+    """Which card and engine backend a run used, for calibration.jsonl: plan.learned_overhead learns per card."""
+    card = sysmem.dgpu() if on_card else None
+    return {"pci": card.pci, "backend": engine.for_device(card).get("backend")} if card else {}
+
+
+def wait_watched(fenced, wd, every=0.5):
+    """Wait for the model to end; if the watchdog stops watching (its thread died or hangs), stop the model:
+    nothing may run unwatched. Returns the exit code."""
+    while True:
+        try:
+            return fenced.wait(timeout=every)
+        except subprocess.TimeoutExpired:
+            pass
+        if not wd.healthy():
+            try:
+                wd.kill("the watchdog stopped watching the model" if not wd.is_alive() else
+                        "the watchdog stopped answering (no check finished for a few seconds)")
+            except Exception:
+                traceback.print_exc()           # tried again in half a second
 
 
 def build_plan(a, for_run):
@@ -234,8 +310,8 @@ def build_plan(a, for_run):
         sys.exit("--pretend-* is for 'plan' only: a real run always uses the real free memory.")
     why_off = None
     card = sysmem.dgpu()
+    allowed = a.allow_gpu
     if not a.cpu_only and not pretend:
-        allowed = a.allow_gpu
         if for_run and not allowed and sys.stdin.isatty():
             allowed = input("Use the graphics card? [y/N] ").strip().lower() == "y"
         if for_run or allowed:
@@ -248,7 +324,8 @@ def build_plan(a, for_run):
         a.model, target_ctx=a.ctx, min_ctx=a.min_ctx, cpu_only=a.cpu_only, leave_gpu=a.leave_gpu * MiB,
         vram_free=None if a.pretend_vram_free is None else a.pretend_vram_free * MiB,
         ram_avail=None if a.pretend_ram_avail is None else a.pretend_ram_avail * MiB,
-        threads=a.threads, why_gpu_off=why_off, device_check=bool(a.allow_gpu and not why_off and not pretend))
+        threads=a.threads, why_gpu_off=why_off,
+        device_check=bool(allowed and not why_off and not pretend and not a.cpu_only))   # a "y" at the question counts too
 
 
 def do_run(a):
@@ -289,7 +366,7 @@ def do_run(a):
     wd = Watchdog(fenced, bool(p["ngl"]), out, log=None if interactive else os.path.join(out, "log.txt"), keep=p["keep"])
     wd.start()
     signal.signal(signal.SIGINT, lambda *_: wd.kill("you pressed Ctrl+C", graceful=True))
-    rc = fenced.wait()
+    rc = wait_watched(fenced, wd)
     secs = time.time() - t0
     wd.stop_flag.set()
     wd.join()
@@ -324,7 +401,7 @@ def do_run(a):
                             "gpu_real": wd.peak["model_vram"] if loaded else None,
                             "ram_anon_est": p["ram_anon_est"], "ram_cap": p["ram_cap"],
                             "ram_real_peak": wd.peak["cgroup_ram"], "exit": rc, "stopped": wd.reason,
-                            "run": os.path.basename(out)}) + "\n")
+                            "run": os.path.basename(out), **card_fields(p["ngl"])}) + "\n")
     lo_v = wd.low["vram_free"]
     print(f"\nexit {rc} after {secs:.0f} s"
           + (f"; STOPPED: {wd.reason}" if wd.reason else "")
@@ -352,6 +429,11 @@ def main(argv):
     ap.add_argument("--think", action="store_true", help="let the model reason before answering")
     ap.add_argument("--runtime", type=int, help="stop after this many seconds")
     a = ap.parse_args(argv)
+    for opt, v in (("--ctx", a.ctx), ("--min-ctx", a.min_ctx)):
+        if v is not None and v < planner.SMALLEST_CTX:
+            ap.error(f"{opt} must be at least {planner.SMALLEST_CTX} words")
+    if a.leave_gpu < 0 or (a.threads is not None and a.threads < 1):
+        ap.error("--leave-gpu can't be negative, and --threads must be at least 1")
     if a.action == "plan":
         p = build_plan(a, False)
         cmd, env = llama_cmd(p, a) if not p["refuse"] else (None, None)
