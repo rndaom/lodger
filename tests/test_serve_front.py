@@ -481,3 +481,68 @@ class StatusTest(MonitorCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DesktopNoteTest(unittest.TestCase):
+    """What lodger notes as the desktop's use of the card (reserve.py) never includes a lodger model: not its
+    own, not another lodger's (lodger.service next to a test or stress lodger), and nothing is noted while lodger
+    memory is on the move."""
+    GiB = serve.GiB
+
+    def setUp(self):
+        self.l = lodger()
+        self.used = 10 * self.GiB
+        self.theirs = [9 * self.GiB, 9 * self.GiB]          # another lodger's model, as each look sees it
+        self.card = SimpleNamespace(pci="0000:03:00.0", integrated=False, asleep=lambda: False,
+                                    memory=lambda: {"used": self.used, "gtt_used": 0}, usage=self.usage)
+        self.noted = []
+        for p in (mock.patch.object(serve.sysmem, "dgpu", return_value=self.card),
+                  mock.patch.object(serve.reserve, "note", lambda pci, used: self.noted.append(used)),
+                  mock.patch.object(serve, "lodger_pids", return_value={900})):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def usage(self, pids):
+        return {900: {"vram": self.theirs.pop(0) if len(self.theirs) > 1 else self.theirs[0], "gtt": 0}} \
+            if 900 in pids else {}
+
+    def test_another_lodgers_model_is_not_the_desktop(self):
+        self.l.install(FakeEng(self.l.models["a"], where="processor"))
+        self.l.note_desktop()
+        self.assertEqual(self.noted, [1 * self.GiB])
+
+    def test_our_card_model_counts_once(self):
+        e = FakeEng(self.l.models["a"], where="card")
+        e.wd.now["vram"] = 9 * self.GiB                     # the same model fdinfo sees as pid 900
+        self.l.install(e)
+        self.l.note_desktop()
+        self.assertEqual(self.noted, [1 * self.GiB])
+
+    def test_nothing_noted_while_a_lodger_model_loads(self):
+        self.theirs = [6 * self.GiB, 9 * self.GiB]
+        self.l.note_desktop()
+        self.assertEqual(self.noted, [])
+
+    def test_nothing_noted_while_our_engine_stops(self):
+        e = FakeEng(self.l.models["a"], where="card")
+        e.stopping = True
+        self.l.install(e)
+        self.l.note_desktop()
+        self.assertEqual(self.noted, [])
+
+
+class LodgerPidsTest(unittest.TestCase):
+    def test_finds_every_lodgers_model(self):
+        procs = {1: ("0::/user.slice/user-1000.slice/user@1000.service/app.slice/lodger-4242-1.service", ""),
+                 2: ("0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-firefox-1.scope", ""),
+                 3: ("0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-x.scope",
+                     "HOME=/h\0LODGER_FENCE_NAME=lodger-77-2\0"),
+                 4: ("0::/user.slice/user-1000.slice/user@1000.service/app.slice/lodger.service", "")}
+
+        def read(path, default=None):
+            pid, what = int(path.split("/")[2]), path.rsplit("/", 1)[1]
+            return procs[pid][0 if what == "cgroup" else 1]
+        with mock.patch.object(serve.sysmem, "pids", return_value=sorted(procs)), \
+                mock.patch.object(serve.sysmem, "_read", read), mock.patch.object(serve.host, "read", read), \
+                mock.patch.object(serve.fence, "our_pids", return_value={5}):
+            self.assertEqual(serve.lodger_pids(), {1, 3, 5})

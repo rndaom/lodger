@@ -42,11 +42,12 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-from . import answers, catalog, config, engine, fence, gpu as gpus, ollama, plan as planner, reserve, sysmem
+from . import answers, catalog, config, engine, fence, gpu as gpus, host, ollama, plan as planner, reserve, sysmem
 from .launch import GAME_GUARD_FLAG, RUNS, Watchdog, card_fields, gpu_blockers, router_coming, unit_cgroup, unit_props
 from .neighbors import Neighbors
 
 MiB, GiB = sysmem.MiB, sysmem.GiB
+MOVING = 256 * MiB        # lodger memory that changed this much between two looks is on the move
 HOST = "127.0.0.1"          # only this PC; part of the approved exception (../CLAUDE.md)
 QUIET_SECONDS = 60          # the card must be quiet this long before the model grows back
 MOVE_WAIT = 600             # how long a request waits for its model (a switch may wait for an answer)
@@ -897,17 +898,25 @@ class Lodger:
                 old.stop()
 
     def note_desktop(self):
-        """While no app needs the card: note how much of it everything but our model uses (reserve.py)."""
+        """While no app needs the card: note how much of it everything but lodger's models uses (reserve.py).
+        Any lodger's model is left out, ours and another's (lodger.service next to a test lodger), and nothing is
+        noted while lodger memory is on the move (an engine loading or stopping)."""
         card = sysmem.dgpu()
-        m = card.memory() if card and not card.asleep() else None
-        if not m:
+        if not card or card.asleep():
             return
         e = self.engine
-        if e and not (e.alive() and e.ready_at):
+        if e and (e.stopping or not (e.alive() and e.ready_at)):
             return                                # loading or stopping: its memory changes faster than it's logged
-        ours = e.wd.now["gtt" if card.integrated else "vram"] if e and e.where == "card" else 0
+        key = "gtt" if card.integrated else "vram"
+        pids = sorted(lodger_pids())
+        before = sum(u[key] for u in card.usage(pids).values())
+        m = card.memory()
+        after = sum(u[key] for u in card.usage(pids).values())
+        if not m or abs(after - before) > MOVING:
+            return                                # another lodger's model is loading or stopping
+        ours = e.wd.now[key] if e and e.where == "card" else 0
         used = (m["gtt_used"] or 0) if card.integrated else m["used"]
-        reserve.note(card.pci, max(0, used - ours))
+        reserve.note(card.pci, max(0, used - max(ours, before, after)))
 
     def status(self):
         e = self.engine
@@ -1637,6 +1646,20 @@ def serve(argv):
             stop_all()
         lodger.unpause()
     return 0
+
+
+def lodger_pids():
+    """Every process of any lodger's model on this PC: in a lodger-* unit or cgroup, started in one of fence.py's
+    process fences (LODGER_FENCE_NAME), or in a fence of this lodger."""
+    out = set(fence.our_pids())
+    for pid in sysmem.pids():
+        if sysmem.app_name(pid) == sysmem.OURS:
+            out.add(pid)
+            continue
+        env = host.read(f"/proc/{pid}/environ") or ""
+        if env.startswith("LODGER_FENCE_NAME=") or "\0LODGER_FENCE_NAME=" in env:
+            out.add(pid)
+    return out
 
 
 def on_hangup(lodger):
