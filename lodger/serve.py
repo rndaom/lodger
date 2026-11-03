@@ -42,7 +42,7 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-from . import answers, catalog, config, engine, fence, ollama, plan as planner, reserve, sysmem
+from . import answers, catalog, config, engine, fence, gpu as gpus, ollama, plan as planner, reserve, sysmem
 from .launch import GAME_GUARD_FLAG, RUNS, Watchdog, card_fields, gpu_blockers, router_coming, unit_cgroup, unit_props
 from .neighbors import Neighbors
 
@@ -306,6 +306,15 @@ class Lodger:
         self.failures = 0                     # the current model's starts that failed in a row
         self.retry_at, self.retry_delay = 0.0, 10
         self.ollama = None                    # where Ollama's API is answered, or why not
+        self.t_start = time.time()
+        self.last_power = 0.0                 # when the power source was last looked at
+        self.reload_wanted = None             # why the model list is to be read again (SIGHUP), or None
+        self.reloading = threading.Lock()
+        self.conf = {n: self.fingerprint(e) for n, e in models.items()}   # each model as models.toml had it
+        self.models_file = catalog.CONFIG
+        self.models_seen, self.models_changed_at = self.models_stat(), None
+        self.models_read, self.models_error = time.time(), None
+        self.monitor_error = None
         self.clock_off = time.time() - time.monotonic()   # moves when the PC sleeps or the clock is set (clock())
         self.grace_until = 0.0                # monotonic: until then a stale watchdog heartbeat may be the clock's doing
         self.out = os.path.join(RUNS, time.strftime("%Y-%m-%d-%H%M%S") + "-serve")
@@ -328,6 +337,98 @@ class Lodger:
         """Is engine `e`'s watchdog on duty (or, just after the clock jumped, not yet known to be off it)?"""
         self.clock()
         return e.watched() or time.monotonic() < self.grace_until
+
+    @staticmethod
+    def fingerprint(e):
+        """A model as the model list gives it (file, settings, context, skip) and its file's size and time: when
+        this changes, lodger plans the model afresh."""
+        try:
+            st = os.stat(e.path)
+            stamp = (st.st_mtime_ns, st.st_size)
+        except (OSError, TypeError):
+            stamp = None
+        return (e.path, json.dumps(getattr(e, "settings", None), sort_keys=True, default=str), e.ctx, e.skip, stamp)
+
+    def models_stat(self):
+        try:
+            st = os.stat(self.models_file)
+            return st.st_mtime_ns, st.st_size
+        except OSError:
+            return None
+
+    def watch_models(self, now):
+        """Read the model list again once models.toml changed and then stayed the same for 3 s (an editor may
+        still be writing it)."""
+        seen = self.models_stat()
+        if seen != self.models_seen:
+            self.models_seen, self.models_changed_at = seen, now
+        elif self.models_changed_at and now - self.models_changed_at >= 3:
+            self.models_changed_at = None
+            self.reload(f"{self.models_file} changed")
+
+    def reload(self, why):
+        """Read the model list again (models.toml, or the files lodger was started with): new models are served,
+        removed ones no longer (an answer being written finishes first), and a model whose settings or file changed
+        is planned afresh from its next start (the same object, so requests in flight keep it). A list that can't
+        be read leaves the models as they were. True if it was read."""
+        with self.reloading:
+            try:
+                models, default = catalog.load(self.a.files or None, self.models_file)
+                if not models:
+                    raise ValueError("it lists no models")
+            except (OSError, ValueError, SystemExit) as ex:   # tomllib's errors are ValueErrors
+                self.models_error = f"{self.models_file} couldn't be read again ({ex}); serving the models read before"
+                self.note(self.models_error)
+                return False
+            changes = []
+            with self.cv:
+                out = {}
+                for name, new in models.items():
+                    cur, fp = self.models.get(name), self.fingerprint(new)
+                    if cur is None:
+                        out[name] = new
+                        changes.append(f"added {name}")
+                    else:
+                        out[name] = cur
+                        if self.conf.get(name) != fp:
+                            loaded = self.engine and self.engine.entry is cur
+                            cur.__dict__.update(new.__dict__)
+                            changes.append(f"changed {name}" + (" (from its next start)" if loaded else ""))
+                    self.conf[name] = fp
+                for name, cur in self.models.items():
+                    if name not in out:
+                        cur.skip = "removed from the model list"
+                        self.conf.pop(name, None)
+                        changes.append(f"removed {name}")
+                self.models = out
+                self.default = (self.a.default if self.a.default in out else default if default in out
+                                else next(iter(out)))
+                if self.switch_to is not None and self.switch_to.skip:
+                    self.switch_to = None
+                if self.cur is not out.get(self.cur.name):        # the loaded model was removed
+                    if self.engine:
+                        self.switch_to = self.switch_to or out[self.default]   # once its answers are written
+                        self.switch_ticket = 0
+                    else:
+                        self.cur = out[self.default]
+                self.models_read, self.models_error = time.time(), None
+                self.cv.notify_all()
+            self.note(f"read the model list again ({why}): " + (", ".join(changes) or "nothing changed"))
+        threading.Thread(target=self.prepare, daemon=True).start()   # new models' contexts, pi's list
+        return True
+
+    def unplugged(self):
+        """Why the model should leave the graphics card now: the PC runs on battery and gpu_on_battery is off
+        (lodger doesn't start work on the card then, and work already there would drain the battery). None if not."""
+        if config.get().get("gpu_on_battery"):
+            return None
+        card = sysmem.dgpu()
+        if card is None or card.integrated:
+            return None
+        src, detail = gpus.power_source()
+        if src != "battery":
+            return None
+        return f"{detail}: the graphics card is used only when plugged in (gpu_on_battery in config.toml)"
 
     def note(self, text):
         log(text)
@@ -668,6 +769,7 @@ class Lodger:
                     traceback.print_exc(file=f)
                 if repr(ex) != last_error:
                     self.note(f"lodger's monitor hit an error and carries on (see monitor-errors.log): {ex!r}")
+                self.monitor_error = f"{time.strftime('%H:%M:%S')} {ex!r}"
                 last_error = repr(ex)
                 time.sleep(5)
 
@@ -675,6 +777,10 @@ class Lodger:
         """One round of the monitor."""
         self.clock()
         now = time.time()
+        if self.reload_wanted:
+            why, self.reload_wanted = self.reload_wanted, None
+            self.reload(why)
+        self.watch_models(now)
         if nb.update() or self.others_coming():
             self.quiet_since = now
         elif now - self.last_note >= 10:
@@ -726,13 +832,18 @@ class Lodger:
             if not self.bring_up(want_card=False) and not self.closing:   # straight back up on the processor
                 self.retry_later()
             return
+        if e and e.where == "card" and not self.force_off_card and now - self.last_power >= 10:
+            self.last_power = now
+            self.force_off_card = self.unplugged() or False
         if self.force_off_card:
+            why = self.force_off_card if isinstance(self.force_off_card, str) else "asked to move off the card"
             self.force_off_card = False
             if e and e.where == "card":
-                # asked to (POST /lodger/move): not a sign the card is contested, so the quiet wait doesn't grow
+                # asked to (POST /lodger/move) or unplugged: not a sign the card is contested, so the quiet wait
+                # doesn't grow
                 self.last_aside, self.card_since = time.time(), None
-                self.note("moving off the card (asked to)")
-                self.why_off_card = "asked to move off the card"
+                self.note(f"moving off the card ({why})")
+                self.why_off_card = why
                 with self.cv:
                     self.ready = False
                 e.stop()
@@ -804,13 +915,29 @@ class Lodger:
         for n, m in self.models.items():
             why = m.skip or self.cooling(m)
             models[n] = ("not served: " if m.skip else "didn't start: ") + why if why else "ok"
+        now = time.time()
+        with self.cv:
+            waiting = {}
+            for m, _ in self.waiting.values():
+                waiting[m.name] = waiting.get(m.name, 0) + 1
+            writing = sum(self.busy.values())
+        started = getattr(e, "started", None)
         return {"model": self.cur.name, "default": self.default, "ready": self.ready,
                 "where": "asleep" if self.asleep else e.where if e else None, "why": self.why,
-                "context": self.cur.ctx, "answers_in_progress": self.active,
-                "switching_to": self.switch_to.name if self.switch_to else None,
-                "quiet_needed_s": self.quiet_needed, "card_quiet_for_s": round(time.time() - self.quiet_since),
+                "context": self.cur.ctx, "answers_in_progress": self.active, "answers_being_written": writing,
+                "waiting": waiting, "switching_to": self.switch_to.name if self.switch_to else None,
+                "off_card": self.why_off_card,
+                "quiet_needed_s": self.quiet_needed, "card_quiet_for_s": round(now - self.quiet_since),
+                "engine": {"model": e.entry.name, "where": e.where, "up_s": round(now - started) if started else None,
+                           "answering": bool(e.ready_at), "stopping": e.wd.reason or (e.stopping or None),
+                           "log": os.path.join(e.out, "engine.log")} if e else None,
+                "retry_in_s": round(self.retry_at - now) if not e and self.retry_at > now else None,
+                "last_fail": self.last_fail,
                 "plan": {k: e.plan[k] for k in ("ngl", "n_cpu_moe", "ctx", "gpu_est")} if e else None,
-                "models": models, "ollama": self.ollama, "events": self.events}
+                "models": models, "models_file": {"path": self.models_file, "read": time.strftime(
+                    "%F %T", time.localtime(self.models_read)), "error": self.models_error},
+                "monitor_error": self.monitor_error, "uptime_s": round(now - self.t_start),
+                "ollama": self.ollama, "events": self.events}
 
     def loaded(self):
         """(model, graphics memory it uses, when it unloads or None) for the model loaded now, or None."""
@@ -1086,6 +1213,10 @@ def make_handler(lodger, key=None, ollama_api=False):
             if raw is None:
                 return
             path = self.route()
+            if path == "/lodger/reload":
+                ok = lodger.reload("asked to")
+                return self.send_json(200 if ok else 422, {"reloaded": ok, "error": lodger.models_error,
+                                                           "models": [e.name for e in lodger.available()]})
             if path == "/lodger/move":
                 on_card = bool(lodger.engine and lodger.engine.where == "card" and lodger.ready)
                 lodger.force_off_card = on_card
@@ -1471,6 +1602,7 @@ def serve(argv):
     ohttpd = ollama_listener(lodger, a) if a.ollama or config.get().get("ollama") else None
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
     signal.signal(signal.SIGINT, signal.default_int_handler)   # also when started in the background of a script
+    signal.signal(signal.SIGHUP, on_hangup(lodger))
     log(f"lodger serving {len(models)} models at http://{HOST}:{a.port}/v1 (only this PC"
         + (", API key required" if a.api_key else "") + f"); default {default}; logs in {lodger.out}")
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -1505,6 +1637,13 @@ def serve(argv):
             stop_all()
         lodger.unpause()
     return 0
+
+
+def on_hangup(lodger):
+    """SIGHUP (`systemctl --user reload lodger`, `kill -HUP`): read the model list again (the monitor does it)."""
+    def handler(sig, frame):
+        lodger.reload_wanted = "SIGHUP"
+    return handler
 
 
 def port_taken(port):

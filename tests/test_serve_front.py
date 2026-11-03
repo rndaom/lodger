@@ -2,7 +2,10 @@
 sleeping, growing back while a card engine fails. No graphics card or llama-server: the engines are small fakes."""
 import http.client
 import json
+import os
+import signal
 import socket
+import tempfile
 import threading
 import time
 import unittest
@@ -328,6 +331,152 @@ class GrowBackTest(MonitorCase):
         self.assertIs(l.engine, old)
         self.assertFalse(old.stopped)
         self.assertEqual(l.why_off_card, "stepped aside: an app needs the graphics card")
+
+
+class PowerTest(MonitorCase):
+    def test_unplugged_laptop_moves_off_the_card(self):
+        l = self.l
+        e = FakeEng(l.models["a"], where="card")
+        l.install(e)
+        card = SimpleNamespace(integrated=False)
+        with mock.patch.object(serve.sysmem, "dgpu", return_value=card), \
+                mock.patch.object(serve.gpus, "power_source", return_value=("battery", "on battery (BAT0 discharging)")), \
+                mock.patch.object(serve.config, "get", return_value={"gpu_on_battery": False}), \
+                mock.patch.object(l, "bring_up", return_value=True) as up:
+            l.tick(QUIET)
+            l.tick(QUIET)
+        self.assertTrue(e.stopped)
+        up.assert_called_with(want_card=False)
+        self.assertIn("battery", l.why_off_card)
+        self.assertEqual(l.quiet_needed, serve.QUIET_SECONDS)       # not a sign the card is contested
+
+    def test_plugged_in_or_allowed_stays(self):
+        l = self.l
+        e = FakeEng(l.models["a"], where="card")
+        l.install(e)
+        for src, allowed, integrated in (("ac", False, False), ("battery", True, False), ("battery", False, True)):
+            l.last_power = 0
+            with mock.patch.object(serve.sysmem, "dgpu", return_value=SimpleNamespace(integrated=integrated)), \
+                    mock.patch.object(serve.gpus, "power_source", return_value=(src, "")), \
+                    mock.patch.object(serve.config, "get", return_value={"gpu_on_battery": allowed}):
+                l.tick(QUIET)
+            self.assertFalse(e.stopped, (src, allowed, integrated))
+
+
+MODELS_TOML = """
+default = "{default}"
+folders = []
+[models.a]
+file = "{d}/a.gguf"
+{a_extra}
+[models.{other}]
+file = "{d}/{other}.gguf"
+"""
+
+
+class ReloadTest(MonitorCase):
+    def setUp(self):
+        super().setUp()
+        self.d = tempfile.mkdtemp()
+        for n in ("a", "b", "c"):
+            open(os.path.join(self.d, f"{n}.gguf"), "wb").close()
+        self.cfg = os.path.join(self.d, "models.toml")
+        self.write(other="b")
+        from lodger import catalog
+        self.catalog = catalog
+        self.p = [mock.patch.object(catalog, "CONFIG", self.cfg), mock.patch.object(catalog, "architecture", return_value="llama")]
+        for p in self.p:
+            p.start()
+        models, default = catalog.load(None, self.cfg)
+        with mock.patch.object(serve, "RUNS", self.d):
+            self.l = serve.Lodger(self.l.a, models, default)
+        self.l.note = self.notes.append
+        for e in self.l.models.values():
+            e.ctx = e.ctx or 4096
+
+    def tearDown(self):
+        for p in self.p:
+            p.stop()
+        super().tearDown()
+
+    def write(self, other="b", default="a", a_extra=""):
+        with open(self.cfg, "w") as f:
+            f.write(MODELS_TOML.format(d=self.d, other=other, default=default, a_extra=a_extra))
+
+    def test_reload_adds_removes_and_updates_in_place(self):
+        l = self.l
+        a = l.models["a"]
+        e = FakeEng(a)
+        l.install(e)
+        self.write(other="c", a_extra="temp = 0.5")
+        with mock.patch.object(l, "prepare"):
+            self.assertTrue(l.reload("test"))
+        self.assertEqual(sorted(l.models), ["a", "c"])
+        self.assertIs(l.models["a"], a)                         # the same model: requests in flight keep it
+        self.assertEqual(a.settings.get("temp"), 0.5)           # its new settings apply from its next start
+        self.assertIs(l.engine, e)
+        self.assertFalse(e.stopped)
+        self.assertTrue(any("b" in n and "removed" in n for n in self.notes), self.notes)
+
+    def test_removed_current_model_is_switched_away_from(self):
+        l = self.l
+        l.cur = l.models["b"]
+        l.install(FakeEng(l.models["b"]))
+        b = l.models["b"]
+        self.write(other="c")
+        with mock.patch.object(l, "prepare"):
+            l.reload("test")
+        self.assertTrue(b.skip)
+        self.assertIsNone(l.wait_engine(b, limit=0.2))
+        self.assertIs(l.switch_to, l.models["a"])
+
+    def test_broken_file_keeps_the_models(self):
+        l = self.l
+        with open(self.cfg, "w") as f:
+            f.write("[models.a\nfile = ")
+        self.assertFalse(l.reload("test"))
+        self.assertEqual(sorted(l.models), ["a", "b"])
+        self.assertIn("models.toml", l.status()["models_file"]["error"])
+
+    def test_changed_file_is_noticed(self):
+        l = self.l
+        l.models_seen = l.models_stat()
+        self.write(other="c")
+        st = os.stat(self.cfg)
+        os.utime(self.cfg, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))
+        with mock.patch.object(l, "reload") as reload:
+            l.watch_models(time.time())
+            reload.assert_not_called()                          # just changed: maybe still being written
+            l.watch_models(time.time() + 1)
+            reload.assert_not_called()
+            l.watch_models(time.time() + 5)
+            reload.assert_called_once()
+
+    def test_sighup_asks_for_a_reload(self):
+        l = self.l
+        l.install(FakeEng(l.models["a"]))
+        handler = serve.on_hangup(l)
+        handler(signal.SIGHUP, None)
+        with mock.patch.object(l, "reload") as reload:
+            l.tick(QUIET)
+        reload.assert_called_once()
+
+
+class StatusTest(MonitorCase):
+    def test_status_says_enough_to_find_a_problem(self):
+        l = self.l
+        e = FakeEng(l.models["a"])
+        e.started, e.out = time.time() - 30, "/runs/x"
+        l.install(e)
+        got = l.wait_engine(l.models["a"], limit=1)
+        st = json.loads(json.dumps(l.status()))
+        self.assertEqual(st["engine"]["where"], "processor")
+        self.assertEqual(st["engine"]["log"], "/runs/x/engine.log")
+        self.assertGreaterEqual(st["engine"]["up_s"], 29)
+        self.assertEqual(st["answers_being_written"], 1)
+        self.assertIn("waiting", st)
+        self.assertIn("uptime_s", st)
+        l.release(got)
 
 
 if __name__ == "__main__":
