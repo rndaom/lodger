@@ -9,6 +9,7 @@ It is the larger of
   least an hour of notes.
 Apps that really need the card (a game loading) aren't covered by this: lodger steps aside for those."""
 import json
+import math
 import os
 import time
 
@@ -42,8 +43,9 @@ def _path(pci):
 
 
 def _valid(v):
+    # json reads Infinity and NaN too: an endless reserve would keep the model off the card for good
     return (isinstance(v, list) and len(v) == 2 and all(isinstance(x, (int, float)) and not isinstance(x, bool)
-                                                        and x >= 0 for x in v))
+                                                        and math.isfinite(x) and x >= 0 for x in v))
 
 
 def _load(pci):
