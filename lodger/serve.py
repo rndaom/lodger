@@ -1420,7 +1420,7 @@ def make_handler(lodger, key=None, ollama_api=False):
                     with lodger.using(e):
                         req = ans.request(attempt)
                         if req is None:             # the length limit was reached just before the move
-                            return self.complete(ans, entry, "length")
+                            return self.complete(ans, entry, "length", e)
                         if attempt and ans.stream:
                             self.event(ans.moved_note(e.where))
                         c, r = self.upstream(e, req, ans.path, ping=ping)
@@ -1461,8 +1461,18 @@ def make_handler(lodger, key=None, ollama_api=False):
                         c.close()                   # stops the engine writing if the app went away
             return self.fail(ans, 503, "the model kept moving; answer cut short")
 
-        def complete(self, ans, entry, why=None):
-            """The answer is complete (or reached its length limit): end the stream, or send the whole answer."""
+        def complete(self, ans, entry, why=None, e=None):
+            """The answer is complete (or reached its length limit): end the stream, or send the whole answer.
+            `e`: an engine to count the request's tokens with, if the answer's own end never said."""
+            path = e and ans.counting()
+            if path:
+                c = None
+                with contextlib.suppress(Exception):
+                    c, r = self.upstream(e, ans.body, path)
+                    n = json.loads(r.read()).get("input_tokens") if r.status == 200 else None
+                    ans.input_tokens = n if isinstance(n, int) and not isinstance(n, bool) else None
+                if c:
+                    c.close()
             for s in ans.close(entry.name, why):
                 self.event(s)
             if ans.stream:

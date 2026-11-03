@@ -21,8 +21,9 @@ class Engine:
     """Stands in for llama-server: answers every POST with `whole` (JSON, `status`), or streams `events` (strings
     sent as they are, dicts as `data:` lines) and then closes; cut=True: the engine counts as gone after that."""
 
-    def __init__(self, whole=None, events=None, status=200, cut=False, where="processor", done=True):
+    def __init__(self, whole=None, events=None, status=200, cut=False, where="processor", done=True, paths=None):
         self.whole, self.events, self.status, self.cut, self.done = whole, list(events or []), status, cut, done
+        self.paths = paths or {}        # path -> JSON answered there instead (token counts)
         self.where, self.dead, self.calls = where, False, []
         self.stopping, self.wd = False, SimpleNamespace(reason=None)
         eng = self
@@ -35,6 +36,13 @@ class Engine:
 
             def do_POST(self):
                 eng.calls.append((self.path, json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
+                if self.path in eng.paths:
+                    body = json.dumps(eng.paths[self.path]).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    return self.wfile.write(body)
                 if eng.events is None or eng.whole is not None or eng.status != 200:
                     body = json.dumps(eng.whole).encode()
                     self.send_response(eng.status)
