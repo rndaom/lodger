@@ -313,6 +313,8 @@ class Lodger:
         self.ollama = None                    # where Ollama's API is answered, or why not
         self.t_start = time.time()
         self.last_power = 0.0                 # when the power source was last looked at
+        self.unload_wanted = None             # why the loaded model is to be unloaded (removed from the list), or None
+        self.next_ctx = {}                    # model -> its context from its next start (it changed while loaded)
         self.reload_wanted = None             # why the model list is to be read again (SIGHUP), or None
         self.reloading = threading.Lock()
         self.conf = {n: self.fingerprint(e) for n, e in models.items()}   # each model as models.toml had it
@@ -381,7 +383,7 @@ class Lodger:
                 models, default = catalog.load(self.a.files or None, self.models_file)
                 if not models:
                     raise ValueError("it lists no models")
-            except (OSError, ValueError, SystemExit) as ex:   # tomllib's errors are ValueErrors
+            except (Exception, SystemExit) as ex:   # unreadable, not TOML, or wrong types (defaults = "x")
                 self.models_error = f"{self.models_file} couldn't be read again ({ex}); serving the models read before"
                 self.note(self.models_error)
                 return False
@@ -397,7 +399,11 @@ class Lodger:
                         out[name] = cur
                         if self.conf.get(name) != fp:
                             loaded = self.engine and self.engine.entry is cur
+                            running = cur.ctx
                             cur.__dict__.update(new.__dict__)
+                            if loaded:
+                                # the running engine keeps its context (status, plans for a move) until it stops
+                                self.next_ctx[name], cur.ctx = cur.ctx, running
                             changes.append(f"changed {name}" + (" (from its next start)" if loaded else ""))
                     self.conf[name] = fp
                 for name, cur in self.models.items():
@@ -410,12 +416,13 @@ class Lodger:
                                 else next(iter(out)))
                 if self.switch_to is not None and self.switch_to.skip:
                     self.switch_to = None
-                if self.cur is not out.get(self.cur.name):        # the loaded model was removed
+                if self.cur is not out.get(self.cur.name) or self.cur.skip:   # the loaded model was removed
+                    why = self.cur.skip or "removed from the model list"
                     if self.engine:
-                        self.switch_to = self.switch_to or out[self.default]   # once its answers are written
-                        self.switch_ticket = 0
+                        self.unload_wanted = f"{self.cur.name}: {why}"           # once its answers are written
                     else:
                         self.cur = out[self.default]
+                        self.asleep = self.asleep or self.switch_to is None     # nothing loads until asked
                 self.models_read, self.models_error = time.time(), None
                 self.cv.notify_all()
             self.note(f"read the model list again ({why}): " + (", ".join(changes) or "nothing changed"))
@@ -746,8 +753,21 @@ class Lodger:
             old.stop()
             if old.where == "card":
                 self.unpause()
+            self.unloaded(old.entry)
         self.card_since, self.quiet_needed = None, QUIET_SECONDS
         self.start_or_give_up()
+
+    def stopped(self, e):
+        """Stop engine `e`, unloaded on purpose (unused, or its model left the list)."""
+        e.stop()
+        self.card_since = None
+        self.unpause()
+        self.unloaded(e.entry)
+
+    def unloaded(self, entry):
+        """A model no longer running: settings that changed while it ran apply from its next start."""
+        if entry.name in self.next_ctx:
+            entry.ctx = self.next_ctx.pop(entry.name)
 
     def wake_up(self):
         with self.cv:
@@ -801,6 +821,20 @@ class Lodger:
             switching = self.may_switch()
         if switching:
             return self.switch()
+        if self.unload_wanted:
+            with self.cv:
+                idle = not (e and self.busy.get(e))
+                if idle:                              # its answers are written: unload, load nothing until asked
+                    why, self.unload_wanted = self.unload_wanted, None
+                    self.ready, self.engine, self.asleep = False, None, True
+                    default = self.models.get(self.default)
+                    self.cur = default if default and not default.skip else next(iter(self.available()), self.cur)
+                    self.why = f"asleep: {why} (a model loads on the next request)"
+            if idle:
+                if e:
+                    self.note(f"unloading {e.entry.name} ({why})")
+                    self.stopped(e)
+                return
         if self.asleep:
             if self.wake:
                 self.wake_up()
@@ -820,9 +854,7 @@ class Lodger:
                     self.why = f"asleep: unloaded after {self.a.idle:g} min unused (loads again on the next request)"
             if unused:
                 self.note(f"unused for {self.a.idle:g} min: unloading {e.entry.name} until the next request")
-                e.stop()
-                self.card_since = None
-                self.unpause()
+                self.stopped(e)
                 return
         if e and not e.alive():
             reason = e.wd.reason
@@ -843,7 +875,9 @@ class Lodger:
             return
         if e and e.where == "card" and not self.force_off_card and now - self.last_power >= 10:
             self.last_power = now
-            self.force_off_card = self.unplugged() or False
+            why = self.unplugged()
+            if why:                                   # never False: a POST /lodger/move meanwhile must not be lost
+                self.force_off_card = why
         if self.force_off_card:
             why = self.force_off_card if isinstance(self.force_off_card, str) else "asked to move off the card"
             self.force_off_card = False
@@ -1541,11 +1575,15 @@ def make_handler(lodger, key=None, ollama_api=False):
                     c, r = self.upstream(e, body, path, ping=ping)
                     if r.status != 200:
                         return self.plain_fail(r.status, r.read())
+                    last = None
                     for ev in answers.events(r.readline):
                         self.event(ev.text())
                         if ev.data == "[DONE]":
                             return
-                    if not self.running(e):
+                        last = ev
+                    # a clean end: llama-server's own paths (/completion, /infill) end with "stop": true and no
+                    # [DONE]. An engine handing over (grow-back) is no longer the current one but still finishes.
+                    if not (stopped_cleanly(last) or e.alive() and not self.stopping(e)):
                         raise OSError("the engine went away")
             except (OSError, http.client.HTTPException):
                 if not self.client_gone:
@@ -1576,6 +1614,15 @@ def make_handler(lodger, key=None, ollama_api=False):
                 raise
 
     return H
+
+
+def stopped_cleanly(ev):
+    """Is this the last event of a llama-server answer that ended on its own ("stop": true)?"""
+    try:
+        d = json.loads(ev.data) if ev else None
+    except ValueError:
+        return False
+    return isinstance(d, dict) and d.get("stop") is True
 
 
 def ctx_arg(v):

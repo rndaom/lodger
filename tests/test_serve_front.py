@@ -358,6 +358,19 @@ class PowerTest(MonitorCase):
         self.assertIn("battery", l.why_off_card)
         self.assertEqual(l.quiet_needed, serve.QUIET_SECONDS)       # not a sign the card is contested
 
+    def test_asked_move_is_not_lost_to_the_power_check(self):
+        l = self.l
+        e = FakeEng(l.models["a"], where="card")
+        l.install(e)
+
+        def unplugged():
+            l.force_off_card = True                             # POST /lodger/move while the power is read
+            return None
+        with mock.patch.object(l, "unplugged", side_effect=unplugged), \
+                mock.patch.object(l, "bring_up", return_value=True):
+            l.tick(QUIET)
+        self.assertTrue(e.stopped)
+
     def test_plugged_in_or_allowed_stays(self):
         l = self.l
         e = FakeEng(l.models["a"], where="card")
@@ -426,17 +439,83 @@ class ReloadTest(MonitorCase):
         self.assertFalse(e.stopped)
         self.assertTrue(any("b" in n and "removed" in n for n in self.notes), self.notes)
 
-    def test_removed_current_model_is_switched_away_from(self):
+    def test_removed_current_model_is_unloaded_and_nothing_loads_unasked(self):
         l = self.l
         l.cur = l.models["b"]
-        l.install(FakeEng(l.models["b"]))
+        e = FakeEng(l.models["b"], where="card")
+        l.install(e)
         b = l.models["b"]
         self.write(other="c")
         with mock.patch.object(l, "prepare"):
             l.reload("test")
         self.assertTrue(b.skip)
         self.assertIsNone(l.wait_engine(b, limit=0.2))
-        self.assertIs(l.switch_to, l.models["a"])
+        self.assertIsNone(l.switch_to)
+        with mock.patch.object(l, "bring_up") as up, mock.patch.object(l, "start_or_give_up") as start:
+            l.tick(QUIET)
+            l.tick(QUIET)
+        self.assertTrue(e.stopped)
+        up.assert_not_called()
+        start.assert_not_called()
+        self.assertTrue(l.asleep)                               # the default loads on the next request, not before
+        self.assertIs(l.cur, l.models["a"])
+
+    def test_removal_waits_for_the_answer_being_written(self):
+        l = self.l
+        l.cur = l.models["b"]
+        e = FakeEng(l.models["b"])
+        l.install(e)
+        l.busy[e] = 1
+        self.write(other="c")
+        with mock.patch.object(l, "prepare"):
+            l.reload("test")
+        l.tick(QUIET)
+        self.assertFalse(e.stopped)
+        del l.busy[e]
+        l.tick(QUIET)
+        self.assertTrue(e.stopped)
+
+    def test_skipped_current_model_is_unloaded(self):
+        l = self.l
+        a = l.models["a"]
+        e = FakeEng(a)
+        l.install(e)
+        self.write(a_extra='skip = "not today"')
+        with mock.patch.object(l, "prepare"):
+            l.reload("test")
+        self.assertTrue(a.skip)
+        with mock.patch.object(l, "bring_up") as up:
+            l.tick(QUIET)
+        self.assertTrue(e.stopped)
+        up.assert_not_called()
+        self.assertIsNone(l.engine)
+
+    def test_changed_loaded_model_keeps_its_running_context(self):
+        l = self.l
+        a = l.models["a"]
+        a.ctx = 8192
+        l.install(FakeEng(a))
+        self.write(a_extra="temp = 0.5")
+        with mock.patch.object(l, "prepare"):
+            l.reload("test")
+        self.assertEqual(a.ctx, 8192)
+        self.assertEqual(l.status()["context"], 8192)
+        self.write(a_extra="ctx = 2048")
+        with mock.patch.object(l, "prepare"):
+            l.reload("test")
+        self.assertEqual(a.ctx, 8192)                          # until it starts again
+        l.a.idle, l.last_used = 1, 0
+        l.tick(QUIET)                                           # unloaded when unused
+        self.assertEqual(a.ctx, 2048)
+
+    def test_wrong_types_in_the_file_keep_the_models(self):
+        l = self.l
+        for text in ('defaults = "x"\n[models.a]\nfile = "a.gguf"\n', "models = 1\n"):
+            with open(self.cfg, "w") as f:
+                f.write(text)
+            self.assertFalse(l.reload("test"), text)
+            self.assertEqual(sorted(l.models), ["a", "b"])
+            self.assertTrue(l.status()["models_file"]["error"], text)
 
     def test_broken_file_keeps_the_models(self):
         l = self.l
@@ -468,6 +547,24 @@ class ReloadTest(MonitorCase):
         with mock.patch.object(l, "reload") as reload:
             l.tick(QUIET)
         reload.assert_called_once()
+
+
+class RelayTest(FrontCase):
+    def test_clean_end_during_a_hand_over_is_not_a_move(self):
+        chunks = [{"content": "one", "stop": False}, {"content": " two", "stop": True}]
+        e = Engine(events=chunks, done=False)
+        f = self.front(e)
+        wait = f.wait_engine
+
+        def handed_over(entry, limit=None, ping=None):
+            got = wait(entry, limit, ping)
+            f.engine = object()                                 # the card engine took over; e finishes this one
+            return got
+        f.wait_engine = handed_over
+        status, _, data = f.post("/completion", {"prompt": "count", "stream": True})
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"moved", data)
+        self.assertIn(b'"stop": true', data)
 
 
 class HangupTest(MonitorCase):
