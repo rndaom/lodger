@@ -48,13 +48,13 @@ PLANNED = {"cache-type-k", "cache-type-v", "flash-attn", "ubatch-size", "batch-s
            "no-repack", "op-offload", "no-op-offload", "kv-offload", "load-mode", "lazy-mode"}
 # change memory, but llama-fit-params can't size them: plan.own_costs counts them itself
 COUNTED = {"mmproj", "mmproj-offload", "no-mmproj-offload", "no-mmap", "mlock", "mmap", "ctx-checkpoints",
-           "moe-cache-mib", "image-max-tokens", "spec-type"}
+           "moe-cache-mib", "image-max-tokens", "spec-type", "spec-draft-n-max"}
 # speculative decoding lodger can plan: multi-token prediction (the model's own MTP layers) and n-grams (no model)
 SPEC_TYPES = {"none", "draft-mtp", "ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod", "ngram-cache"}
-# settings of those that don't change memory (or only make it smaller)
-SPEC_OK = {"spec-draft-n-max", "spec-draft-n-min", "spec-draft-p-min", "spec-draft-p-split", "spec-draft-n-ubatch",
+# settings of those that don't change memory, or only make it smaller (spec-draft-n-max does: it is COUNTED)
+SPEC_OK = {"spec-draft-n-min", "spec-draft-p-min", "spec-draft-p-split", "spec-draft-n-ubatch",
            "spec-draft-backend-sampling", "no-spec-draft-backend-sampling"}
-WHOLE = {"ctx-checkpoints", "moe-cache-mib", "image-max-tokens"}     # need a whole number, 0 or more
+WHOLE = {"ctx-checkpoints", "moe-cache-mib", "image-max-tokens", "spec-draft-n-max"}     # need a whole number, 0 or more
 MEMORY_SETTINGS = PLANNED | COUNTED
 
 
@@ -84,7 +84,7 @@ def problem(settings, ctx):
                         "which lodger can't plan memory for yet; draft-mtp and the ngram types work")
         if k in WHOLE and v is not True and (type(v) is not int or v < 0):
             return f"its setting {k} must be a whole number, 0 or more (it is {v!r})"
-        if k in UNPLANNED or (k.startswith("spec-draft-") and k not in SPEC_OK) or k.endswith("-draft"):
+        if k in UNPLANNED or (k.startswith("spec-draft-") and k not in SPEC_OK | COUNTED) or k.endswith("-draft"):
             return (f"its settings ask for {UNPLANNED.get(k, 'a draft model (speculative decoding)')} ({k}), which "
                     "lodger can't plan memory for yet")
         if k == "mmproj" and not (isinstance(v, str) and os.path.isfile(v)):

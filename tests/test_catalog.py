@@ -92,6 +92,9 @@ class EntryTest(unittest.TestCase):
                                                "spec-ngram-mod-n-max": 24})
             self.assertIsNone(e.skip, v)
             self.assertEqual(e.planning_args()[0], "--spec-type")       # the planner counts it
+        e = catalog.Entry("m", "/m.gguf", {"spec-type": "draft-mtp", "spec-draft-n-max": 6})
+        self.assertEqual(e.planning_args(), ["--spec-type", "draft-mtp", "--spec-draft-n-max", "6"])   # counted
+        self.assertIsNotNone(catalog.Entry("m", "/m.gguf", {"spec-draft-n-max": "lots"}).skip)
         for v in ("draft-eagle3", "draft-simple", "mtp", "ngram-mod,draft-dflash"):
             self.assertIn("draft model", catalog.Entry("m", "/m.gguf", {"spec-type": v}).skip or "", v)
         self.assertIn("needs a value", catalog.Entry("m", "/m.gguf", {"spec-type": True}).skip or "")
