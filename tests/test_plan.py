@@ -8,6 +8,7 @@ from unittest import mock
 from lodger import config, engine, gpu, plan
 from lodger.model import Model
 from tests.support import machine
+from tests.test_model import write_gguf
 
 MiB, GiB = 1 << 20, 1 << 30
 
@@ -532,6 +533,119 @@ class PlacementTest(PlanBase):
         self.assertEqual(c["ram_anon_est"] - a["ram_anon_est"], 4 * 150 * MiB)
         self.assertEqual(a["checkpoint_bytes"], 0)
         self.assertEqual(b["checkpoint_bytes"], 32 * 150 * MiB)
+
+
+def projector_file(d, **vision):
+    """A vision projector's header: Qwen3-VL's by default."""
+    kv = {"general.architecture": "clip", "clip.has_vision_encoder": True}
+    hp = {"embedding_length": 1152, "feed_forward_length": 4304, "attention.head_count": 16, "image_size": 768,
+          "patch_size": 16, "spatial_merge_size": 2, **vision}
+    kv.update({f"clip.vision.{k}": v for k, v in hp.items() if v is not None})
+    return write_gguf(os.path.join(d, "mmproj.gguf"), kv, [("v.blk.0.attn_q.weight", 0, [1152, 1152], 1152 * 1152 * 4)])
+
+
+def mtp_model(**kw):
+    """A model whose last layer only multi-token prediction uses (like Qwen3.5's)."""
+    m = fake_model(kinds=["attn"] * 39 + [None], **kw)
+    m.mtp = {39: {"dense": 200 * MiB, "experts": kw.get("experts", 0)}}
+    m.layers[39] = {"dense": 0, "experts": 0}
+    return m
+
+
+class GapTest(PlanBase):
+    """What llama-fit-params doesn't size: multi-token prediction drafting, llama.cpp's expert cache, a vision
+    projector's working memory."""
+
+    def test_mtp_drafting_loads_its_layers_and_a_second_context(self):
+        seen = []
+
+        def probe(model, ctx, gpu=None, extra=(), dev=None):
+            seen.append(list(extra))
+            return fake_probe(model, ctx)
+        m = mtp_model()
+        with mock.patch("lodger.plan.probe", side_effect=probe):
+            a = self.make(m, card=None, target_ctx=8192)
+            b = self.make(m, card=None, target_ctx=8192, extra=["--spec-type", "draft-mtp"])
+        draft = int(8192 * 64 * 1024 / 39)          # one more attention layer's cache, as long as the main one
+        self.assertEqual(b["ram_weights"] - a["ram_weights"], 200 * MiB)
+        self.assertEqual(b["ram_anon_est"] - a["ram_anon_est"], draft + 300 * MiB)
+        self.assertTrue(all("--spec-type" not in e for e in seen), seen)    # llama-fit-params doesn't take it
+        self.assertTrue(any("draft-mtp" in w for w in b["why"]), b["why"])
+        with machine("desktop-amd"):
+            c = self.make(m, vram_free=15 * GiB, target_ctx=8192)
+            d = self.make(m, vram_free=15 * GiB, target_ctx=8192, extra=["--spec-type", "ngram-mod,draft-mtp"])
+        self.assertEqual(d["gpu_est"] - c["gpu_est"], 200 * MiB + draft + 300 * MiB)
+        self.assertEqual(d["ngl"], 41)
+
+    def test_mtp_drafting_without_mtp_layers_is_refused(self):
+        p = self.make(fake_model(), card=None, target_ctx=8192, extra=["--spec-type", "draft-mtp"])
+        self.assertIn("no MTP layers", p["refuse"] or "")
+        self.assertIsNone(self.make(fake_model(), card=None, target_ctx=8192, extra=["--spec-type", "ngram-mod"])["refuse"])
+
+    def test_mtp_draft_cache_sits_with_the_mtp_layer(self):
+        m = mtp_model().with_mtp()
+        costs = plan.Costs(m, 4096, 8192)
+        costs.add_draft(m)
+        share = plan.layer_ctx(m, costs, 8192)
+        self.assertAlmostEqual(sum(share.values()), costs.context(8192), delta=2)
+        self.assertAlmostEqual(share[39], 8192 * 64 * 1024 / 39, delta=2)
+        self.assertEqual(costs.fixed(8192), 100 * MiB)                       # the draft cache grows with the context
+
+    def test_expert_cache_is_counted_on_the_card_when_experts_stay_in_ram(self):
+        m = fake_model(dense=60 * MiB, experts=400 * MiB)
+        with machine("desktop-amd"):
+            a = self.make(m, vram_free=12 * GiB, target_ctx=8192)
+            b = self.make(m, vram_free=12 * GiB, target_ctx=8192, extra=["--moe-cache-mib", "1024"])
+            whole = self.make(fake_model(dense=60 * MiB, experts=10 * MiB), vram_free=12 * GiB, target_ctx=8192)
+            whole_c = self.make(fake_model(dense=60 * MiB, experts=10 * MiB), vram_free=12 * GiB, target_ctx=8192,
+                                extra=["--moe-cache-mib", "1024"])
+        self.assertIsNone(b["refuse"])
+        self.assertGreater(b["n_cpu_moe"], a["n_cpu_moe"])                   # room for the cache, fewer experts
+        self.assertLessEqual(b["gpu_bytes"], b["vram_budget"])
+        self.assertTrue(any("Expert cache" in w for w in b["why"]), b["why"])
+        self.assertEqual(whole_c["gpu_est"], whole["gpu_est"])              # every expert on the card: no cache made
+        # with no cache asked for, the plan says how much room one could have
+        self.assertGreaterEqual(a["moe_cache_room_mib"], 0)
+        self.assertLess(a["moe_cache_room_mib"] * MiB, 400 * MiB * 1.2)
+        self.assertNotIn("moe_cache_room_mib", b)
+
+    def test_expert_cache_that_cant_work_is_refused(self):
+        moe = fake_model(dense=60 * MiB, experts=400 * MiB)
+        p = self.make(moe, card=None, target_ctx=8192, extra=["--moe-cache-mib", "1024"])
+        self.assertIn("MoE cache requires a GPU backend", p["refuse"] or "")
+        p = self.make(fake_model(), card=None, target_ctx=8192, extra=["--moe-cache-mib", "1024"])
+        self.assertIn("mixture-of-experts", p["refuse"] or "")
+        # one word uses 8 of 128 experts: llama.cpp needs 9 slots of 400/128 MiB
+        self.assertEqual(plan.min_moe_cache(moe), -(-400 * MiB // 128) * 9)
+        with machine("desktop-amd"):
+            p = self.make(moe, vram_free=12 * GiB, target_ctx=8192, extra=["--moe-cache-mib", "16"])
+        self.assertIn("too small", p["refuse"] or "")
+        self.assertEqual(plan.own_costs(["--moe-cache-mib", "16"])["fit"], [])
+
+    def test_vision_projector_working_memory_from_its_header(self):
+        d = tempfile.mkdtemp(prefix="lodger-proj-")
+        self.addCleanup(subprocess.run, ["rm", "-rf", d])
+        per_patch = (3 * 1152 + 4304) * 4
+        # measured on the processor with Qwen3-VL's projector: 120.06 MiB at 4096 patches, 248.10 MiB at 8464
+        self.assertAlmostEqual(4096 * per_patch / MiB, 120.06, delta=120.06 * 0.02)
+        self.assertAlmostEqual(8464 * per_patch / MiB, 248.10, delta=248.10 * 0.02)
+        p = projector_file(d)
+        self.assertEqual(plan.projector_work(p), int(1.5 * 4096 * 4 * per_patch))     # pictures up to 4096 words
+        self.assertEqual(plan.projector_work(p, tokens=1024), max(256 * MiB, int(1.5 * 1024 * 4 * per_patch)))
+        self.assertEqual(plan.projector_work(p, tokens=1024, flash_attn=False),
+                         int(1.5 * (4096 * per_patch + 16 * 4096 * 4096 * 4)))
+        p = projector_file(d, image_max_pixels=2048 * 2048)
+        self.assertEqual(plan.projector_work(p), int(1.5 * 16384 * per_patch))
+        p = projector_file(d, spatial_merge_size=None, image_size=896, patch_size=14)      # every picture at 896 x 896
+        self.assertEqual(plan.projector_work(p), 256 * MiB)
+        p = projector_file(d, patch_size=None)
+        self.assertEqual(plan.projector_work(p), plan.MMPROJ_SCRATCH)        # the file doesn't say enough
+        o = plan.own_costs(["--mmproj", projector_file(d), "--image-max-tokens", "2048", "--flash-attn", "off"])
+        self.assertEqual(o["fit"], ["--flash-attn", "off"])
+        self.assertEqual(o["proj_work"], int(1.5 * (8192 * per_patch + 16 * 8192 * 8192 * 4)))
+        a = self.make(fake_model(), card=None, target_ctx=8192)
+        b = self.make(fake_model(), card=None, target_ctx=8192, extra=["--mmproj", projector_file(d)])
+        self.assertEqual(b["ram_anon_est"] - a["ram_anon_est"], os.path.getsize(projector_file(d)) + plan.projector_work(projector_file(d)))
 
 
 class ProbeCacheTest(unittest.TestCase):

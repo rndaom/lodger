@@ -2,6 +2,7 @@
 Reads only the file headers, itself (read_gguf: a few milliseconds; the `gguf` package took seconds for a big
 tokenizer). Split models are read from all parts. gguf_reader() is for `lodger doctor`."""
 import bisect
+import copy
 import glob
 import os
 import re
@@ -238,7 +239,7 @@ class Model:
     counted in mtp (same form as layers), and in layers as empty, so the layer numbers stay llama.cpp's.
     kinds[i]: what a layer keeps for the context: "attn" (grows with it), "swa" (a sliding window: fixed once
     the context is longer), "recr" (a fixed state), or None (nothing)."""
-    kv, mtp, kinds, quant, tied = {}, {}, {}, (), False    # what a model made by hand (tests) lacks
+    kv, mtp, mtp_quant, kinds, quant, tied = {}, {}, (), {}, (), False    # what a model made by hand (tests) lacks
 
     def __init__(self, path):
         self.path = os.path.abspath(os.path.expanduser(path))   # not realpath: split parts may be links to two drives
@@ -302,6 +303,7 @@ class Model:
                 if i in self.layers:
                     self.mtp[i] = self.layers[i]
                     self.layers[i] = {"dense": 0, "experts": 0}
+            self.mtp_quant = [q for q in self.quant if q[1] in self.mtp]
             self.quant = [q for q in self.quant if q[1] not in self.mtp]
         self.kinds = {i: None if i in self.mtp else _kind(names.get(i, ()), self._swa(i)) for i in range(self.n_layer)}
 
@@ -317,6 +319,14 @@ class Model:
         if type(pattern) is int and pattern > 0:
             return i % pattern < pattern - 1        # llama.cpp's set_swa_pattern: every n-th layer sees everything
         return None
+
+    def with_mtp(self):
+        """This model as llama.cpp loads it for multi-token prediction drafting (--spec-type draft-mtp): its MTP
+        layers' weights are loaded too (mtp still says which layers they are)."""
+        m = copy.copy(self)
+        m.layers = {**self.layers, **self.mtp}
+        m.quant = list(self.quant) + list(self.mtp_quant)
+        return m
 
     @property
     def is_moe(self):

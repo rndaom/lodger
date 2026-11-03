@@ -28,7 +28,8 @@ SMALLEST_CTX = 256               # shorter than this isn't a usable context (and
 # more than CTX_SHARE of the memory the model may use there (the rest is better spent on the model itself).
 CTX_CAP = 131072
 CTX_SHARE = 0.25
-MMPROJ_SCRATCH = GiB             # a vision projector's working space for pictures, on top of its file size
+MMPROJ_SCRATCH = GiB             # a vision projector's working space for pictures, when its file doesn't say
+PICTURE_TOKENS = 4096            # the most words a picture becomes in llama.cpp's projectors that take any size
 CHECKPOINTS = 32                 # llama-server's --ctx-checkpoints: copies of the state a model can't roll back
 UBATCH = 512                     # llama.cpp's default --ubatch-size
 # --load-mode values that keep the weights in the program's own memory instead of the page cache (older builds:
@@ -172,7 +173,12 @@ class Costs:
             (c1, v1), (c2, v2) = self.points[-2:]
             self.per_tok = max(0.0, (v2 - v1) / (c2 - c1))
 
+    draft_tok = 0.0                 # what a multi-token prediction draft context adds per word (add_draft)
+
     def context(self, ctx):
+        return self._trunk(ctx) + int(self.draft_tok * ctx)
+
+    def _trunk(self, ctx):
         if not self.points:
             return int(self.base + self.per_tok * ctx)
         pts = self.points
@@ -182,7 +188,16 @@ class Costs:
 
     def fixed(self, ctx):
         """The part of context(ctx) that doesn't grow with more words (recurrent state, full sliding windows)."""
-        return max(0, self.context(ctx) - int(self.per_tok * ctx))
+        return max(0, self._trunk(ctx) - int(self.per_tok * ctx))
+
+    def add_draft(self, m):
+        """Multi-token prediction drafting (--spec-type draft-mtp): llama-server makes a second context as long as
+        the main one, with a plain attention cache for the MTP layers only and its own scratch (llama.cpp's
+        common/speculative.cpp). llama-fit-params doesn't size it."""
+        kinds = list(m.kinds.values())
+        attn = kinds.count("attn") or sum(1 for k in kinds if k) or max(1, m.n_layer - len(m.mtp))
+        self.draft_tok = len(m.mtp) * self.per_tok / attn
+        self.compute *= 2
 
 
 def window_bend(m, extra):
@@ -205,7 +220,8 @@ def layer_ctx(m, costs, ctx):
     layers that keep it. Where the file doesn't say which layers those are, each layer that keeps anything gets
     the same (layers that keep nothing, e.g. multi-token prediction, none)."""
     L = m.n_layer
-    total = costs.context(ctx)
+    draft = int(costs.draft_tok * ctx)
+    total = costs.context(ctx) - draft
     kinds = m.kinds or {}
     grows = [i for i in range(L) if kinds.get(i) == "attn"]
     keeps = [i for i in range(L) if kinds.get(i) in ("swa", "recr")]
@@ -215,12 +231,14 @@ def layer_ctx(m, costs, ctx):
     if not grows or not keeps:
         for i in grows or keeps:
             out[i] = total / len(grows or keeps)
-        return out
-    tok = min(total, costs.per_tok * ctx)
-    for i in grows:
-        out[i] = tok / len(grows)
-    for i in keeps:
-        out[i] = (total - tok) / len(keeps)
+    else:
+        tok = min(total, costs.per_tok * ctx)
+        for i in grows:
+            out[i] = tok / len(grows)
+        for i in keeps:
+            out[i] = (total - tok) / len(keeps)
+    for i in m.mtp if draft else ():
+        out[i] += draft / len(m.mtp)
     return out
 
 
@@ -270,13 +288,23 @@ def ladder(target, lo, ctx_train):
 
 def own_costs(extra):
     """llama-server options that change memory but that llama-fit-params can't size (see catalog.py) are
-    counted here. Returns {fit: options for llama-fit-params, proj: vision projector bytes, proj_card: projector on
-    the card, held: weights held in RAM, repack: weights may be repacked, checkpoints: --ctx-checkpoints}."""
-    out = {"fit": [], "proj": 0, "proj_card": True, "held": False, "repack": True, "checkpoints": CHECKPOINTS}
+    counted here. Returns {fit: options for llama-fit-params, proj: vision projector bytes, proj_work: its working
+    memory, proj_card: projector on the card, held: weights held in RAM, repack: weights may be repacked,
+    checkpoints: --ctx-checkpoints, mtp: multi-token prediction drafting, moe_cache: --moe-cache-mib in bytes}."""
+    out = {"fit": [], "proj": 0, "proj_work": 0, "proj_card": True, "held": False, "repack": True,
+           "checkpoints": CHECKPOINTS, "mtp": False, "moe_cache": 0}
+    proj, tokens, fa = None, None, True
     args = iter(extra)
     for a in args:
         if a == "--mmproj":
-            out["proj"] = os.path.getsize(next(args))
+            proj = next(args)
+            out["proj"] = os.path.getsize(proj)
+        elif a == "--image-max-tokens":
+            tokens = int(next(args))
+        elif a == "--spec-type":
+            out["mtp"] = "draft-mtp" in str(next(args)).split(",")
+        elif a == "--moe-cache-mib":
+            out["moe_cache"] = max(0, int(next(args))) * MiB
         elif a in ("--mmproj-offload", "--no-mmproj-offload"):
             out["proj_card"] = a == "--mmproj-offload"
         elif a in ("--no-mmap", "--mlock"):
@@ -292,8 +320,46 @@ def own_costs(extra):
         else:
             if a in ("--repack", "--no-repack"):
                 out["repack"] = a == "--repack"
+            if a == "--flash-attn":
+                v = next(args)
+                fa = str(v).lower() not in ("off", "0", "false", "disabled")
+                out["fit"] += [a, v]
+                continue
             out["fit"].append(a)
+    if proj:
+        out["proj_work"] = projector_work(proj, tokens, fa)
     return out
+
+
+def projector_work(path, tokens=None, flash_attn=True):
+    """A vision projector's working memory for the largest picture it takes: clip.cpp sizes it for a test picture
+    and grows it for a bigger one. About 4 bytes x (3 x its width + its ffn width) per patch with flash attention
+    (on the processor 120 MiB at 4096 patches and 248 MiB at 8464 for Qwen3-VL's, within 2 % of this), plus a
+    patches x patches table per head without. Half again on top (measured on the processor, not yet on a card),
+    at least 256 MiB; MMPROJ_SCRATCH when the file doesn't say enough. tokens: --image-max-tokens."""
+    try:
+        kv, _ = models.read_gguf(path)
+    except (OSError, ValueError):
+        return MMPROJ_SCRATCH
+
+    def num(k):
+        v = kv.get("clip.vision." + k)
+        return v if type(v) is int and v > 0 else None
+    width, ffn, heads, size, patch = (num(k) for k in ("embedding_length", "feed_forward_length",
+                                                      "attention.head_count", "image_size", "patch_size"))
+    if not kv.get("clip.has_vision_encoder") or not all((width, ffn, heads, size, patch)) or kv.get("clip.has_audio_encoder"):
+        return MMPROJ_SCRATCH
+    merge = num("spatial_merge_size") or 1
+    if tokens and tokens > 0:
+        patches = tokens * merge * merge
+    elif num("image_max_pixels"):
+        patches = num("image_max_pixels") // (patch * patch)
+    elif merge > 1:
+        patches = PICTURE_TOKENS * merge * merge       # pictures of any size, up to llama.cpp's usual limit
+    else:
+        patches = (size // patch) ** 2                 # every picture is scaled to image_size
+    work = patches * (3 * width + ffn) * 4 + (0 if flash_attn else heads * patches * patches * 4)
+    return max(256 * MiB, int(1.5 * work))
 
 
 def with_margin(x):
@@ -313,12 +379,28 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
     m = model_path if isinstance(model_path, Model) else models.load(model_path)
     L = m.n_layer
     why = []
+
+    def refused(reason):
+        return {"model": m.path, "name": m.meta.get("name"), "why": why, "refuse": reason}
     if not L:
-        return {"model": m.path, "name": m.meta.get("name"), "why": why, "refuse":
-                f"lodger can't place this model: it has no layers it knows ({m.meta.get('arch') or 'unknown'} design)"}
+        return refused(f"lodger can't place this model: it has no layers it knows ({m.meta.get('arch') or 'unknown'} design)")
     leave_gpu = max(0, leave_gpu)
     own_extra = own_costs(extra)
     extra, proj, proj_card, held = (own_extra[k] for k in ("fit", "proj", "proj_card", "held"))
+    moe_cache = own_extra["moe_cache"]
+    if own_extra["mtp"]:
+        if not m.mtp:
+            return refused("its settings ask for multi-token prediction drafting (spec-type draft-mtp), but this model "
+                           "file has no MTP layers")
+        mtp_bytes = sum(l["dense"] + l["experts"] for l in m.mtp.values())
+        m = m.with_mtp()
+    if moe_cache:
+        if not m.is_moe:
+            return refused("its settings ask for an expert cache (moe-cache-mib), but this isn't a mixture-of-experts model")
+        least = min_moe_cache(m)
+        if moe_cache < least:
+            return refused(f"its expert cache (moe-cache-mib {moe_cache // MiB}) is too small for one word's experts: "
+                           f"llama.cpp needs at least {-(-least // MiB)}")
     card = sysmem.dgpu() if card is AUTO else card
     mem = sysmem.meminfo() if mem is None else mem
     cfg = config.get()
@@ -353,6 +435,8 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
     ctxs = ladder(CTX_CAP if auto else target_ctx, min(min_ctx, CTX_CAP if auto else target_ctx), m.meta.get("ctx_train"))
     bend = window_bend(m, extra)
     costs = Costs(m, ctxs[-1], ctxs[0], extra, [bend] if bend else ())
+    if own_extra["mtp"]:
+        costs.add_draft(m)
 
     def fair(budget):
         """Automatic context: the lengths that cost at most CTX_SHARE of `budget` (at least the shortest)."""
@@ -381,11 +465,15 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
                + f", {ram_keep / GiB:.1f} GiB RAM for everything else. "
                f"Our estimates get +{EST_MARGIN:.0%} + {EST_MARGIN_FIXED // MiB} MiB extra on top.")
 
+    if own_extra["mtp"]:
+        why.append(f"Multi-token prediction drafting (spec-type draft-mtp): its {len(m.mtp)} MTP layer(s) are loaded "
+                   f"too ({mtp_bytes / GiB:.1f} GiB), with a second context as long as the main one and its own "
+                   "scratch, counted.")
     # a vision projector (mmproj) is loaded whole, on the card with the model unless told otherwise, and needs
     # room for the pictures; llama-fit-params doesn't count it
-    proj_need = proj + MMPROJ_SCRATCH if proj else 0
+    proj_need = proj + own_extra["proj_work"] if proj else 0
     if proj:
-        why.append(f"Vision projector: {proj / GiB:.1f} GiB + {MMPROJ_SCRATCH / GiB:.1f} GiB for pictures, counted "
+        why.append(f"Vision projector: {proj / GiB:.1f} GiB + {own_extra['proj_work'] / GiB:.1f} GiB for pictures, counted "
                    + ("on the graphics card when the model is there, else in RAM." if proj_card else "in RAM (no-mmproj-offload)."))
     gpu = None
     if cpu_only or no_card or why_gpu_off:
@@ -394,27 +482,30 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
         overhead, src = learned_overhead(card.pci, backend)
         more = overhead + (proj_need if proj_card else 0)      # on the card besides llama.cpp's own estimate
         budget, w = vram_budget, []
-        gpu = place_on_gpu(m, costs, fair(budget), budget, w, more)
+        gpu = place_on_gpu(m, costs, fair(budget), budget, w, more, moe_cache)
         for _ in range(3):
             if not (gpu and device_check):
                 break
             d = probe(m, gpu["ctx"], (gpu["ngl"], gpu["n_cpu_moe"]), extra, dev=card)
             llama = d["model"] + d["context"] + d["compute"]
             plan["llama_gpu_est"] = llama
-            if llama + more <= gpu["gpu_est"]:
+            beside = more + (moe_cache if gpu["n_cpu_moe"] else 0)
+            if llama + beside <= gpu["gpu_est"]:
                 break                                   # our own estimate is the higher one: keep it
-            short = with_margin(llama + more) - gpu["gpu_bytes"]
-            if with_margin(llama + more) <= vram_budget:   # the real limit, not the shrunk working budget
-                gpu.update(gpu_est=llama + more, gpu_bytes=with_margin(llama + more))
+            short = with_margin(llama + beside) - gpu["gpu_bytes"]
+            if with_margin(llama + beside) <= vram_budget:   # the real limit, not the shrunk working budget
+                gpu.update(gpu_est=llama + beside, gpu_bytes=with_margin(llama + beside))
                 break
             budget -= short                             # llama.cpp says more than we thought: plan smaller
             w = [f"llama.cpp's own estimate for the card was {short // MiB} MiB higher than ours; planned smaller."]
-            gpu = place_on_gpu(m, costs, fair(vram_budget), budget, w, more)
+            gpu = place_on_gpu(m, costs, fair(vram_budget), budget, w, more, moe_cache)
         else:
             if gpu and device_check:
                 w.append("Couldn't get our plan and llama.cpp's estimate to agree; not using the graphics card.")
                 gpu = None
         why.extend(w)
+        if gpu and moe_cache and gpu["n_cpu_moe"]:
+            why.append(f"Expert cache (moe-cache-mib): {moe_cache // MiB} MiB on the card for experts kept in RAM, counted.")
         if gpu:
             why.append(f"Card estimate: " + (f"llama.cpp says {plan['llama_gpu_est'] / GiB:.1f} GiB" if "llama_gpu_est" in plan
                        else "our own (llama.cpp asked only for real runs)")
@@ -423,6 +514,10 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
 
     if gpu is None:
         plan.update(ngl=0, ngl_layers=0, n_cpu_moe=0, ctx=None, output_on_gpu=False, gpu_bytes=0, gpu_est=0)
+        if moe_cache:
+            plan["refuse"] = ("Its settings ask for an expert cache on the graphics card (moe-cache-mib), but the card "
+                              "isn't used for this model; llama.cpp would stop ('MoE cache requires a GPU backend').")
+            return plan
     else:
         plan.update(gpu)
         if shared:
@@ -487,6 +582,10 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
     plan["ram_weights"] = cpu_weights
     plan["ram_copied"] = copied
     plan["checkpoint_bytes"] = n_ckpt * costs.fixed(plan["ctx"])
+    if gpu and plan["n_cpu_moe"] and not moe_cache:
+        # what llama.cpp's expert cache (--moe-cache-mib) could use on the card here; not passed on (yet)
+        room = int((vram_budget - gpu["gpu_bytes"]) / (1 + EST_MARGIN)) // MiB
+        plan["moe_cache_room_mib"] = room if room * MiB >= min_moe_cache(m) else 0
 
     if with_margin(anon) > ram_budget:
         plan["refuse"] = (f"Not enough RAM: the model needs {with_margin(anon) / GiB:.1f} GiB of its own memory "
@@ -510,9 +609,10 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
     return plan
 
 
-def place_on_gpu(m, costs, ctxs, budget, why, overhead):
+def place_on_gpu(m, costs, ctxs, budget, why, overhead, moe_cache=0):
     """Best placement on the card, or None. Order of preference (NOTES.md step 4). overhead: what the card holds
-    beyond the model's pieces, context and scratch (its runtime, a vision projector)."""
+    beyond the model's pieces, context and scratch (its runtime, a vision projector). moe_cache: llama.cpp's
+    expert cache, made on the card only when some experts stay in RAM."""
     L = m.n_layer
     # 1. everything, longest context first
     for c in ctxs:
@@ -525,7 +625,7 @@ def place_on_gpu(m, costs, ctxs, budget, why, overhead):
     #    llama.cpp's --n-cpu-moe N keeps the experts of the FIRST N layers in RAM)
     if m.is_moe:
         for c in ctxs:
-            fixed = m.dense() + m.output + m.other + costs.context(c) + costs.compute + overhead
+            fixed = m.dense() + m.output + m.other + costs.context(c) + costs.compute + overhead + moe_cache
             if with_margin(fixed) > budget:
                 continue
             k, need = 0, fixed
@@ -543,7 +643,8 @@ def place_on_gpu(m, costs, ctxs, budget, why, overhead):
     #    card first, then the last N - 1 layers
     for c in ctxs:
         share = layer_ctx(m, costs, c)
-        need = costs.compute + overhead + m.other + m.output    # pieces outside the layers: counted on the card to be safe
+        need = costs.compute + overhead + m.other + m.output + (moe_cache if m.is_moe else 0)
+        # (pieces outside the layers: counted on the card to be safe)
         if with_margin(need) > budget:
             continue
         n = 0
@@ -564,6 +665,16 @@ def place_on_gpu(m, costs, ctxs, budget, why, overhead):
             return gpu_plan(L, n, L if m.is_moe else 0, c, int(need), True)
     why.append(f"Nothing useful fits on the graphics card ({budget / GiB:.1f} GiB usable after margins).")
     return None
+
+
+def min_moe_cache(m):
+    """The smallest --moe-cache-mib llama.cpp takes: room for the experts one word uses in one layer, plus one
+    (llama.cpp's llama-moe-cache.cpp)."""
+    n, used = m.meta.get("expert_count"), m.meta.get("expert_used")
+    one = max((l["experts"] for l in m.layers.values()), default=0)
+    if type(n) is not int or n <= 0 or type(used) is not int or used <= 0:
+        return 0
+    return -(-one // n) * (used + 1)
 
 
 def gpu_plan(L, n_layers, n_cpu_moe, ctx, need, output_on_gpu):

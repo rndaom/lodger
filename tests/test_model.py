@@ -157,6 +157,16 @@ class ModelTest(Base):
         self.assertIsNone(m.kinds[2])
         self.assertEqual(m.repacked({2: 8}, {0, 1, 2}, set(), False)[0], 2 * 3 * q4_0(256, 256)[2])
 
+    def test_mtp_drafting_loads_the_mtp_layers(self):
+        t = layer(0) + layer(1) + layer(2) + [("blk.2.nextn.eh_proj.weight", *q4_0(256, 512))]
+        m = model.Model(self.file({"toy.block_count": 3, "toy.nextn_predict_layers": 1}, t))
+        d = m.with_mtp()
+        self.assertEqual(d.layers[2], m.mtp[2])
+        self.assertEqual(d.total, m.total + m.mtp[2]["dense"])
+        self.assertEqual(m.layers[2], {"dense": 0, "experts": 0})          # the model itself is unchanged
+        self.assertEqual(d.repacked({2: 8}, {0, 1, 2}, set(), False)[0], 3 * 3 * q4_0(256, 256)[2] + q4_0(256, 512)[2])
+        self.assertEqual((d.mtp, d.kinds[2]), (m.mtp, None))
+
     def test_layer_count_is_llamas_even_without_the_last_layers_tensors(self):
         # a trunk-only file of a model with an MTP layer: llama.cpp still counts block_count layers
         m = model.Model(self.file({"toy.block_count": 3, "toy.nextn_predict_layers": 1}, layer(0) + layer(1)))
