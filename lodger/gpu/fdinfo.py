@@ -153,6 +153,17 @@ def drm_fds(pid, pci=None):
     return out
 
 
+def holds(pid, path):
+    """Does the process have `path` open (say /dev/kfd, which every ROCm program opens)?"""
+    for fd in host.listdir(f"/proc/{pid}/fd"):
+        try:
+            if os.readlink(host.path(f"/proc/{pid}/fd/{fd}")) == path:
+                return True
+        except OSError:
+            pass
+    return False
+
+
 def clients(pid, pci=None):
     """DRM clients a process holds: {(pci, client_id): record} (only on `pci` when given). An app often opens
     the same client through several file descriptors; it is counted once."""

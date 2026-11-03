@@ -9,6 +9,11 @@ Adding a kind of card: write lodger/gpu/<vendor>.py with
                       still counts for `gpu = "auto"`, ranked by the size seen while it was awake
   usage(dev, pids)    {pid: {vram, gtt, busy_ns, cycles}} (for drivers with DRM fdinfo: fdinfo.usage, plus
                       a row in fdinfo.DRIVERS)
+  busy(dev)           (optional) how busy the whole card's 3D/compute engine is, 0..1, or None; never wakes
+                      the card (only called while it's awake). With fdinfo, lodger sees only its own user's
+                      apps: this and the card's memory use are how it notices other users' (neighbors.py)
+  has_busy(dev)       (optional) whether busy() can be read on this card, without reading it
+  sees_every_app      (optional) True if usage() covers every user's apps (NVML), so no such fallback is needed
 add its kernel driver to BACKENDS, and tell lodger/engine.py how llama.cpp finds the card."""
 import re
 
@@ -68,6 +73,30 @@ class Device:
     def usage(self, pids):
         return self.backend.usage(self, pids)
 
+    @property
+    def sees_every_app(self):
+        """usage() covers every user's apps (NVML). fdinfo, which the kernel shows only for the user's own
+        processes, doesn't."""
+        return getattr(self.backend, "sees_every_app", False)
+
+    def has_busy(self):
+        fn = getattr(self.backend, "has_busy", None)
+        return bool(fn and fn(self))
+
+    def busy(self):
+        """How busy the whole card is right now (3D/compute, 0..1), or None (the driver doesn't say, or it sleeps)."""
+        fn = getattr(self.backend, "busy", None)
+        return fn(self) if fn and not self.asleep() else None
+
+    def whole(self):
+        """The whole card's numbers, for apps lodger can't look into: {busy (0..1), used (bytes on the card)},
+        None where unknown (used: also on built-in graphics, whose own memory is a sliver of RAM); or None
+        where usage() lists every app anyway."""
+        if self.sees_every_app:
+            return None
+        m = None if self.integrated else self.memory()
+        return {"busy": self.busy(), "used": m["used"] if m else None}
+
     def free(self, mem=None, meminfo=None):
         """Graphics memory free right now in bytes, or None if unknown. Built-in graphics share RAM: what
         it can still get is the smaller of RAM available and its GTT limit (the most RAM the driver lets the
@@ -88,6 +117,35 @@ class Device:
         if self.integrated:
             return m.get("gtt_total") or (meminfo or host.meminfo()).get("MemTotal", 0)
         return m["total"]
+
+    def crash_report(self):
+        """True while the kernel keeps a crash report (devcoredump) from this card's driver: the card reset or
+        hung in the last few minutes (the kernel deletes them after 5). Reads only sysfs links."""
+        base = "/sys/class/devcoredump"
+        return any(host.realname(f"{base}/{n}/failing_device") == self.pci
+                   for n in host.listdir(base) if n.startswith("devcd"))
+
+    def heat(self):
+        """[(sensor, degrees C now, critical)] from the card's hwmon, for sensors with a critical line; [] without
+        them, and while the card sleeps (reading may wake it)."""
+        if self.asleep():
+            return []
+        out = []
+        for h in sorted(host.listdir(f"{self.sys}/hwmon")):
+            d = f"{self.sys}/hwmon/{h}"
+            for n in sorted(host.listdir(d)):
+                m = re.fullmatch(r"(temp\d+)_input", n)
+                if not m:
+                    continue
+                now, crit = host.read_int(f"{d}/{n}", None), host.read_int(f"{d}/{m.group(1)}_crit", None)
+                if now is not None and crit:
+                    out.append(((host.read(f"{d}/{m.group(1)}_label") or m.group(1)).strip(), now / 1000, crit / 1000))
+        return out
+
+    def too_hot(self):
+        """Plain words for the sensors at or over their critical temperature, or None."""
+        hot = [f"{name} {t:.0f} °C (critical {c:.0f} °C)" for name, t, c in self.heat() if t >= c]
+        return ", ".join(hot) or None
 
     def outputs(self):
         """Connected screens, e.g. ['DP-1', 'HDMI-A-1']."""

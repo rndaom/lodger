@@ -27,6 +27,7 @@ def integrated(dev):
 
 
 reads_when_awake = True     # memory() is None while the card sleeps, not for good (see gpu/__init__.py)
+sees_every_app = True       # NVML lists every user's processes, unlike fdinfo (unchecked on real hardware)
 
 
 class _Memory(ctypes.Structure):
@@ -194,7 +195,12 @@ def usage(dev, pids):
     want = set(pids)
     try:
         procs = nvml().processes(dev.pci)
-        st = _busy.setdefault(dev.pci, {"since_us": int(time.time() * 1e6) - 1_000_000, "ns": {}, "seen": {}})
+        now_us = int(time.time() * 1e6)
+        st = _busy.setdefault(dev.pci, {"since_us": now_us - 1_000_000, "ns": {}, "seen": {}})
+        if st["since_us"] > now_us + 1_000_000:
+            # NVML stamps its samples with the wall clock: after the clock was set back, asking for samples newer
+            # than the last one seen would return none until the clock caught up (blind for that long)
+            st["since_us"], st["seen"] = now_us - 1_000_000, {}
         for pid, ts, sm in sorted(nvml().utilization(dev.pci, st["since_us"]), key=lambda s: s[1]):
             prev = st["seen"].get(pid, ts - 1_000_000 // 6)           # NVML samples about 6 times a second
             st["ns"][pid] = st["ns"].get(pid, 0) + int(sm / 100 * max(0, ts - prev) * 1000)

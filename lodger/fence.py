@@ -45,6 +45,7 @@ KINDS = ("systemd", "cgroup", "none")
 WRAP = ('cg="$1"; shift; if [ -n "$cg" ]; then echo $$ > "$cg/cgroup.procs" || exit 70; fi; '
         'echo 1000 > /proc/self/oom_score_adj 2>/dev/null; ulimit -c 0; exec nice -n 10 "$@"')
 
+SYSTEMCTL_WAIT = 5          # seconds: a systemd that hasn't answered by then counts as failed (it may hang)
 _mode = None
 _live = set()
 _count = 0
@@ -59,6 +60,15 @@ def _systemd_user():
         return subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True, timeout=10).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
+
+
+def _systemctl(*args):
+    """systemctl --user ARGS (output captured), or None if it can't start or doesn't answer in time. Called
+    from the watchdog: it must never wait forever."""
+    try:
+        return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, timeout=SYSTEMCTL_WAIT)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
 
 
 def own_cgroup():
@@ -264,9 +274,8 @@ class Fenced:
     def cgroup(self):
         """The cgroup folder, or None ('none' kind, or a systemd unit that is gone)."""
         if self.kind == "systemd" and not self.cg:
-            r = subprocess.run(["systemctl", "--user", "show", "-p", "ControlGroup", "--value", self.name + ".service"],
-                               capture_output=True, text=True)
-            cg = r.stdout.strip()
+            r = _systemctl("show", "-p", "ControlGroup", "--value", self.name + ".service")
+            cg = r.stdout.strip() if r and r.returncode == 0 else ""
             self.cg = CGROOT + cg if cg else None
         return self.cg
 
@@ -336,18 +345,26 @@ class Fenced:
     def gone(self):
         return self.proc.poll() is not None and not self.pids()
 
+    def _cgroup_kill(self):
+        """SIGKILL everything in the fence's cgroup with one write to cgroup.kill (kernel 5.14+). True if done."""
+        cg = self.cgroup() if self.kind != "none" else None
+        if not cg or not os.path.exists(cg + "/cgroup.kill"):
+            return False
+        try:
+            with open(cg + "/cgroup.kill", "w") as f:
+                f.write("1")
+            return True
+        except OSError:
+            return False
+
     def kill(self, sig=signal.SIGKILL):
-        if self.kind == "systemd":
-            subprocess.run(["systemctl", "--user", "kill", "-s", signal.Signals(sig).name[3:], self.name + ".service"],
-                           capture_output=True)
+        # SIGKILL goes straight through the cgroup where it can: no systemd round trip, which can take seconds
+        # (or hang) exactly when memory runs low and the watchdog needs the model gone
+        if sig == signal.SIGKILL and self._cgroup_kill():
             return
-        if self.kind == "cgroup" and sig == signal.SIGKILL and self.cg and os.path.exists(self.cg + "/cgroup.kill"):
-            try:
-                with open(self.cg + "/cgroup.kill", "w") as f:
-                    f.write("1")
-                return
-            except OSError:
-                pass
+        if self.kind == "systemd":
+            _systemctl("kill", "-s", signal.Signals(sig).name[3:], self.name + ".service")
+            return
         for pid in self.pids() or ([self.proc.pid] if self.proc.poll() is None else []):
             try:
                 os.kill(pid, sig)
@@ -366,10 +383,10 @@ class Fenced:
             self.kill(signal.SIGKILL)
             self.proc.wait(timeout=10)
         if self.kind == "systemd":
-            subprocess.run(["systemctl", "--user", "stop", self.name + ".service"], capture_output=True)  # in case it outlived its client
+            _systemctl("stop", self.name + ".service")         # in case it outlived its client
         else:
-            t0 = time.time()
-            while self.pids() and time.time() - t0 < 10:
+            t0 = time.monotonic()
+            while self.pids() and time.monotonic() - t0 < 10:
                 self.kill(signal.SIGKILL)
                 time.sleep(0.1)
         self.close()
@@ -381,8 +398,8 @@ class Fenced:
         with _lock:
             _live.discard(self)
         if self.kind == "cgroup" and self.cg:
-            t0 = time.time()
-            while time.time() - t0 < 5:
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < 5:
                 try:
                     os.rmdir(self.cg)
                     break
@@ -443,6 +460,19 @@ def owner_alive(pid):
     return any(os.path.basename(a) == "lodger" or a == "lodger.cli" for a in args)
 
 
+def named():
+    """Programs started in a cgroup/'none' fence by any lodger, found by the LODGER_FENCE_NAME they carry (they have
+    no lodger-* systemd unit or cgroup to tell them by): {fence name: [pids]}. Only this user's are readable."""
+    procs = {}
+    for p in host.listdir("/proc"):
+        if p.isdigit():
+            env = host.read(f"/proc/{p}/environ") or ""
+            i = env.find("LODGER_FENCE_NAME=")
+            if i >= 0 and (i == 0 or env[i - 1] == "\0"):
+                procs.setdefault(env[i + len("LODGER_FENCE_NAME="):].split("\0", 1)[0], []).append(int(p))
+    return {name: pids for name, pids in procs.items() if NAME.match(name)}
+
+
 def find_orphans():
     """Fences whose lodger is gone, with the model maybe still in them: [{kind, name, owner, where}]. Reads
     only (systemctl list-units, the delegated cgroup folder, /proc)."""
@@ -469,14 +499,7 @@ def find_orphans():
         if m and os.path.isdir(os.path.join(parent, n)) and not owner_alive(int(m.group(1))):
             out.append({"kind": "cgroup", "name": n, "owner": int(m.group(1)), "where": os.path.join(parent, n)})
             seen.add(n)
-    procs = {}
-    for p in host.listdir("/proc"):
-        if p.isdigit():
-            env = host.read(f"/proc/{p}/environ") or ""
-            i = env.find("LODGER_FENCE_NAME=")
-            if i >= 0 and (i == 0 or env[i - 1] == "\0"):
-                procs.setdefault(env[i + len("LODGER_FENCE_NAME="):].split("\0", 1)[0], []).append(int(p))
-    for name, pids in sorted(procs.items()):
+    for name, pids in sorted(named().items()):
         m = NAME.match(name)
         if m and name not in seen and not owner_alive(int(m.group(1))):
             out.append({"kind": "process", "name": name, "owner": int(m.group(1)), "where": sorted(pids)})
@@ -511,8 +534,8 @@ def reap_orphans(log=None):
 
 def _kill_cgroup(d):
     """Kill everything in a lodger-* cgroup and remove it."""
-    t0 = time.time()
-    while time.time() - t0 < 5:
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 5:
         pids = [int(x) for x in (_text(d + "/cgroup.procs") or "").split()]
         if not pids:
             break

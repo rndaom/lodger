@@ -112,7 +112,8 @@ class LaptopNvidiaTest(unittest.TestCase):
             with mock.patch("time.time", return_value=t / 1e6):
                 card.usage([500])
             fake.samples.append((500, t + 1_000_000, 60))     # one second later, 60% busy
-            b = card.usage([500])[500]["busy_ns"]
+            with mock.patch("time.time", return_value=t / 1e6 + 1):
+                b = card.usage([500])[500]["busy_ns"]
             self.assertAlmostEqual(b - 100_000_000, 600_000_000, delta=1_000_000)
 
     def test_cuda_number(self):
@@ -156,7 +157,7 @@ class NeighborsTest(unittest.TestCase):
             fd = "/proc/700/fdinfo/5"
             text = read(root, fd)
             clock = [1000.0]
-            with mock.patch("lodger.neighbors.time.time", side_effect=lambda: clock[0]), \
+            with mock.patch("lodger.neighbors.time.monotonic", side_effect=lambda: clock[0]), \
                     mock.patch("lodger.sysmem.app_name", return_value="game"):
                 total, rcs = 7655183225, 28257900
                 reason = None
@@ -293,6 +294,36 @@ class NvmlLifeTest(unittest.TestCase):
             self.assertIsNone(nvidia.driver_version())
             self.assertIsNone(nvidia.cuda_ok(13))
         self.assertTrue(nvidia.cuda_ok(13, (580, 65, 6)))
+
+
+class CardTroubleSignsTest(unittest.TestCase):
+    def test_crash_report_names_the_card(self):
+        with machine("desktop-amd", writable=True) as root:
+            d = gpu.choose()
+            self.assertFalse(d.crash_report())
+            os.makedirs(os.path.join(root, "sys/class/devcoredump/devcd3"))
+            os.symlink(os.path.join(root, "sys/bus/pci/devices/0000:11:00.0"),
+                       os.path.join(root, "sys/class/devcoredump/devcd3/failing_device"))
+            self.assertFalse(d.crash_report())                  # the built-in graphics' report
+            os.makedirs(os.path.join(root, "sys/class/devcoredump/devcd4"))
+            os.symlink(os.path.join(root, "sys/bus/pci/devices/0000:03:00.0"),
+                       os.path.join(root, "sys/class/devcoredump/devcd4/failing_device"))
+            self.assertTrue(d.crash_report())
+
+    def test_heat_from_hwmon(self):
+        with machine("desktop-amd", writable=True) as root:
+            h = "/sys/bus/pci/devices/0000:03:00.0/hwmon/hwmon2"
+            for name, now, crit in (("temp1", 43000, 100000), ("temp2", 111000, 110000), ("temp3", 66000, 0)):
+                write(root, f"{h}/{name}_input", f"{now}\n")
+                write(root, f"{h}/{name}_crit", f"{crit}\n")
+            write(root, f"{h}/temp2_label", "junction\n")
+            d = gpu.choose()
+            self.assertEqual(d.heat()[:2], [("temp1", 43.0, 100.0), ("junction", 111.0, 110.0)])
+            self.assertIn("junction 111", d.too_hot())
+            write(root, f"{h}/temp2_input", "90000\n")
+            self.assertIsNone(d.too_hot())
+            write(root, "/sys/bus/pci/devices/0000:03:00.0/power/runtime_status", "suspended\n")
+            self.assertEqual(d.heat(), [])                      # never woken to look
 
 
 if __name__ == "__main__":

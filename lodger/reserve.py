@@ -6,9 +6,12 @@ It is the larger of
 - what the desktop showed it needs: while `lodger serve` runs and no app is busy on the card, it notes how
   much memory everything but lodger's model uses, minute by minute (kept 7 days, per card). The reserve is
   how far that use rises within 10 minutes, at worst 1 time in 20, plus 256 MiB. It counts once there is at
-  least an hour of notes.
-Apps that really need the card (a game loading) aren't covered by this: lodger steps aside for those."""
+  least an hour of notes, and at most a quarter of the card (MAX_SHARE).
+Apps that really need the card (a game loading) aren't covered by this: lodger steps aside for those. But an
+app that holds a lot while idle (a game in its menu, a test's memory grabber) looks like the desktop in the
+notes: the quarter-of-the-card limit keeps such notes from taking the card away for a week."""
 import json
+import math
 import os
 import time
 
@@ -20,6 +23,7 @@ KEEP = 7 * 24 * 60     # minutes of notes kept
 MIN_NOTES = 60         # minutes of notes before the measured part counts
 HEADROOM = 256 * MiB
 SHARE = 0.95           # rises at or below this share of all windows are covered
+MAX_SHARE = 0.25       # the measured part never asks for more than this share of the card
 
 _notes = {}            # pci -> {minute: [lowest, highest]}
 
@@ -42,8 +46,9 @@ def _path(pci):
 
 
 def _valid(v):
+    # json reads Infinity and NaN too: an endless reserve would keep the model off the card for good
     return (isinstance(v, list) and len(v) == 2 and all(isinstance(x, (int, float)) and not isinstance(x, bool)
-                                                        and x >= 0 for x in v))
+                                                        and math.isfinite(x) and x >= 0 for x in v))
 
 
 def _load(pci):
@@ -99,8 +104,34 @@ def reserve(pci, total):
     r = rise(_load(pci)) if pci else None
     if r is None or r + HEADROOM <= f:
         return f, None
-    return r + HEADROOM, (f"your desktop's graphics memory use rose by up to {r / GiB:.1f} GiB within "
-                          f"{WINDOW} minutes lately, so lodger keeps more than its usual {f / GiB:.1f} GiB")
+    keep = int(r + HEADROOM)
+    if total and keep > total * MAX_SHARE:
+        keep = max(f, int(total * MAX_SHARE))
+        if keep <= f:
+            return f, None
+        return keep, (f"your desktop's graphics memory use rose by up to {r / GiB:.1f} GiB within {WINDOW} minutes "
+                      f"lately (likely an app holding memory while idle), so lodger keeps {keep / GiB:.1f} GiB, "
+                      f"a quarter of the card, instead of its usual {f / GiB:.1f} GiB")
+    return keep, (f"your desktop's graphics memory use rose by up to {r / GiB:.1f} GiB within "
+                  f"{WINDOW} minutes lately, so lodger keeps more than its usual {f / GiB:.1f} GiB")
+
+
+def report(pci, total):
+    """For lodger doctor: {floor, measured (bytes the notes ask for, or None), keep, notes (minutes noted), capped,
+    warning (plain words when the notes ask for far more than the floor, else None)}."""
+    f = floor(total)
+    notes = _load(pci) if pci else {}
+    r = rise(notes)
+    keep, _ = reserve(pci, total)
+    measured = None if r is None else int(r + HEADROOM)
+    warning = None
+    if measured is not None and measured > 2 * f:
+        warning = (f"lodger learned that your desktop needs {measured / GiB:.1f} GiB of graphics memory, far above the "
+                   f"usual {f / GiB:.1f} GiB: an app holding memory while idle (a game in its menu), or lodger's own "
+                   f"model, may have been noted as desktop use. The notes are in {_path(pci)}; removing that file "
+                   "starts them over")
+    return {"floor": f, "measured": measured, "keep": keep, "notes": len(notes),
+            "capped": measured is not None and keep < measured, "warning": warning}
 
 
 def kill_line(keep):
