@@ -165,7 +165,7 @@ class FakeLodger:
     def find(self, name):
         return self.entry
 
-    def wait_engine(self, entry, limit=None):
+    def wait_engine(self, entry, limit=None, ping=None):
         return self.engine
 
     def cooling(self, entry):

@@ -280,6 +280,9 @@ class Lodger:
         self.cur = models[default]            # the model loaded (or to load next)
         self.default = default
         self.switch_to = None                 # a request is waiting for this model
+        self.switch_ticket = 0                # ... and its place in line: requests that came before it go first
+        self.ticket = 0                       # requests take numbers as they come in
+        self.waiting = {}                     # requests waiting for an engine: token -> (model, ticket)
         self.busy = {}                        # engine -> answers being written on it now
         self.cv = threading.Condition()
         self.engine = None
@@ -511,32 +514,64 @@ class Lodger:
         self.note(self.why)
         return False
 
-    def wait_engine(self, entry, limit=MOVE_WAIT):
+    def wait_engine(self, entry, limit=MOVE_WAIT, ping=None):
         """The engine for `entry`, once it's loaded and ready (asks for a switch or a wake-up if needed), counted
-        as busy until release(); None if that doesn't happen within `limit` seconds or the model can't run."""
+        as busy until release(); None if that doesn't happen within `limit` seconds or the model can't run.
+        Requests are served in the order they came: when another model is asked for, the requests for this one
+        that came first still get it before the switch, and the request that asked for the switch gets the new
+        model before the next one (two apps using two models would otherwise keep switching, serving neither).
+        ping(): called every PING seconds while waiting, without the lock (it may raise OSError: the app left)."""
         end = time.time() + limit
+        token, next_ping = object(), time.monotonic() + PING
         with self.cv:
-            while True:
-                self.last_used = time.time()
-                if entry.skip or self.closing:
-                    return None
-                e = self.engine
-                if (self.cur is entry and self.ready and e and e.alive() and not e.stopping and not e.wd.reason
-                        and self.switch_to in (None, entry)):    # not one the watchdog is stopping
-                    self.busy[e] = self.busy.get(e, 0) + 1     # under the lock: no switch or sleep can slip in
-                    return e
-                if self.cooling(entry):
-                    return None
-                if self.cur is entry and not e and not self.asleep and self.failures >= 2:
-                    return None                       # it keeps failing to start: say so now, not in 10 minutes
-                if self.cur is not entry and self.switch_to is None:
-                    self.switch_to = entry            # first in line: the monitor switches once nothing is written
-                if self.asleep:
-                    self.wake = True
-                left = end - time.time()
-                if left <= 0:
-                    return None
-                self.cv.wait(min(1.0, left))
+            self.ticket += 1
+            ticket = self.ticket
+            self.waiting[token] = (entry, ticket)
+            try:
+                while True:
+                    self.last_used = time.time()
+                    if entry.skip or self.closing:
+                        return None
+                    e = self.engine
+                    if (self.cur is entry and self.ready and e and e.alive() and not e.stopping and not e.wd.reason
+                            and (self.switch_to in (None, entry) or ticket < self.switch_ticket)):
+                        self.busy[e] = self.busy.get(e, 0) + 1     # under the lock: no switch or sleep can slip in
+                        return e
+                    if self.cooling(entry):
+                        return None
+                    if self.cur is entry and not e and not self.asleep and self.failures >= 2:
+                        return None                       # it keeps failing to start: say so now, not in 10 minutes
+                    if self.cur is not entry and self.switch_to is None:
+                        # first in line: the monitor switches once nothing is written and the requests that came
+                        # before this one have their answers
+                        self.switch_to, self.switch_ticket = entry, ticket
+                    if self.asleep:
+                        self.wake = True
+                    left = end - time.time()
+                    if left <= 0:
+                        return None
+                    if ping and time.monotonic() >= next_ping:
+                        next_ping = time.monotonic() + PING
+                        self.cv.release()
+                        try:
+                            ping()
+                        finally:
+                            self.cv.acquire()
+                        continue
+                    self.cv.wait(max(0.01, min(1.0, left, next_ping - time.monotonic() if ping else 1.0)))
+            finally:
+                del self.waiting[token]
+                self.cv.notify_all()
+
+    def may_switch(self):
+        """(Under the lock.) May the monitor switch to the model asked for now? Not while an answer is being
+        written, nor while requests for the loaded model that came before the switch request wait for it."""
+        e = self.engine
+        if self.switch_to is None or self.switch_to is self.cur or (e and self.busy.get(e)):
+            return False
+        if e and self.ready and e.alive():
+            return not any(m is self.cur and t < self.switch_ticket for m, t in self.waiting.values())
+        return True
 
     def release(self, e):
         with self.cv:
@@ -574,7 +609,7 @@ class Lodger:
         """Unload the current model and load the one a request is waiting for."""
         with self.cv:
             target, old = self.switch_to, self.engine
-            if not target or (old and self.busy.get(old)):
+            if not self.may_switch():
                 return                                # an answer started meanwhile: switch after it
             self.ready, self.engine, self.cur = False, None, target
             self.switch_to, self.asleep, self.wake = None, False, False
@@ -627,7 +662,7 @@ class Lodger:
         e = self.engine
         # another model wanted: switch once nothing is being written with this one
         with self.cv:
-            switching = self.switch_to is not None and self.switch_to is not self.cur and not (e and self.busy.get(e))
+            switching = self.may_switch()
         if switching:
             return self.switch()
         if self.asleep:
@@ -1064,7 +1099,10 @@ def make_handler(lodger, key=None, ollama_api=False):
             if req is None:                          # nothing to write: load the model (or, keep_alive 0, nothing)
                 if body.get("keep_alive") in (0, "0", "0s", "0m"):
                     return self.send_json(200, ans.loaded(load=False))
-                e = lodger.wait_engine(entry)
+                try:
+                    e = lodger.wait_engine(entry, ping=self.check_gone)
+                except OSError:
+                    return
                 if not e:
                     return self.send_error_json(503, self.unavailable(entry))
                 lodger.release(e)
@@ -1125,7 +1163,10 @@ def make_handler(lodger, key=None, ollama_api=False):
 
         def whole(self, body, entry, path):
             for _ in range(4):
-                e = lodger.wait_engine(entry)
+                try:
+                    e = lodger.wait_engine(entry, ping=self.check_gone)
+                except OSError:
+                    return
                 if not e:
                     return self.send_error_json(503, self.unavailable(entry))
                 c = None
@@ -1167,13 +1208,12 @@ def make_handler(lodger, key=None, ollama_api=False):
         def wait_pinging(self, entry):
             """wait_engine() for a streaming app, pinging it while a model loads or switches (minutes, sometimes):
             it keeps the app's connection open, and an app that went away ends the wait (OSError)."""
-            end = time.time() + MOVE_WAIT
-            while True:
-                t0, step = time.time(), min(PING, max(0.0, end - time.time()))
-                e = lodger.wait_engine(entry, limit=step)
-                if e or time.time() >= end or time.time() - t0 < step - 0.5:   # ready, too long, or can't run
-                    return e
-                self.event(":")
+            return lodger.wait_engine(entry, ping=lambda: self.event(":"))
+
+        def check_gone(self):
+            """wait_engine()'s ping for an app waiting for a whole answer: one that went away ends the wait."""
+            if self.app_gone():
+                raise OSError("the app went away")
 
         def stream_error(self, msg):
             self.event(f"data: {json.dumps({'error': {'message': msg}})}")

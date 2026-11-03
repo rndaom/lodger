@@ -180,5 +180,79 @@ class RequestTest(FrontCase):
         self.assertTrue(out.startswith(b"HTTP/1.1 100"), out[:40])
 
 
+class Waiter(threading.Thread):
+    """A request waiting for a model's engine (wait_engine) in its own thread; it releases the engine at once."""
+
+    def __init__(self, l, name, **kw):
+        super().__init__(daemon=True)
+        self.l, self.entry, self.kw, self.got = l, l.models[name], kw, None
+        self.start()
+
+    def run(self):
+        self.got = self.l.wait_engine(self.entry, **{"limit": 5, **self.kw})
+        if self.got:
+            self.l.release(self.got)
+
+
+class FairnessTest(unittest.TestCase):
+    def setUp(self):
+        self.l = lodger()
+        self.l.note = lambda text: None
+
+    def loads(self, delay=0.3):
+        """start_or_give_up() that installs a fake engine for the model being switched to, after `delay`."""
+        def start():
+            time.sleep(delay)
+            self.l.install(FakeEng(self.l.cur))
+            return True
+        return mock.patch.object(self.l, "start_or_give_up", side_effect=start)
+
+    def test_requests_for_two_models_are_both_served(self):
+        l = self.l
+        l.install(FakeEng(l.models["a"]))
+        wb = Waiter(l, "b")
+        time.sleep(0.1)
+        self.assertIs(l.switch_to, l.models["b"])
+        with self.loads():
+            threading.Timer(0.1, lambda: setattr(self, "wa", Waiter(l, "a"))).start()
+            l.switch()                                # loads b; meanwhile a request for a comes in
+            wb.join(2)
+            self.assertIs(wb.got and wb.got.entry, l.models["b"])   # the request that asked for b gets b first
+            self.assertIs(l.switch_to, l.models["a"])
+            l.switch()                                # then a, for the request that waited for it
+            self.wa.join(2)
+        self.assertIs(self.wa.got and self.wa.got.entry, l.models["a"])
+
+    def test_switch_waits_for_requests_that_came_first(self):
+        l = self.l
+        l.install(FakeEng(l.models["a"]))
+        with l.cv:                                # a request for a, not yet served when b is asked for
+            l.ticket += 1
+            l.waiting[object()] = (l.models["a"], l.ticket)
+            l.switch_to, l.switch_ticket = l.models["b"], l.ticket + 1
+        with mock.patch.object(l, "start_or_give_up") as start:
+            l.switch()
+            start.assert_not_called()
+
+    def test_pings_keep_the_place_in_line(self):
+        l = self.l
+        pings = []
+        with mock.patch.object(serve, "PING", 0.2):
+            w = Waiter(l, "b", limit=1, ping=lambda: pings.append(1))
+            w.join(2)
+        self.assertGreaterEqual(len(pings), 3)
+        self.assertEqual(l.waiting, {})
+
+    def test_app_gone_ends_the_wait(self):
+        l = self.l
+
+        def gone():
+            raise OSError("the app went away")
+        with mock.patch.object(serve, "PING", 0.1):
+            with self.assertRaises(OSError):
+                l.wait_engine(l.models["b"], limit=2, ping=gone)
+        self.assertEqual(l.waiting, {})
+
+
 if __name__ == "__main__":
     unittest.main()
