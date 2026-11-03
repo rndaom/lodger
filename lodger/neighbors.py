@@ -9,10 +9,12 @@ The model's own processes (systemd unit lodger-*) never count. Times are monoton
 
 Apps lodger can't look into: the kernel shows /proc/<pid>/fdinfo only to the app's own user, so another
 user's game, a compositor or Xorg running as root, or a system container using the card show no per-app
-numbers. Where the driver gives the whole card's numbers (amdgpu: gpu_busy_percent, memory used), lodger
-compares them with the sum of every app it can see, its own model included: what is left over is those apps,
-judged by the same rules (busy only while lodger's own model leaves the card mostly idle, as the two
-numbers aren't measured the same way). NVIDIA's NVML lists every user's apps, so it needs none of this."""
+numbers. Nor does compute work that bypasses the kernel's per-app counters (ROCm's queues: another AI tool,
+Blender, Resolve), though its memory shows. Where the driver gives the whole card's numbers (amdgpu:
+gpu_busy_percent, memory used), lodger compares them with the sum of every app it can see, its own model
+included: what is left over is those apps, judged by the same rules. Busy is compared only while lodger's
+own model leaves the card mostly idle and doesn't run on ROCm (the numbers aren't measured alike, and its
+ROCm work would look like a stranger's). NVIDIA's NVML lists every user's apps, so it needs none of this."""
 import collections
 import os
 import time
@@ -26,7 +28,7 @@ BUSY_SECONDS = 3.0
 GROWTH = 512 * MiB
 GROWTH_SECONDS = 5.0
 OURS = sysmem.OURS
-UNSEEN = "an app lodger can't look into (another user's, or the system's)"
+UNSEEN = "an app lodger can't look into (another user's, the system's, or ROCm compute)"
 OURS_QUIET = 0.10      # the whole card's busy is compared only while lodger's own model keeps it under this
 
 
@@ -94,7 +96,9 @@ class Neighbors:
         # card's numbers would count lodger's own work as a stranger's
         if any(pid not in use and fdinfo.drm_fds(pid, self.pci) for pid in ours):
             return None
-        return {"full": full, "busy": w["busy"], "used": w["used"],
+        # ROCm's compute queues bypass the per-app counters: lodger's own ROCm model's work would look like a stranger's
+        busy = None if any(fdinfo.holds(pid, "/dev/kfd") for pid in ours) else w["busy"]
+        return {"full": full, "busy": busy, "used": w["used"],
                 "seen": {app: (r["busy_ns"], r["vram"]) for app, r in seen.items()}}
 
     def update(self):
