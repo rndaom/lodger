@@ -192,7 +192,7 @@ def game_procs():
     for d in os.listdir("/proc"):
         if d.isdigit():
             try:
-                with open(f"/proc/{d}/stat") as f:
+                with open(f"/proc/{d}/stat", errors="replace") as f:
                     ppid = int(f.read().rsplit(")", 1)[1].split()[1])
                 kids.setdefault(ppid, []).append(int(d))
             except (OSError, IndexError, ValueError):

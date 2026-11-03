@@ -9,8 +9,10 @@ def path(p):
 
 
 def read(p, default=None):
+    """A file's text. Bytes that aren't UTF-8 (any process's environment, name or cgroup may hold them) are
+    replaced, never an error."""
     try:
-        with open(ROOT + p) as f:
+        with open(ROOT + p, encoding="utf-8", errors="replace") as f:
             return f.read()
     except OSError:
         return default

@@ -1,5 +1,6 @@
 """RAM numbers: /proc/meminfo shows the whole machine, but lodger may run inside a memory limit (a container,
 a capped user slice): available RAM is then the room under the tightest limit."""
+import os
 import unittest
 
 from lodger import host, sysmem
@@ -112,6 +113,36 @@ class LodgerUseTest(unittest.TestCase):
 
     def test_no_card(self):
         self.assertEqual(sysmem.lodger_use(None, ours=()), {"vram": 0, "gtt": 0})
+
+class StrangeBytesTest(unittest.TestCase):
+    """Any process may carry bytes that aren't UTF-8 (its environment, its name, a cgroup someone named): reading
+    them must never stop orphan reaping, lodger doctor or the desktop notes."""
+
+    def test_proc_files_that_arent_utf8_are_read(self):
+        from lodger import fence
+        with machine("desktop-amd", writable=True) as root:
+            def raw(rel, data):
+                path = os.path.join(root, rel.lstrip("/"))
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as f:
+                    f.write(data)
+            raw("/proc/900/environ", b"LANG=C\0NAME=caf\xe9\0")
+            raw("/proc/900/comm", b"caf\xe9\n")
+            raw("/proc/900/cmdline", b"caf\xe9\0")
+            raw("/proc/900/stat", b"900 (caf\xe9) S 1 900 900 0")
+            raw("/proc/900/cgroup", b"0::" + SLICE.encode() + b"/user@1000.service/app.slice/app-caf\xe9.scope\n")
+            raw("/proc/901/environ", b"LODGER_FENCE_NAME=lodger-4242-1\0")
+            self.assertEqual(fence.named(), {"lodger-4242-1": [901]})
+            self.assertFalse(fence.owner_alive(900))
+            self.assertIn(900, fence._group(900))
+            self.assertTrue(sysmem.app_name(900).startswith("caf"))
+            self.assertTrue(sysmem.comm(900).startswith("caf"))
+            # a cgroup named with a broken escape (systemd escapes as \x2d; anyone may name their own)
+            raw("/proc/902/cgroup", b"0::" + SLICE.encode() + b"/user@1000.service/app.slice/app-x\\x2.scope\n")
+            self.assertEqual(sysmem.app_name(902), "x\\x2")
+            raw("/proc/903/cgroup", b"0::" + SLICE.encode() + b"/user@1000.service/app.slice/app-gtk\\x2dlaunch-ab12.scope\n")
+            self.assertEqual(sysmem.app_name(903), "gtk-launch")
+
 
 if __name__ == "__main__":
     unittest.main()

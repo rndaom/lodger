@@ -431,7 +431,7 @@ def _first_int(path):
 
 def _text(path):
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             return f.read()
     except OSError:
         return None
