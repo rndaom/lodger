@@ -455,11 +455,50 @@ class ReloadTest(MonitorCase):
     def test_sighup_asks_for_a_reload(self):
         l = self.l
         l.install(FakeEng(l.models["a"]))
-        handler = serve.on_hangup(l)
+        handler = serve.on_hangup(l, tty=False)
         handler(signal.SIGHUP, None)
         with mock.patch.object(l, "reload") as reload:
             l.tick(QUIET)
         reload.assert_called_once()
+
+
+class HangupTest(MonitorCase):
+    """SIGHUP reloads a lodger run as a service; a lodger whose terminal closed stops (its models with it), and
+    writing to a terminal that is gone never stops it halfway."""
+    def test_closed_terminal_stops_lodger(self):
+        with self.assertRaises(KeyboardInterrupt):
+            serve.on_hangup(self.l, tty=True)(signal.SIGHUP, None)
+        self.assertIsNone(self.l.reload_wanted)
+
+    def test_log_to_a_closed_terminal_does_not_raise(self):
+        class Gone:
+            def write(self, s):
+                raise OSError(5, "Input/output error")
+
+            def flush(self):
+                raise OSError(5, "Input/output error")
+        with mock.patch.object(serve.sys, "stdout", Gone()):
+            serve.log("still here")
+
+    def test_monitor_survives_its_own_error_note_failing(self):
+        l = serve.Lodger.__new__(serve.Lodger)
+        l.__dict__.update(self.l.__dict__)
+        calls = []
+
+        def tick(nb):
+            calls.append(1)
+            if len(calls) == 3:
+                l.closing = True
+            raise OSError("sysfs went away")
+
+        def note(text):
+            raise OSError(5, "Input/output error")
+        l.note = note
+        l.out = "/nonexistent/lodger-run"                   # monitor-errors.log can't be written either
+        with mock.patch.object(l, "tick", side_effect=tick), mock.patch.object(serve, "Neighbors"), \
+                mock.patch.object(serve.time, "sleep"):
+            l.monitor()
+        self.assertEqual(len(calls), 3)
 
 
 class StatusTest(MonitorCase):

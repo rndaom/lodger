@@ -119,7 +119,9 @@ def unpause_all(argv=()):
 
 
 def log(msg):
-    print(time.strftime("%H:%M:%S ") + msg, flush=True)
+    """A line on lodger's output. Never raises: a closed terminal (EIO) must not stop the monitor halfway."""
+    with contextlib.suppress(OSError, ValueError):
+        print(time.strftime("%H:%M:%S ") + msg, flush=True)
 
 
 def free_port():
@@ -768,11 +770,14 @@ class Lodger:
             try:
                 self.tick(nb)
             except (Exception, SystemExit) as ex:
-                with contextlib.suppress(OSError), open(os.path.join(self.out, "monitor-errors.log"), "a") as f:
-                    f.write(time.strftime("%F %T\n"))
-                    traceback.print_exc(file=f)
+                # nothing here may end the monitor either (a note to a closed terminal, a full disk)
+                with contextlib.suppress(Exception):
+                    with open(os.path.join(self.out, "monitor-errors.log"), "a") as f:
+                        f.write(time.strftime("%F %T\n"))
+                        traceback.print_exc(file=f)
                 if repr(ex) != last_error:
-                    self.note(f"lodger's monitor hit an error and carries on (see monitor-errors.log): {ex!r}")
+                    with contextlib.suppress(Exception):
+                        self.note(f"lodger's monitor hit an error and carries on (see monitor-errors.log): {ex!r}")
                 self.monitor_error = f"{time.strftime('%H:%M:%S')} {ex!r}"
                 last_error = repr(ex)
                 time.sleep(5)
@@ -1650,9 +1655,18 @@ def serve(argv):
     return 0
 
 
-def on_hangup(lodger):
-    """SIGHUP (`systemctl --user reload lodger`, `kill -HUP`): read the model list again (the monitor does it)."""
+def on_hangup(lodger, tty=None):
+    """SIGHUP. Run as a service (`systemctl --user reload lodger`, `kill -HUP`): read the model list again (the
+    monitor does it). Run in a terminal, SIGHUP means the terminal closed: stop, with the models, as Ctrl-C does."""
+    if tty is None:
+        try:
+            tty = os.isatty(sys.stdout.fileno())
+        except (OSError, ValueError, AttributeError):
+            tty = False
+
     def handler(sig, frame):
+        if tty:
+            raise KeyboardInterrupt
         lodger.reload_wanted = "SIGHUP"
     return handler
 
