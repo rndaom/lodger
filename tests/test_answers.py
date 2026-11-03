@@ -131,7 +131,8 @@ def block_start(i, kind, **extra):
 
 
 def block_delta(i, kind, text):
-    field = {"text_delta": "text", "thinking_delta": "thinking", "input_json_delta": "partial_json"}[kind]
+    field = {"text_delta": "text", "thinking_delta": "thinking", "input_json_delta": "partial_json",
+             "signature_delta": "signature"}[kind]
     return ev("content_block_delta", {"type": "content_block_delta", "index": i, "delta": {"type": kind, field: text}})
 
 
@@ -195,6 +196,37 @@ class MessagesTest(FrontCase):
         self.assertEqual(out["usage"]["input_tokens"], 20)
         self.assertEqual(b.calls[0][1]["messages"][-1], {"role": "assistant", "content": "Say: Hel"})
         self.assertEqual(len(b.calls[0][1]["messages"]), 2)                 # the app's own start, continued
+
+    def after_thinking(self):
+        """A cut in the answer after its thinking; llama-server numbers the next engine's closing events counting the
+        thinking it was given (thinking 0, text 1), not the text block it streamed as 0."""
+        a = Engine(events=[msg_start(), block_start(0, "thinking"), block_delta(0, "thinking_delta", "hmm"),
+                           block_delta(0, "signature_delta", ""), block_stop(0), block_start(1, "text"),
+                           block_delta(1, "text_delta", "one ")], cut=True)
+        b = Engine(events=[msg_start("msg_2"), block_start(0, "text"), block_delta(0, "text_delta", "two"),
+                           block_delta(0, "signature_delta", ""), block_stop(0), block_stop(1), *msg_end(1)],
+                   done=False)
+        return a, b
+
+    def test_closing_numbers_after_a_move_dont_matter_whole(self):
+        status, _, data = self.front(*self.after_thinking()).post("/v1/messages", MSG)
+        self.assertEqual(status, 200)
+        out = json.loads(data)
+        self.assertEqual(out["content"], [{"type": "thinking", "thinking": "hmm", "signature": ""},
+                                          {"type": "text", "text": "one two"}])
+        self.assertEqual(out["usage"]["output_tokens"], 3)
+
+    def test_closing_numbers_after_a_move_dont_matter_stream(self):
+        status, _, data = self.front(*self.after_thinking()).post("/v1/messages", dict(MSG, stream=True))
+        out = sse(data)
+        self.assertEqual([n for n, _ in out if n == "error"], [])
+        stops = [d["index"] for n, d in out if n == "content_block_stop"]
+        self.assertEqual(stops, [0, 1])
+        sig = [d["index"] for n, d in out if n == "content_block_delta" and d["delta"]["type"] == "signature_delta"]
+        self.assertEqual(sig, [0])
+        text = "".join(d["delta"].get("text", "") for n, d in out if n == "content_block_delta" and d["index"] == 1)
+        self.assertEqual(text, "one two")
+        self.assertEqual([n for n, _ in out][-2:], ["message_delta", "message_stop"])
 
     def test_tool_call_cut_ends_with_an_anthropic_error(self):
         a = Engine(events=[msg_start(), block_start(0, "tool_use", name="ls"),
@@ -302,6 +334,41 @@ class ResponsesTest(FrontCase):
         events = [*resp_start(), *msg_added(0, "msg_a"), text_delta(0, "msg_a", "hi"), *resp_end(0, "msg_a", "hi", "resp_1", 1)]
         status, _, data = self.front(Engine(events=events, done=False)).post("/v1/responses", dict(RESP, stream=True))
         self.assertEqual(data.decode(), "".join(events))
+
+    def after_reasoning(self):
+        """A cut in the answer after its reasoning; the next engine's closing events number the reasoning it was
+        given as item 0 and its message as item 1, though it streamed the message as item 0."""
+        r_item = {"id": "rs_a", "type": "reasoning", "summary": [], "content": [], "status": "in_progress"}
+        a = Engine(events=[*resp_start(), rev("response.output_item.added", output_index=0, item=r_item),
+                           rev("response.reasoning_text.delta", item_id="rs_a", output_index=0, content_index=0,
+                               delta="hmm"),
+                           *msg_added(1, "msg_a"), text_delta(1, "msg_a", "one ")], cut=True)
+        r_b = {"id": "rs_b", "type": "reasoning", "summary": [], "status": "completed",
+               "content": [{"type": "reasoning_text", "text": "hmm"}]}
+        end = resp_end(1, "msg_b", "two", "resp_2", 1)
+        b = Engine(events=[*resp_start("resp_2"), *msg_added(0, "msg_b"), text_delta(0, "msg_b", "two"),
+                           rev("response.output_item.done", output_index=0, item=r_b), *end], done=False)
+        return a, b
+
+    def test_closing_numbers_after_a_move_dont_matter_whole(self):
+        status, _, data = self.front(*self.after_reasoning()).post("/v1/responses", RESP)
+        self.assertEqual(status, 200)
+        out = json.loads(data)
+        self.assertEqual([o["type"] for o in out["output"]], ["reasoning", "message"])
+        self.assertEqual(out["output"][1]["content"][0]["text"], "one two")
+        self.assertEqual(out["usage"], {"input_tokens": 28, "output_tokens": 3, "total_tokens": 31})
+
+    def test_closing_numbers_after_a_move_dont_matter_stream(self):
+        status, _, data = self.front(*self.after_reasoning()).post("/v1/responses", dict(RESP, stream=True))
+        out = sse(data)
+        kinds = [n for n, _ in out]
+        self.assertNotIn("response.failed", kinds)
+        done = [(d["output_index"], d["item"]["id"]) for n, d in out if n == "response.output_item.done"]
+        self.assertEqual(done, [(0, "rs_a"), (1, "msg_a")])                 # each item finished once
+        self.assertEqual([d["text"] for n, d in out if n == "response.output_text.done"], ["one two"])
+        completed = out[-1][1]["response"]
+        self.assertEqual(completed["usage"]["output_tokens"], 3)
+        self.assertEqual(completed["output"][1]["content"][0]["text"], "one two")
 
     def test_tool_call_cut_fails_the_response(self):
         a = Engine(events=[*resp_start(), rev("response.output_item.added", output_index=0, item={

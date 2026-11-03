@@ -351,6 +351,9 @@ class Chat(Answer):
         return ["data: " + compact({"error": {"message": msg, "type": "unavailable_error", "code": 503}})]
 
 
+KINDS = {"text_delta": "text", "thinking_delta": "thinking", "input_json_delta": "tool_use"}   # delta -> block
+
+
 class Messages(Answer):
     """Anthropic's Messages API (/v1/messages): content blocks (thinking, text, tool_use) in numbered events.
     After a move the next engine's message_start is left out, its first block joins the cut one if it is of the
@@ -413,6 +416,11 @@ class Messages(Answer):
     def event(name, d):
         return f"event: {name}\ndata: {compact(d)}"
 
+    def latest(self, kind):
+        """Our newest block of this kind the engine now writing has started or continued (None: none)."""
+        mine = [o for o in self.map.values() if self.blocks[o]["type"] == kind]
+        return max(mine) if mine else None
+
     def closing(self, our):
         """Events that close our block `our` (a thinking block gets its empty signature first, as llama-server
         sends it)."""
@@ -443,10 +451,11 @@ class Messages(Answer):
         if kind == "content_block_start":
             i, cb = d.get("index"), d.get("content_block") if isinstance(d.get("content_block"), dict) else {}
             t, out = cb.get("type"), []
-            if self.cont is not None and not self.map and self.blocks[self.cont]["type"] == t:
+            if self.attempt and self.cont is not None and not self.map and self.blocks[self.cont]["type"] == t:
                 self.map[i] = self.cont                 # the cut block goes on
                 return []
-            if self.cont is not None and self.cont not in self.map.values() and self.blocks[self.cont]["open"]:
+            if self.attempt and self.cont is not None and self.cont not in self.map.values() \
+                    and self.blocks[self.cont]["open"]:
                 out += self.closing(self.cont)          # the cut block ended there
                 self.cont = None
             our = len(self.blocks)
@@ -454,35 +463,45 @@ class Messages(Answer):
             self.map[i] = our
             if t == "tool_use":
                 self.tooling = True
-            if our != i:
+            if our != i and self.attempt:
                 d["index"] = our
-                return out + ([self.event(ev.name or kind, d)] if self.stream else [])
-            return out + same
+                out.append(self.event(ev.name or kind, d))
+            else:
+                out.append(ev.text())
+            return out if self.stream else []
         if kind in ("content_block_delta", "content_block_stop"):
+            delta = d.get("delta") if isinstance(d.get("delta"), dict) else {}
+            closes = kind == "content_block_stop" or delta.get("type") == "signature_delta"
+            if self.attempt and closes:
+                # after a move lodger closes the blocks itself (at message_delta): the engine numbers its closing
+                # events counting the thinking it was given, not the blocks it streamed
+                return []
             our = self.map.get(d.get("index"))
+            if our is None or (not closes and self.blocks[our]["type"] != KINDS.get(delta.get("type"))):
+                our = self.latest(KINDS.get(delta.get("type")))
             if our is None:
-                raise OSError("the engine sent a block it never started")
+                return same if not self.attempt else []
             b = self.blocks[our]
-            if kind == "content_block_stop":
+            if closes:
                 b["open"] = False
             else:
-                delta = d.get("delta") if isinstance(d.get("delta"), dict) else {}
-                for key, field in (("text_delta", "text"), ("thinking_delta", "thinking"),
-                                   ("input_json_delta", "partial_json")):
-                    if delta.get("type") == key and isinstance(delta.get(field), str):
-                        name = "json" if field == "partial_json" else field
-                        b[name] = b.get(name, "") + delta[field]
-                        if key != "input_json_delta" and delta[field]:
-                            self.wrote()
-            if our != d.get("index"):
+                field = {"text_delta": "text", "thinking_delta": "thinking", "input_json_delta": "partial_json"}.get(
+                    delta.get("type"))
+                if field and isinstance(delta.get(field), str):
+                    name = "json" if field == "partial_json" else field
+                    b[name] = b.get(name, "") + delta[field]
+                    if field != "partial_json" and delta[field]:
+                        self.wrote()
+            if our != d.get("index") and self.attempt:
                 d["index"] = our
                 return [self.event(ev.name or kind, d)] if self.stream else []
             return same
         if kind == "message_delta":
             out = []
-            for our, b in enumerate(self.blocks):
-                if b["open"]:
-                    out += self.closing(our)            # blocks the next engine didn't continue
+            if self.attempt:
+                for our, b in enumerate(self.blocks):
+                    if b["open"]:
+                        out += self.closing(our)        # in order, as llama-server closes them
             self.finished = True
             self.stop = d.get("delta") if isinstance(d.get("delta"), dict) else {}
             u = d.get("usage")
@@ -538,6 +557,10 @@ class Messages(Answer):
 
     def stream_error(self, msg):
         return [self.event("error", anthropic_error(503, msg))]
+
+
+DELTAS = {"response.output_text.delta": "message", "response.reasoning_text.delta": "reasoning",
+          "response.function_call_arguments.delta": "function_call"}   # delta event -> item type
 
 
 class Responses(Answer):
@@ -621,12 +644,19 @@ class Responses(Answer):
                                                             "output_index": our, "item": self.full(o)}))
         return out
 
-    def ours(self, d):
-        """Our item for an event of the engine now writing (by its output_index)."""
+    def ours(self, d, t=None):
+        """Our item for an event of the engine now writing: by its output_index, else by its item id, else (after a
+        move) its newest item of type `t`. None: no such item."""
+        def fits(o):
+            return o is not None and (not t or self.out[o]["type"] == t)
         our = self.map.get(d.get("output_index"))
-        if our is None:
-            raise OSError("the engine sent an item it never added")
-        return our
+        if not fits(our):
+            iid = self.ids.get(d.get("item_id"), d.get("item_id"))
+            our = next((o for o in self.map.values() if iid and self.out[o]["id"] == iid), None)
+        if not fits(our) and self.attempt and t:
+            mine = [o for o in self.map.values() if self.out[o]["type"] == t]
+            our = max(mine) if mine else None
+        return our if fits(our) else None
 
     def feed(self, ev):
         if ev.name == ":":
@@ -660,30 +690,31 @@ class Responses(Answer):
             d["output_index"] = our
         elif kind == "response.content_part.added":
             our = self.ours(d)
+            if our is None:
+                return same if not self.attempt else []
             if self.attempt and our == self.cont:
                 return []
             d["output_index"], d["item_id"] = our, self.out[our]["id"]
-        elif kind in ("response.output_text.delta", "response.reasoning_text.delta",
-                      "response.function_call_arguments.delta"):
-            our = self.ours(d)
+        elif kind in DELTAS:
+            our = self.ours(d, DELTAS[kind])
+            if our is None:
+                return same if not self.attempt else []
             delta = d.get("delta") if isinstance(d.get("delta"), str) else ""
             self.out[our]["text"] += delta
             if delta and kind != "response.function_call_arguments.delta":
                 self.wrote()
             d["output_index"], d["item_id"] = our, self.out[our]["id"]
-        elif kind in ("response.output_text.done", "response.content_part.done", "response.output_item.done"):
+        elif kind in ("response.output_text.done", "response.reasoning_text.done", "response.content_part.done",
+                      "response.output_item.done", "response.function_call_arguments.done"):
             self.finished = True                        # the closing events: everything is written
+            if self.attempt:
+                # after a move lodger finishes the items itself (at response.completed): the engine numbers its
+                # closing events counting the reasoning it was given, not the items it streamed
+                return []
             our = self.ours(d)
-            o = self.out[our]
-            d["output_index"] = our
-            if kind == "response.output_item.done":
-                o["done"] = True
-                d["item"] = self.full(o) if self.attempt else d.get("item")
-            elif kind == "response.output_text.done":
-                d["item_id"], d["text"] = o["id"], o["text"]
-            else:
-                d["item_id"] = o["id"]
-                d["part"] = dict(d.get("part") or {}, text=o["text"])
+            if our is not None and kind == "response.output_item.done":
+                self.out[our]["done"] = True
+            return same
         elif kind == "response.completed":
             out = []
             for our, o in enumerate(self.out):
