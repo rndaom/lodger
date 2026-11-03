@@ -86,6 +86,32 @@ class EntryTest(unittest.TestCase):
             e = catalog.Entry("m", "/m.gguf", {k: v})
             self.assertIn("can't plan memory for", e.skip or "", k)
 
+    def test_speculative_decoding_without_a_draft_model_is_planned(self):
+        for v in ("draft-mtp", "ngram-mod", "ngram-simple,draft-mtp", ["draft-mtp", "ngram-cache"], "none"):
+            e = catalog.Entry("m", "/m.gguf", {"spec-type": v, "spec-draft-n-max": 3, "draft-p-min": 0.8,
+                                               "spec-ngram-mod-n-max": 24})
+            self.assertIsNone(e.skip, v)
+            self.assertEqual(e.planning_args()[0], "--spec-type")       # the planner counts it
+        for v in ("draft-eagle3", "draft-simple", "mtp", "ngram-mod,draft-dflash"):
+            self.assertIn("draft model", catalog.Entry("m", "/m.gguf", {"spec-type": v}).skip or "", v)
+        self.assertIn("needs a value", catalog.Entry("m", "/m.gguf", {"spec-type": True}).skip or "")
+
+    def test_counted_settings_need_whole_numbers(self):
+        e = catalog.Entry("m", "/m.gguf", {"ctxcp": 4, "moe-cache-mib": 2048, "image-max-tokens": 1024})
+        self.assertIsNone(e.skip)
+        self.assertEqual(e.planning_args(), ["--ctx-checkpoints", "4", "--moe-cache-mib", "2048",
+                                             "--image-max-tokens", "1024"])
+        self.assertEqual(catalog.Entry("m", "/m.gguf", {"swa-checkpoints": 2}).planning_args(), ["--ctx-checkpoints", "2"])
+        for k, v in (("ctx-checkpoints", "lots"), ("moe-cache-mib", -1), ("image-max-tokens", 1.5), ("moe-cache-mib", True)):
+            self.assertIsNotNone(catalog.Entry("m", "/m.gguf", {k: v}).skip, (k, v))
+
+    def test_dense_layers_on_the_processor_are_lodgers_to_set(self):
+        for k in ("ncffn", "n-cpu-ffn"):
+            self.assertIn("lodger sets itself", catalog.Entry("m", "/m.gguf", {k: 4}).skip or "", k)
+
+    def test_a_table_is_not_a_setting(self):
+        self.assertIn("is a table", catalog.Entry("m", "/m.gguf", {"temp": {"a": 1}}).skip or "")
+
     def test_bad_ctx_is_refused(self):
         for ctx in (0, -1, 100, "big", True, 8192.5):
             self.assertIn("ctx must be", catalog.Entry("m", "/m.gguf", {"ctx": ctx}).skip or "", ctx)
