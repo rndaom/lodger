@@ -249,5 +249,64 @@ class WrongCardTest(unittest.TestCase):
         self.assertIn("0000:11:00.0", why)
 
 
+class FakeCard:
+    """A card whose free memory the test sets (None: it can't be read, as during a reset or after unplugging)."""
+    pci = "0000:03:00.0"
+    integrated = False
+    known = True
+
+    def __init__(self, free):
+        self._free = free
+
+    def free(self, mem=None, meminfo=None):
+        return self._free
+
+    def usage(self, pids):
+        return {}
+
+    def asleep(self):
+        return False
+
+
+class StopTest(unittest.TestCase):
+    def setUp(self):
+        config.use(config.load(os.devnull))
+        self.addCleanup(config.use, None)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.quiet = contextlib.redirect_stderr(io.StringIO())
+        self.quiet.__enter__()
+        self.addCleanup(self.quiet.__exit__, None, None, None)
+
+    def test_the_kernel_stops_the_model_first_when_memory_runs_out(self):
+        props = launch.unit_props({"ram_cap": 8 << 30, "ngl": 0})
+        self.assertEqual(props["OOMScoreAdjust"], "1000")
+
+    def test_it_watches_the_card_the_model_was_planned_for(self):
+        planned = FakeCard(10 << 30)
+        with machine("desktop-amd"):                               # sysmem.dgpu() would pick the recorded card
+            w = launch.Watchdog(FakeFence([]), True, self.tmp.name, keep=2 << 30, card=planned)
+        self.assertIs(w.card, planned)
+
+    def test_card_memory_that_cant_be_read_stops_the_model_in_plain_words(self):
+        f = FakeFence([], gone=False)
+        with machine("desktop-amd"):
+            w = launch.Watchdog(f, True, self.tmp.name, keep=2 << 30, card=FakeCard(None))
+            w.check(0.0, False)
+        self.assertIn("can't be read", w.reason)
+        self.assertNotIn("only 0 MiB", w.reason)
+
+    def test_a_graceful_stop_turns_hard_when_memory_runs_out_meanwhile(self):
+        f = FakeFence([], gone=False)                          # the model ignores SIGTERM
+        card = FakeCard(10 << 30)
+        with machine("desktop-amd"):
+            w = launch.Watchdog(f, True, self.tmp.name, keep=2 << 30, card=card)
+            card._free = 200 * MiB                             # a game loads fast while the model winds down
+            t0 = time.monotonic()
+            w.kill("a game needs the card; giving the graphics card back", graceful=True)
+        self.assertLess(time.monotonic() - t0, 1.0)
+        self.assertEqual(f.signals[:2], [signal.SIGTERM, signal.SIGKILL])
+
+
 if __name__ == "__main__":
     unittest.main()
