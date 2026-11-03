@@ -21,8 +21,9 @@ class Engine:
     """Stands in for llama-server: answers every POST with `whole` (JSON, `status`), or streams `events` (strings
     sent as they are, dicts as `data:` lines) and then closes; cut=True: the engine counts as gone after that."""
 
-    def __init__(self, whole=None, events=None, status=200, cut=False, where="processor", done=True):
+    def __init__(self, whole=None, events=None, status=200, cut=False, where="processor", done=True, paths=None):
         self.whole, self.events, self.status, self.cut, self.done = whole, list(events or []), status, cut, done
+        self.paths = paths or {}        # path -> JSON answered there instead (token counts)
         self.where, self.dead, self.calls = where, False, []
         self.stopping, self.wd = False, SimpleNamespace(reason=None)
         eng = self
@@ -35,6 +36,13 @@ class Engine:
 
             def do_POST(self):
                 eng.calls.append((self.path, json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
+                if self.path in eng.paths:
+                    body = json.dumps(eng.paths[self.path]).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    return self.wfile.write(body)
                 if eng.events is None or eng.whole is not None or eng.status != 200:
                     body = json.dumps(eng.whole).encode()
                     self.send_response(eng.status)
@@ -99,7 +107,7 @@ class Front:
     def loaded(self):
         return None
 
-    def wait_engine(self, entry, limit=None, ping=None):
+    def wait_engine(self, entry, limit=None, ping=None, turn=None):
         self.waits.append(ping)
         self.engine = self.engines.pop(0) if self.engines else None
         return self.engine
@@ -237,6 +245,28 @@ class FairnessTest(unittest.TestCase):
             l.switch()
             start.assert_not_called()
 
+    def test_an_answer_continued_after_a_move_keeps_its_place(self):
+        l = self.l
+        a = l.models["a"]
+        e = FakeEng(a)
+        l.install(e)
+        turn = {}
+        got = l.wait_engine(a, limit=1, turn=turn)          # an answer starts on a
+        self.assertIs(got, e)
+        wb = Waiter(l, "b", limit=0.5)                      # then b is asked for
+        time.sleep(0.1)
+        self.assertIs(l.switch_to, l.models["b"])
+        l.release(e)
+        l.drop(e)                                           # a moves (stepped aside) mid-answer
+        wa = Waiter(l, "a", limit=2, turn=turn)             # the rest of the answer waits for a again
+        time.sleep(0.1)
+        with l.cv:
+            self.assertFalse(l.may_switch())                # it came before b: no switch away from a
+        l.install(FakeEng(a))
+        wa.join(2)
+        self.assertIs(wa.got and wa.got.entry, a)
+        wb.join(2)
+
     def test_pings_keep_the_place_in_line(self):
         l = self.l
         pings = []
@@ -291,7 +321,18 @@ class SleepTest(MonitorCase):
         e.fence.stop.assert_not_called()
         self.assertIsNone(e.wd.reason)
         self.assertTrue(any("slept" in n for n in self.notes), self.notes)
-        self.assertGreater(l.quiet_since, time.time() - 5)     # the card wasn't watched meanwhile: no grow-back yet
+        self.assertGreater(l.quiet_since, time.monotonic() - 5)     # the card wasn't watched meanwhile: no grow-back yet
+
+    def test_clock_set_forward_does_not_unload_a_model_in_use(self):
+        l = self.l
+        e = FakeEng(l.models["a"])
+        l.install(e)
+        l.a.idle = 10
+        l.last_used = time.monotonic()                      # used just now
+        wall = time.time() + 3600                           # the clock is set an hour ahead (NTP, a time zone fix)
+        with mock.patch.object(serve.time, "time", return_value=wall):
+            l.tick(QUIET)
+        self.assertFalse(e.stopped)
 
     def test_a_dead_watchdog_still_stops_the_model(self):
         l = self.l
@@ -349,6 +390,19 @@ class PowerTest(MonitorCase):
         up.assert_called_with(want_card=False)
         self.assertIn("battery", l.why_off_card)
         self.assertEqual(l.quiet_needed, serve.QUIET_SECONDS)       # not a sign the card is contested
+
+    def test_asked_move_is_not_lost_to_the_power_check(self):
+        l = self.l
+        e = FakeEng(l.models["a"], where="card")
+        l.install(e)
+
+        def unplugged():
+            l.force_off_card = True                             # POST /lodger/move while the power is read
+            return None
+        with mock.patch.object(l, "unplugged", side_effect=unplugged), \
+                mock.patch.object(l, "bring_up", return_value=True):
+            l.tick(QUIET)
+        self.assertTrue(e.stopped)
 
     def test_plugged_in_or_allowed_stays(self):
         l = self.l
@@ -418,17 +472,83 @@ class ReloadTest(MonitorCase):
         self.assertFalse(e.stopped)
         self.assertTrue(any("b" in n and "removed" in n for n in self.notes), self.notes)
 
-    def test_removed_current_model_is_switched_away_from(self):
+    def test_removed_current_model_is_unloaded_and_nothing_loads_unasked(self):
         l = self.l
         l.cur = l.models["b"]
-        l.install(FakeEng(l.models["b"]))
+        e = FakeEng(l.models["b"], where="card")
+        l.install(e)
         b = l.models["b"]
         self.write(other="c")
         with mock.patch.object(l, "prepare"):
             l.reload("test")
         self.assertTrue(b.skip)
         self.assertIsNone(l.wait_engine(b, limit=0.2))
-        self.assertIs(l.switch_to, l.models["a"])
+        self.assertIsNone(l.switch_to)
+        with mock.patch.object(l, "bring_up") as up, mock.patch.object(l, "start_or_give_up") as start:
+            l.tick(QUIET)
+            l.tick(QUIET)
+        self.assertTrue(e.stopped)
+        up.assert_not_called()
+        start.assert_not_called()
+        self.assertTrue(l.asleep)                               # the default loads on the next request, not before
+        self.assertIs(l.cur, l.models["a"])
+
+    def test_removal_waits_for_the_answer_being_written(self):
+        l = self.l
+        l.cur = l.models["b"]
+        e = FakeEng(l.models["b"])
+        l.install(e)
+        l.busy[e] = 1
+        self.write(other="c")
+        with mock.patch.object(l, "prepare"):
+            l.reload("test")
+        l.tick(QUIET)
+        self.assertFalse(e.stopped)
+        del l.busy[e]
+        l.tick(QUIET)
+        self.assertTrue(e.stopped)
+
+    def test_skipped_current_model_is_unloaded(self):
+        l = self.l
+        a = l.models["a"]
+        e = FakeEng(a)
+        l.install(e)
+        self.write(a_extra='skip = "not today"')
+        with mock.patch.object(l, "prepare"):
+            l.reload("test")
+        self.assertTrue(a.skip)
+        with mock.patch.object(l, "bring_up") as up:
+            l.tick(QUIET)
+        self.assertTrue(e.stopped)
+        up.assert_not_called()
+        self.assertIsNone(l.engine)
+
+    def test_changed_loaded_model_keeps_its_running_context(self):
+        l = self.l
+        a = l.models["a"]
+        a.ctx = 8192
+        l.install(FakeEng(a))
+        self.write(a_extra="temp = 0.5")
+        with mock.patch.object(l, "prepare"):
+            l.reload("test")
+        self.assertEqual(a.ctx, 8192)
+        self.assertEqual(l.status()["context"], 8192)
+        self.write(a_extra="ctx = 2048")
+        with mock.patch.object(l, "prepare"):
+            l.reload("test")
+        self.assertEqual(a.ctx, 8192)                          # until it starts again
+        l.a.idle, l.last_used = 1, 0
+        l.tick(QUIET)                                           # unloaded when unused
+        self.assertEqual(a.ctx, 2048)
+
+    def test_wrong_types_in_the_file_keep_the_models(self):
+        l = self.l
+        for text in ('defaults = "x"\n[models.a]\nfile = "a.gguf"\n', "models = 1\n"):
+            with open(self.cfg, "w") as f:
+                f.write(text)
+            self.assertFalse(l.reload("test"), text)
+            self.assertEqual(sorted(l.models), ["a", "b"])
+            self.assertTrue(l.status()["models_file"]["error"], text)
 
     def test_broken_file_keeps_the_models(self):
         l = self.l
@@ -445,28 +565,85 @@ class ReloadTest(MonitorCase):
         st = os.stat(self.cfg)
         os.utime(self.cfg, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))
         with mock.patch.object(l, "reload") as reload:
-            l.watch_models(time.time())
+            l.watch_models(time.monotonic())
             reload.assert_not_called()                          # just changed: maybe still being written
-            l.watch_models(time.time() + 1)
+            l.watch_models(time.monotonic() + 1)
             reload.assert_not_called()
-            l.watch_models(time.time() + 5)
+            l.watch_models(time.monotonic() + 5)
             reload.assert_called_once()
 
     def test_sighup_asks_for_a_reload(self):
         l = self.l
         l.install(FakeEng(l.models["a"]))
-        handler = serve.on_hangup(l)
+        handler = serve.on_hangup(l, tty=False)
         handler(signal.SIGHUP, None)
         with mock.patch.object(l, "reload") as reload:
             l.tick(QUIET)
         reload.assert_called_once()
 
 
+class RelayTest(FrontCase):
+    def test_clean_end_during_a_hand_over_is_not_a_move(self):
+        chunks = [{"content": "one", "stop": False}, {"content": " two", "stop": True}]
+        e = Engine(events=chunks, done=False)
+        f = self.front(e)
+        wait = f.wait_engine
+
+        def handed_over(entry, limit=None, ping=None):
+            got = wait(entry, limit, ping)
+            f.engine = object()                                 # the card engine took over; e finishes this one
+            return got
+        f.wait_engine = handed_over
+        status, _, data = f.post("/completion", {"prompt": "count", "stream": True})
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"moved", data)
+        self.assertIn(b'"stop": true', data)
+
+
+class HangupTest(MonitorCase):
+    """SIGHUP reloads a lodger run as a service; a lodger whose terminal closed stops (its models with it), and
+    writing to a terminal that is gone never stops it halfway."""
+    def test_closed_terminal_stops_lodger(self):
+        with self.assertRaises(KeyboardInterrupt):
+            serve.on_hangup(self.l, tty=True)(signal.SIGHUP, None)
+        self.assertIsNone(self.l.reload_wanted)
+
+    def test_log_to_a_closed_terminal_does_not_raise(self):
+        class Gone:
+            def write(self, s):
+                raise OSError(5, "Input/output error")
+
+            def flush(self):
+                raise OSError(5, "Input/output error")
+        with mock.patch.object(serve.sys, "stdout", Gone()):
+            serve.log("still here")
+
+    def test_monitor_survives_its_own_error_note_failing(self):
+        l = serve.Lodger.__new__(serve.Lodger)
+        l.__dict__.update(self.l.__dict__)
+        calls = []
+
+        def tick(nb):
+            calls.append(1)
+            if len(calls) == 3:
+                l.closing = True
+            raise OSError("sysfs went away")
+
+        def note(text):
+            raise OSError(5, "Input/output error")
+        l.note = note
+        l.out = "/nonexistent/lodger-run"                   # monitor-errors.log can't be written either
+        with mock.patch.object(l, "tick", side_effect=tick), mock.patch.object(serve, "Neighbors"), \
+                mock.patch.object(serve.time, "sleep"):
+            l.monitor()
+        self.assertEqual(len(calls), 3)
+
+
 class StatusTest(MonitorCase):
     def test_status_says_enough_to_find_a_problem(self):
         l = self.l
         e = FakeEng(l.models["a"])
-        e.started, e.out = time.time() - 30, "/runs/x"
+        e.started, e.out = time.monotonic() - 30, "/runs/x"
         l.install(e)
         got = l.wait_engine(l.models["a"], limit=1)
         st = json.loads(json.dumps(l.status()))

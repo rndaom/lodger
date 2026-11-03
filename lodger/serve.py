@@ -119,7 +119,9 @@ def unpause_all(argv=()):
 
 
 def log(msg):
-    print(time.strftime("%H:%M:%S ") + msg, flush=True)
+    """A line on lodger's output. Never raises: a closed terminal (EIO) must not stop the monitor halfway."""
+    with contextlib.suppress(OSError, ValueError):
+        print(time.strftime("%H:%M:%S ") + msg, flush=True)
 
 
 def free_port():
@@ -184,7 +186,7 @@ class Engine:
             with open(os.path.join(out, "plan.json"), "w") as f:
                 json.dump({**p, "cmd": cmd, "env": env, "fence": fence.mode()[0]}, f, indent=1)
             self.logf = open(os.path.join(out, "engine.log"), "w")
-            self.started = time.time()
+            self.started = time.monotonic()
             # own session: Ctrl-C in the terminal reaches lodger only, which then stops the engine itself
             self.fence = fence.Fenced(cmd, env, unit_props(p), stdout=self.logf, stderr=subprocess.STDOUT,
                                       new_session=True, name=self.name)
@@ -227,7 +229,7 @@ class Engine:
     def wait_ready(self, limit=600, abort=lambda: False):
         """Wait until the engine answers. /health needs no key, and the key is only sent once the program on the
         port is known to be the engine (see port_owned)."""
-        while time.time() - self.started < limit and self.alive() and not abort():
+        while time.monotonic() - self.started < limit and self.alive() and not abort():
             try:
                 c = http.client.HTTPConnection(HOST, self.port, timeout=2)
                 c.request("GET", "/health")
@@ -238,7 +240,7 @@ class Engine:
                         self.wd.reason = self.wd.reason or f"another program took the engine's port {self.port}"
                         return False
                     self.forget_keyfile()
-                    self.ready_at = time.time()
+                    self.ready_at = time.monotonic()
                     return True
             except (OSError, http.client.HTTPException):
                 pass
@@ -267,7 +269,7 @@ class Engine:
         with contextlib.suppress(ValueError):
             Engine.all.remove(self)
         # learn: planned vs really used on the card (only once it had loaded and run a little)
-        if self.plan["ngl"] and self.ready_at and time.time() - self.ready_at > 10:
+        if self.plan["ngl"] and self.ready_at and time.monotonic() - self.ready_at > 10:
             with open(os.path.join(RUNS, "calibration.jsonl"), "a") as f:
                 f.write(json.dumps({"time": time.strftime("%F %T"), "model": self.entry.name, "ngl": self.plan["ngl"],
                                     "n_cpu_moe": self.plan["n_cpu_moe"], "ctx": self.plan["ctx"],
@@ -294,7 +296,7 @@ class Lodger:
         self.why = "starting"
         self.why_off_card = None if a.allow_gpu else "the graphics card is only used when you allow it (--allow-gpu)"
         self.last_aside = 0.0
-        self.quiet_since = time.time()
+        self.quiet_since = time.monotonic()
         self.quiet_needed = QUIET_SECONDS     # doubles each time the model has to step aside soon after growing back
         self.card_since = None
         self.events = []                      # (time, text) shown in /lodger/status
@@ -302,15 +304,17 @@ class Lodger:
         self.closing = False
         self.asleep = bool(a.idle)            # with --idle: load a model on the first request, not at start
         self.wake = False
-        self.last_used = time.time()
+        self.last_used = time.monotonic()
         self.last_note = 0.0
         self.last_fail = None                 # why the last engine didn't start
         self.failed = {}                      # name -> (time it may be tried again, why it didn't start)
         self.failures = 0                     # the current model's starts that failed in a row
         self.retry_at, self.retry_delay = 0.0, 10
         self.ollama = None                    # where Ollama's API is answered, or why not
-        self.t_start = time.time()
+        self.t_start = time.monotonic()
         self.last_power = 0.0                 # when the power source was last looked at
+        self.unload_wanted = None             # why the loaded model is to be unloaded (removed from the list), or None
+        self.next_ctx = {}                    # model -> its context from its next start (it changed while loaded)
         self.reload_wanted = None             # why the model list is to be read again (SIGHUP), or None
         self.reloading = threading.Lock()
         self.conf = {n: self.fingerprint(e) for n, e in models.items()}   # each model as models.toml had it
@@ -332,7 +336,7 @@ class Lodger:
         jump, self.clock_off = off - self.clock_off, off
         if abs(jump) > 5:
             self.grace_until = time.monotonic() + 15
-            self.quiet_since = time.time()
+            self.quiet_since = time.monotonic()
             self.note(f"the PC slept or its clock was set ({jump / 60:+.0f} min): carrying on")
         return jump
 
@@ -379,7 +383,7 @@ class Lodger:
                 models, default = catalog.load(self.a.files or None, self.models_file)
                 if not models:
                     raise ValueError("it lists no models")
-            except (OSError, ValueError, SystemExit) as ex:   # tomllib's errors are ValueErrors
+            except (Exception, SystemExit) as ex:   # unreadable, not TOML, or wrong types (defaults = "x")
                 self.models_error = f"{self.models_file} couldn't be read again ({ex}); serving the models read before"
                 self.note(self.models_error)
                 return False
@@ -395,7 +399,11 @@ class Lodger:
                         out[name] = cur
                         if self.conf.get(name) != fp:
                             loaded = self.engine and self.engine.entry is cur
+                            running = cur.ctx
                             cur.__dict__.update(new.__dict__)
+                            if loaded:
+                                # the running engine keeps its context (status, plans for a move) until it stops
+                                self.next_ctx[name], cur.ctx = cur.ctx, running
                             changes.append(f"changed {name}" + (" (from its next start)" if loaded else ""))
                     self.conf[name] = fp
                 for name, cur in self.models.items():
@@ -408,12 +416,13 @@ class Lodger:
                                 else next(iter(out)))
                 if self.switch_to is not None and self.switch_to.skip:
                     self.switch_to = None
-                if self.cur is not out.get(self.cur.name):        # the loaded model was removed
+                if self.cur is not out.get(self.cur.name) or self.cur.skip:   # the loaded model was removed
+                    why = self.cur.skip or "removed from the model list"
                     if self.engine:
-                        self.switch_to = self.switch_to or out[self.default]   # once its answers are written
-                        self.switch_ticket = 0
+                        self.unload_wanted = f"{self.cur.name}: {why}"           # once its answers are written
                     else:
                         self.cur = out[self.default]
+                        self.asleep = self.asleep or self.switch_to is None     # nothing loads until asked
                 self.models_read, self.models_error = time.time(), None
                 self.cv.notify_all()
             self.note(f"read the model list again ({why}): " + (", ".join(changes) or "nothing changed"))
@@ -450,7 +459,7 @@ class Lodger:
     def cooling(self, entry):
         """Why `entry` didn't start a little while ago (lodger tries again after FAIL_COOLDOWN), or None."""
         until, why = self.failed.get(entry.name, (0, None))
-        return why if time.time() < until else None
+        return why if time.monotonic() < until else None
 
     def decide_ctx(self, entry):
         """A model's context for this session: automatic (see plan.CTX_CAP/CTX_SHARE) for where it may run,
@@ -592,7 +601,7 @@ class Lodger:
             self.last_fail = reason
             self.note(f"the {e.where} engine didn't come up: {reason}")
             return None
-        self.note(f"{self.cur.name} ready on the {e.where} after {time.time() - e.started:.0f} s")
+        self.note(f"{self.cur.name} ready on the {e.where} after {time.monotonic() - e.started:.0f} s")
         return e
 
     def install(self, e):
@@ -600,7 +609,7 @@ class Lodger:
             old, self.engine, self.ready = self.engine, e, True
             self.why = f"{e.entry.name} on the {e.where}" + (
                 f": {self.why_off_card}" if e.where == "processor" and self.why_off_card else "")
-            self.card_since = time.time() if e.where == "card" else None
+            self.card_since = time.monotonic() if e.where == "card" else None
             self.failed.pop(e.entry.name, None)
             self.failures, self.retry_delay = 0, 10
             self.cv.notify_all()
@@ -617,7 +626,7 @@ class Lodger:
 
     def retry_later(self):
         """No engine is up for the current model: the monitor tries again in a while (10 s, doubling to 5 min)."""
-        self.retry_at = time.time() + self.retry_delay
+        self.retry_at = time.monotonic() + self.retry_delay
         self.why = f"{self.cur.name} couldn't start ({self.last_fail}); trying again in {self.retry_delay} s"
         self.note(self.why)
         self.retry_delay = min(self.retry_delay * 2, 300)
@@ -630,7 +639,7 @@ class Lodger:
             return True
         with self.cv:
             why = self.last_fail or "see the engine logs"
-            self.failed[target.name] = (time.time() + FAIL_COOLDOWN, why)
+            self.failed[target.name] = (time.monotonic() + FAIL_COOLDOWN, why)
             self.asleep, self.cur = True, self.models[self.default] if not self.models[self.default].skip else target
             self.why = (f"{target.name} couldn't start ({why}); a request may try it again after "
                         f"{FAIL_COOLDOWN // 60} min")
@@ -639,22 +648,28 @@ class Lodger:
         self.note(self.why)
         return False
 
-    def wait_engine(self, entry, limit=MOVE_WAIT, ping=None):
+    def wait_engine(self, entry, limit=MOVE_WAIT, ping=None, turn=None):
         """The engine for `entry`, once it's loaded and ready (asks for a switch or a wake-up if needed), counted
         as busy until release(); None if that doesn't happen within `limit` seconds or the model can't run.
         Requests are served in the order they came: when another model is asked for, the requests for this one
         that came first still get it before the switch, and the request that asked for the switch gets the new
         model before the next one (two apps using two models would otherwise keep switching, serving neither).
-        ping(): called every PING seconds while waiting, without the lock (it may raise OSError: the app left)."""
-        end = time.time() + limit
+        ping(): called every PING seconds while waiting, without the lock (it may raise OSError: the app left).
+        turn: a dict the request keeps over its tries: an answer continued after a move keeps its place in line."""
+        end = time.monotonic() + limit
         token, next_ping = object(), time.monotonic() + PING
         with self.cv:
-            self.ticket += 1
-            ticket = self.ticket
+            if turn is not None and "ticket" in turn:
+                ticket = turn["ticket"]
+            else:
+                self.ticket += 1
+                ticket = self.ticket
+                if turn is not None:
+                    turn["ticket"] = ticket
             self.waiting[token] = (entry, ticket)
             try:
                 while True:
-                    self.last_used = time.time()
+                    self.last_used = time.monotonic()
                     if entry.skip or self.closing:
                         return None
                     e = self.engine
@@ -672,7 +687,7 @@ class Lodger:
                         self.switch_to, self.switch_ticket = entry, ticket
                     if self.asleep:
                         self.wake = True
-                    left = end - time.time()
+                    left = end - time.monotonic()
                     if left <= 0:
                         return None
                     if ping and time.monotonic() >= next_ping:
@@ -694,8 +709,11 @@ class Lodger:
         e = self.engine
         if self.switch_to is None or self.switch_to is self.cur or (e and self.busy.get(e)):
             return False
+        earlier = any(m is self.cur and t < self.switch_ticket for m, t in self.waiting.values())
         if e and self.ready and e.alive():
-            return not any(m is self.cur and t < self.switch_ticket for m, t in self.waiting.values())
+            return not earlier
+        if earlier and not self.asleep and self.failures < 2 and not self.cooling(self.cur):
+            return False                          # the model is coming back after a move: its earlier requests first
         return True
 
     def release(self, e):
@@ -714,15 +732,15 @@ class Lodger:
             self.release(e)
 
     def stepped_aside(self):
-        self.last_aside = time.time()
-        if self.card_since and time.time() - self.card_since < 600:
+        self.last_aside = time.monotonic()
+        if self.card_since and time.monotonic() - self.card_since < 600:
             self.quiet_needed = min(self.quiet_needed * 2, 1800)   # it came back too soon: wait longer next time
         elif self.card_since:
             self.quiet_needed = QUIET_SECONDS
         self.card_since = None
 
     def card_quiet(self, now=None):
-        now = now or time.time()
+        now = now or time.monotonic()
         return now - self.quiet_since >= self.quiet_needed and now - self.last_aside >= self.quiet_needed
 
     def drop(self, e):
@@ -744,8 +762,21 @@ class Lodger:
             old.stop()
             if old.where == "card":
                 self.unpause()
+            self.unloaded(old.entry)
         self.card_since, self.quiet_needed = None, QUIET_SECONDS
         self.start_or_give_up()
+
+    def stopped(self, e):
+        """Stop engine `e`, unloaded on purpose (unused, or its model left the list)."""
+        e.stop()
+        self.card_since = None
+        self.unpause()
+        self.unloaded(e.entry)
+
+    def unloaded(self, entry):
+        """A model no longer running: settings that changed while it ran apply from its next start."""
+        if entry.name in self.next_ctx:
+            entry.ctx = self.next_ctx.pop(entry.name)
 
     def wake_up(self):
         with self.cv:
@@ -768,11 +799,14 @@ class Lodger:
             try:
                 self.tick(nb)
             except (Exception, SystemExit) as ex:
-                with contextlib.suppress(OSError), open(os.path.join(self.out, "monitor-errors.log"), "a") as f:
-                    f.write(time.strftime("%F %T\n"))
-                    traceback.print_exc(file=f)
+                # nothing here may end the monitor either (a note to a closed terminal, a full disk)
+                with contextlib.suppress(Exception):
+                    with open(os.path.join(self.out, "monitor-errors.log"), "a") as f:
+                        f.write(time.strftime("%F %T\n"))
+                        traceback.print_exc(file=f)
                 if repr(ex) != last_error:
-                    self.note(f"lodger's monitor hit an error and carries on (see monitor-errors.log): {ex!r}")
+                    with contextlib.suppress(Exception):
+                        self.note(f"lodger's monitor hit an error and carries on (see monitor-errors.log): {ex!r}")
                 self.monitor_error = f"{time.strftime('%H:%M:%S')} {ex!r}"
                 last_error = repr(ex)
                 time.sleep(5)
@@ -780,7 +814,7 @@ class Lodger:
     def tick(self, nb):
         """One round of the monitor."""
         self.clock()
-        now = time.time()
+        now = time.monotonic()
         if self.reload_wanted:
             why, self.reload_wanted = self.reload_wanted, None
             self.reload(why)
@@ -796,6 +830,20 @@ class Lodger:
             switching = self.may_switch()
         if switching:
             return self.switch()
+        if self.unload_wanted:
+            with self.cv:
+                idle = not (e and self.busy.get(e))
+                if idle:                              # its answers are written: unload, load nothing until asked
+                    why, self.unload_wanted = self.unload_wanted, None
+                    self.ready, self.engine, self.asleep = False, None, True
+                    default = self.models.get(self.default)
+                    self.cur = default if default and not default.skip else next(iter(self.available()), self.cur)
+                    self.why = f"asleep: {why} (a model loads on the next request)"
+            if idle:
+                if e:
+                    self.note(f"unloading {e.entry.name} ({why})")
+                    self.stopped(e)
+                return
         if self.asleep:
             if self.wake:
                 self.wake_up()
@@ -809,15 +857,13 @@ class Lodger:
         if self.a.idle and e and e.alive():
             with self.cv:
                 unused = (self.active == 0 and not self.busy.get(e)
-                          and time.time() - self.last_used >= self.a.idle * 60)
+                          and time.monotonic() - self.last_used >= self.a.idle * 60)
                 if unused:
                     self.ready, self.asleep, self.engine = False, True, None
                     self.why = f"asleep: unloaded after {self.a.idle:g} min unused (loads again on the next request)"
             if unused:
                 self.note(f"unused for {self.a.idle:g} min: unloading {e.entry.name} until the next request")
-                e.stop()
-                self.card_since = None
-                self.unpause()
+                self.stopped(e)
                 return
         if e and not e.alive():
             reason = e.wd.reason
@@ -838,14 +884,16 @@ class Lodger:
             return
         if e and e.where == "card" and not self.force_off_card and now - self.last_power >= 10:
             self.last_power = now
-            self.force_off_card = self.unplugged() or False
+            why = self.unplugged()
+            if why:                                   # never False: a POST /lodger/move meanwhile must not be lost
+                self.force_off_card = why
         if self.force_off_card:
             why = self.force_off_card if isinstance(self.force_off_card, str) else "asked to move off the card"
             self.force_off_card = False
             if e and e.where == "card":
                 # asked to (POST /lodger/move) or unplugged: not a sign the card is contested, so the quiet wait
                 # doesn't grow
-                self.last_aside, self.card_since = time.time(), None
+                self.last_aside, self.card_since = time.monotonic(), None
                 self.note(f"moving off the card ({why})")
                 self.why_off_card = why
                 with self.cv:
@@ -867,22 +915,22 @@ class Lodger:
         if e.where == "processor" and self.a.allow_gpu and self.active == 0 and self.card_quiet(now):
             trial = self.make_plan(True)
             if trial["refuse"] or not trial["ngl"]:
-                self.quiet_since = time.time()      # no room on the card yet; look again in a while
+                self.quiet_since = time.monotonic()      # no room on the card yet; look again in a while
                 return
             self.note(f"the card has been quiet for {now - self.quiet_since:.0f} s: growing back onto it")
             # the processor engine keeps answering while the card engine loads; then they swap
             new = self.launch(want_card=True, card_only=True)
             if not new:
-                self.quiet_since = time.time()
+                self.quiet_since = time.monotonic()
                 self.note("not growing back after all: " + (self.last_fail or "the card engine didn't come up"))
                 return
             old = self.install(new)
             if old:
                 # new answers go to the card now; one still being written on the processor may finish there
                 # (a tool call cut by a move must be asked again), then the rest continues on the card
-                end = time.time() + GROW_WAIT
+                end = time.monotonic() + GROW_WAIT
                 with self.cv:
-                    while (time.time() < end and self.busy.get(old) and not self.closing and new.alive()
+                    while (time.monotonic() < end and self.busy.get(old) and not self.closing and new.alive()
                            and not new.wd.reason and self.watched(new) and self.watched(old)):   # watch them here
                         self.cv.wait(1)
                 if not new.alive() or new.wd.reason:
@@ -926,7 +974,7 @@ class Lodger:
         for n, m in self.models.items():
             why = m.skip or self.cooling(m)
             models[n] = ("not served: " if m.skip else "didn't start: ") + why if why else "ok"
-        now = time.time()
+        now = time.monotonic()
         with self.cv:
             waiting = {}
             for m, _ in self.waiting.values():
@@ -1276,7 +1324,7 @@ def make_handler(lodger, key=None, ollama_api=False):
             finally:
                 with lodger.cv:
                     lodger.active -= 1
-                    lodger.last_used = time.time()
+                    lodger.last_used = time.monotonic()
 
         def ollama_post(self, raw, path):
             """Ollama's POST /api/...: translated to llama-server's kind and answered as the others are."""
@@ -1352,8 +1400,8 @@ def make_handler(lodger, key=None, ollama_api=False):
         def moved(self, e):
             """After an error talking to engine `e`: was it stopped or replaced (a move: ask again on the next one),
             rather than failing while it runs?"""
-            t0 = time.time()
-            while time.time() - t0 < 5 and lodger.engine is e and e.alive() and not self.stopping(e):
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < 5 and lodger.engine is e and e.alive() and not self.stopping(e):
                 time.sleep(0.2)
             return lodger.engine is not e or not e.alive() or self.stopping(e)
 
@@ -1367,8 +1415,9 @@ def make_handler(lodger, key=None, ollama_api=False):
         def whole(self, body, entry, path):
             """A whole answer passed through as llama-server gives it (asked again of the next engine after a
             move: nothing of it was sent yet)."""
+            turn = {}
             for _ in range(4):
-                e = lodger.wait_engine(entry, ping=self.check_gone)
+                e = lodger.wait_engine(entry, ping=self.check_gone, turn=turn)
                 if not e:
                     return self.send_error_json(503, self.unavailable(entry))
                 c = None
@@ -1406,8 +1455,9 @@ def make_handler(lodger, key=None, ollama_api=False):
             streams; a streaming app gets the events as they come (the reply's headers go out with the first one,
             so an error before that keeps its HTTP status), a whole answer is sent once it's complete."""
             ping = (lambda: self.event(":")) if ans.stream else self.check_gone
+            turn = {}
             for attempt in range(6):
-                e = lodger.wait_engine(entry, ping=ping)
+                e = lodger.wait_engine(entry, ping=ping, turn=turn)
                 if not e:
                     return self.fail(ans, 503, self.unavailable(entry))
                 c = None
@@ -1415,7 +1465,7 @@ def make_handler(lodger, key=None, ollama_api=False):
                     with lodger.using(e):
                         req = ans.request(attempt)
                         if req is None:             # the length limit was reached just before the move
-                            return self.complete(ans, entry, "length")
+                            return self.complete(ans, entry, "length", e)
                         if attempt and ans.stream:
                             self.event(ans.moved_note(e.where))
                         c, r = self.upstream(e, req, ans.path, ping=ping)
@@ -1456,8 +1506,18 @@ def make_handler(lodger, key=None, ollama_api=False):
                         c.close()                   # stops the engine writing if the app went away
             return self.fail(ans, 503, "the model kept moving; answer cut short")
 
-        def complete(self, ans, entry, why=None):
-            """The answer is complete (or reached its length limit): end the stream, or send the whole answer."""
+        def complete(self, ans, entry, why=None, e=None):
+            """The answer is complete (or reached its length limit): end the stream, or send the whole answer.
+            `e`: an engine to count the request's tokens with, if the answer's own end never said."""
+            path = e and ans.counting()
+            if path:
+                c = None
+                with contextlib.suppress(Exception):
+                    c, r = self.upstream(e, ans.body, path)
+                    n = json.loads(r.read()).get("input_tokens") if r.status == 200 else None
+                    ans.input_tokens = n if isinstance(n, int) and not isinstance(n, bool) else None
+                if c:
+                    c.close()
             for s in ans.close(entry.name, why):
                 self.event(s)
             if ans.stream:
@@ -1526,11 +1586,15 @@ def make_handler(lodger, key=None, ollama_api=False):
                     c, r = self.upstream(e, body, path, ping=ping)
                     if r.status != 200:
                         return self.plain_fail(r.status, r.read())
+                    last = None
                     for ev in answers.events(r.readline):
                         self.event(ev.text())
                         if ev.data == "[DONE]":
                             return
-                    if not self.running(e):
+                        last = ev
+                    # a clean end: llama-server's own paths (/completion, /infill) end with "stop": true and no
+                    # [DONE]. An engine handing over (grow-back) is no longer the current one but still finishes.
+                    if not (stopped_cleanly(last) or e.alive() and not self.stopping(e)):
                         raise OSError("the engine went away")
             except (OSError, http.client.HTTPException):
                 if not self.client_gone:
@@ -1561,6 +1625,15 @@ def make_handler(lodger, key=None, ollama_api=False):
                 raise
 
     return H
+
+
+def stopped_cleanly(ev):
+    """Is this the last event of a llama-server answer that ended on its own ("stop": true)?"""
+    try:
+        d = json.loads(ev.data) if ev else None
+    except ValueError:
+        return False
+    return isinstance(d, dict) and d.get("stop") is True
 
 
 def ctx_arg(v):
@@ -1650,9 +1723,18 @@ def serve(argv):
     return 0
 
 
-def on_hangup(lodger):
-    """SIGHUP (`systemctl --user reload lodger`, `kill -HUP`): read the model list again (the monitor does it)."""
+def on_hangup(lodger, tty=None):
+    """SIGHUP. Run as a service (`systemctl --user reload lodger`, `kill -HUP`): read the model list again (the
+    monitor does it). Run in a terminal, SIGHUP means the terminal closed: stop, with the models, as Ctrl-C does."""
+    if tty is None:
+        try:
+            tty = os.isatty(sys.stdout.fileno())
+        except (OSError, ValueError, AttributeError):
+            tty = False
+
     def handler(sig, frame):
+        if tty:
+            raise KeyboardInterrupt
         lodger.reload_wanted = "SIGHUP"
     return handler
 
@@ -1713,7 +1795,7 @@ def ask(argv):
             print("lodger serve was started with an API key: pass --api-key-file PATH or set LODGER_API_KEY",
                   file=sys.stderr)
         return 1
-    t0, words, timings = time.time(), 0, None
+    t0, words, timings = time.monotonic(), 0, None
     for line in r:
         s = line.decode(errors="replace").strip()
         if s.startswith(": lodger"):
@@ -1732,7 +1814,7 @@ def ask(argv):
             timings = d.get("timings") or timings
     print(flush=True)
     if timings:
-        print(f"[{timings.get('predicted_per_second', 0):.1f} words/s writing, {time.time() - t0:.0f} s total]", file=sys.stderr)
+        print(f"[{timings.get('predicted_per_second', 0):.1f} words/s writing, {time.monotonic() - t0:.0f} s total]", file=sys.stderr)
     return 0
 
 def read_key(path=None):

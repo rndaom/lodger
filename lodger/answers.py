@@ -112,13 +112,26 @@ def anthropic_error(status, msg):
     return {"type": "error", "error": {"type": ANTHROPIC_TYPES.get(status, "api_error"), "message": msg}}
 
 
+def structured(body):
+    """Is the answer held to a shape (JSON schema, JSON mode, a grammar)? Half of one can't be continued: the next
+    engine would start the shape again."""
+    text = body.get("text")
+    formats = (body.get("response_format"), text.get("format") if isinstance(text, dict) else None,
+               body.get("output_format"))
+    return bool(body.get("json_schema") or body.get("grammar")
+                or any(isinstance(f, dict) and f.get("type", "text") != "text" for f in formats))
+
+
 class Answer:
     """What the three shapes share. Subclasses set `path` (llama-server's) and the shape's parts."""
     path = None
     limit_keys = LIMITS
+    count_path = None               # where the engine counts the tokens of the app's request, if it can
 
     def __init__(self, body, stream):
         self.body, self.stream = body, stream
+        self.structured = structured(body)
+        self.input_tokens = None    # the request's tokens, when the engine never said (counted at count_path)
         self.limit = next((positive_int(body[k]) for k in self.limit_keys if k in body), None)
         self.pieces = 0             # pieces of text or thinking written so far, over all engines
         self.before = 0             # ... before the engine now writing started
@@ -134,7 +147,7 @@ class Answer:
     def wrote(self):
         """A piece of text or thinking came: count it and its writing time."""
         self.pieces += 1
-        now = time.time()
+        now = time.monotonic()
         self.t_first = self.t_first or now
         self.t_last = now
 
@@ -166,6 +179,12 @@ class Answer:
         """Why the answer can't be continued after a move (None: it can)."""
         if self.tooling:
             return "the model moved while writing a tool call; please retry"
+        if self.structured and self.pieces:
+            return "the model moved while writing a structured answer; please retry"
+        return None
+
+    def counting(self):
+        """Where to count the request's tokens before close() (None: not needed)."""
         return None
 
     def usage(self, u, prompt_key, answer_key, total_key="total_tokens"):
@@ -201,9 +220,6 @@ class Chat(Answer):
 
     def __init__(self, body, stream):
         super().__init__(body, stream)
-        rf = body.get("response_format")
-        self.structured = bool(body.get("json_schema") or body.get("grammar")
-                               or isinstance(rf, dict) and rf.get("type", "text") != "text")
         self.several = (positive_int(body.get("n")) or 1) > 1
         self.ended = set()          # several answers: the ones that are complete
         msgs = list(body.get("messages") or [])
@@ -241,8 +257,6 @@ class Chat(Answer):
     def cut(self):
         if self.several and self.first:
             return "the model moved while writing several answers; please retry"
-        if self.structured and (self.content or self.reasoning):
-            return "the model moved while writing a structured answer; please retry"
         return super().cut()
 
     def moved_note(self, where):
@@ -592,6 +606,12 @@ class Responses(Answer):
         self.ids = {}               # ... its item ids -> ours
         self.cont = None
         self.completed = None
+        self.opened = set()         # response.created / in_progress passed on (once, from whichever engine)
+
+    count_path = "/v1/responses/input_tokens"
+
+    def counting(self):
+        return None if self.done or self.input_tokens is not None else self.count_path
 
     def continue_from(self, req):
         last = self.out[-1] if self.out else None
@@ -672,7 +692,10 @@ class Responses(Answer):
         if kind in ("response.created", "response.in_progress"):
             if self.resp is None and isinstance(d.get("response"), dict):
                 self.resp = d["response"]
-            return same if not self.attempt else []
+            if kind in self.opened:
+                return []                               # a continuation: the app has its start already
+            self.opened.add(kind)
+            return [self.event(kind, d)] if self.stream and self.attempt else same
         changed = bool(self.attempt)
         if kind == "response.output_item.added":
             item = d.get("item") if isinstance(d.get("item"), dict) else {}
@@ -750,8 +773,10 @@ class Responses(Answer):
                 out += self.finishing(our)
         r = {"id": (self.resp or {}).get("id") or "resp_lodger", "object": "response", "created_at": int(self.t0),
              "status": "incomplete" if why == "length" else "completed", "model": entry_name,
-             "output": [self.full(o) for o in self.out],
-             "usage": {"input_tokens": 0, "output_tokens": self.pieces, "total_tokens": self.pieces}}
+             "output": [self.full(o) for o in self.out]}
+        if self.input_tokens is not None:                   # never a made-up count
+            r["usage"] = {"input_tokens": self.input_tokens, "output_tokens": self.pieces,
+                          "total_tokens": self.input_tokens + self.pieces}
         if why == "length":
             r["incomplete_details"] = {"reason": "max_output_tokens"}
         self.completed = r

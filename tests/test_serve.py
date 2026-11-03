@@ -96,7 +96,7 @@ class Front:
     def cooling(self, entry):
         return None
 
-    def wait_engine(self, entry, limit=None, ping=None):
+    def wait_engine(self, entry, limit=None, ping=None, turn=None):
         self.engine = self.engines.pop(0) if self.engines else None
         return self.engine
 
@@ -334,7 +334,7 @@ class LodgerTest(unittest.TestCase):
         self.assertIsNone(l.wait_engine(l.models["b"], limit=5))
         self.assertLess(time.time() - t0, 1)                # says so at once
         self.assertTrue(l.status()["models"]["b"].startswith("didn't start"))
-        l.failed["b"] = (time.time() - 1, "old")
+        l.failed["b"] = (time.monotonic() - 1, "old")
         self.assertIsNone(l.cooling(l.models["b"]))         # tried again after the cool-down
         self.assertEqual(l.status()["models"]["b"], "ok")
 
@@ -382,7 +382,7 @@ class LodgerTest(unittest.TestCase):
             l.last_fail = "not enough memory"
             l.tick(nb)
             self.assertIsNone(l.engine)
-            self.assertGreater(l.retry_at, time.time())
+            self.assertGreater(l.retry_at, time.monotonic())
             l.tick(nb)                                      # too soon: no new try
             self.assertEqual(launch.call_count, 1)
             l.retry_at = 0

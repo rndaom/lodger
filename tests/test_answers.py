@@ -228,6 +228,19 @@ class MessagesTest(FrontCase):
         self.assertEqual(text, "one two")
         self.assertEqual([n for n, _ in out][-2:], ["message_delta", "message_stop"])
 
+    def test_usage_when_the_engine_never_started_the_message(self):
+        a = Engine(events=[], cut=True)
+        b = Engine(events=[msg_start("msg_2", 30)], cut=True,
+                   paths={"/v1/messages/count_tokens": {"input_tokens": 9}})
+        c = Engine(events=[], paths={"/v1/messages/count_tokens": {"input_tokens": 9}})
+        msgs = [block_start(0, "text"), *[block_delta(0, "text_delta", f"{i} ") for i in range(100)]]
+        b.events += msgs
+        status, _, data = self.front(a, b, c).post("/v1/messages", MSG)
+        out = json.loads(data)
+        self.assertEqual(out["stop_reason"], "max_tokens")
+        self.assertEqual(out["usage"]["input_tokens"], 30)
+        self.assertEqual(out["usage"]["output_tokens"], 100)
+
     def test_tool_call_cut_ends_with_an_anthropic_error(self):
         a = Engine(events=[msg_start(), block_start(0, "tool_use", name="ls"),
                            block_delta(0, "input_json_delta", "{\"p")], cut=True)
@@ -369,6 +382,35 @@ class ResponsesTest(FrontCase):
         completed = out[-1][1]["response"]
         self.assertEqual(completed["usage"]["output_tokens"], 3)
         self.assertEqual(completed["output"][1]["content"][0]["text"], "one two")
+
+    def test_move_before_the_first_event_still_creates_the_response(self):
+        a = Engine(events=[], cut=True)
+        b = Engine(events=[*resp_start("resp_2"), *msg_added(0, "msg_b"), text_delta(0, "msg_b", "hi"),
+                           *resp_end(0, "msg_b", "hi", "resp_2", 1)], done=False)
+        status, _, data = self.front(a, b).post("/v1/responses", dict(RESP, stream=True))
+        kinds = [n for n, _ in sse(data)]
+        self.assertEqual(kinds[:2], ["response.created", "response.in_progress"])
+        self.assertEqual(kinds.count("response.created"), 1)
+
+    def test_structured_answer_is_not_continued(self):
+        ask = dict(RESP, stream=True, text={"format": {"type": "json_schema", "name": "n", "schema": {}}})
+        a = Engine(events=[*resp_start(), *msg_added(0, "msg_a"), text_delta(0, "msg_a", '{"a": ')], cut=True)
+        b = Engine(events=[*resp_start("resp_2"), *msg_added(0, "msg_b"), text_delta(0, "msg_b", "1}"),
+                           *resp_end(0, "msg_b", "1}", "resp_2", 1)], done=False)
+        status, _, data = self.front(a, b).post("/v1/responses", ask)
+        name, d = sse(data)[-1]
+        self.assertEqual(name, "response.failed")
+        self.assertIn("structured", d["response"]["error"]["message"])
+        self.assertEqual(b.calls, [])
+
+    def test_usage_of_an_answer_ended_at_its_limit_after_a_move(self):
+        a = Engine(events=[*resp_start(), *msg_added(0, "msg_a"), *[text_delta(0, "msg_a", f"{i} ") for i in range(50)]],
+                   cut=True)
+        b = Engine(events=[], paths={"/v1/responses/input_tokens": {"object": "response.input_tokens", "input_tokens": 12}})
+        status, _, data = self.front(a, b).post("/v1/responses", RESP)
+        out = json.loads(data)
+        self.assertEqual(out["status"], "incomplete")
+        self.assertEqual(out["usage"], {"input_tokens": 12, "output_tokens": 50, "total_tokens": 62})
 
     def test_tool_call_cut_fails_the_response(self):
         a = Engine(events=[*resp_start(), rev("response.output_item.added", output_index=0, item={
