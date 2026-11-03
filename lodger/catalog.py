@@ -148,12 +148,16 @@ def load(paths=None, config=CONFIG):
             cfg = tomllib.load(f)
     defaults = cfg.get("defaults", {})
     ignore = listed(cfg, "ignore")
-    named = {}
+    named, again = {}, []
     for name, sec in cfg.get("models", {}).items():
         if not isinstance(sec, dict) or not isinstance(sec.get("file"), str):
             raise ValueError(f'[models.{name}] in models.toml needs file = "path/to/model.gguf"')
         path = os.path.abspath(os.path.expanduser(sec["file"]))
-        named[path] = (name, {k: v for k, v in sec.items() if k not in ("file", "skip")}, sec.get("skip"))
+        own = (name, {k: v for k, v in sec.items() if k not in ("file", "skip")}, sec.get("skip"))
+        if path in named:                            # the first section of a file counts; the others are listed, not served
+            again.append((path, own, named[path][0]))
+            continue
+        named[path] = own
     files = [os.path.abspath(os.path.expanduser(p)) for p in paths] if paths else []
     if not paths:
         files = list(named)
@@ -182,4 +186,8 @@ def load(paths=None, config=CONFIG):
             name = f"{name}-{n}"
         first.setdefault(name, p)
         out[name] = Entry(name, p, {**defaults, **own}, skip)
+    for p, (name, own, _), used in again:
+        if (not paths or p in files) and name not in out:
+            out[name] = Entry(name, p, {**defaults, **own}, f"its file is already served as {used}; one [models.NAME] "
+                              "section per file")
     return out, cfg.get("default")

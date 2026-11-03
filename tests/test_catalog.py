@@ -206,6 +206,15 @@ file = "{self.dir}/does-not-exist.gguf"
         with self.assertRaises(ValueError):
             catalog.load(config=self.write_config("[models.x]\ntemp = 1\n"))
 
+    def test_one_file_in_two_sections_keeps_the_first_and_says_so(self):
+        f = touch(self.dir, "m", "M.gguf")
+        config = self.write_config(f'[models.fast]\nfile = "{f}"\ntemp = 0.2\n[models.slow]\nfile = "{f}"\ntemp = 1.0\n')
+        models, _ = catalog.load(config=config)
+        self.assertEqual(list(models), ["fast", "slow"])
+        self.assertEqual((models["fast"].settings, models["fast"].skip), ({"temp": 0.2}, None))
+        self.assertIn("already served as fast", models["slow"].skip or "")
+        self.assertEqual(list(catalog.load([f], config=config)[0]), ["fast", "slow"])
+
     def test_a_name_used_twice_keeps_the_first(self):
         a = touch(self.dir, "a", "Same.gguf")
         b = touch(self.dir, "b", "Same.gguf")
