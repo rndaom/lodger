@@ -35,3 +35,14 @@ jobs:
           "$RUNNER_TEMP/venv/bin/lodger" doctor
           "$RUNNER_TEMP/venv/bin/python" -m lodger.cli --help
           "$RUNNER_TEMP/venv/bin/lodger" setup --help
+
+  aur:
+    # the AUR package builds from this commit, passes its tests, installs and runs on Arch Linux
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build, test, install and run lodger-git
+        run: packaging/aur/check.sh "$GITHUB_WORKSPACE"

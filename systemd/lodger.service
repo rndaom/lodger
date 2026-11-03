@@ -3,11 +3,12 @@
 # ~/.config/lodger/models.toml, one at a time. A model loads on the first request for it and unloads
 # after 10 minutes unused, so lodger holds no memory while you don't use it.
 #
-# Install (lodger installed with pipx, uv tool or pip --user, which put it in ~/.local/bin):
+# Install: `lodger service install` writes this unit for the lodger you run it with (pipx, uv tool, pip, a
+# checkout's bin/lodger), then enables and starts it. Packages install it with ExecStart=/usr/bin/lodger.
+# By hand (lodger in ~/.local/bin):
 #   cp systemd/lodger.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload && systemctl --user enable --now lodger
-# lodger somewhere else (a package in /usr/bin, or a checkout's bin/lodger): keep this file and point
-# ExecStart there with `systemctl --user edit lodger`:
+# Other settings without editing the file: `systemctl --user edit lodger`, then
 #   [Service]
 #   ExecStart=
 #   ExecStart=/path/to/lodger serve --allow-gpu --idle 10

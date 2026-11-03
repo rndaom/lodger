@@ -1,0 +1,26 @@
+pkgbase = lodger-git
+	pkgdesc = Local AI that lives on your PC as a guest: it steps aside when your apps need the graphics card, then grows back
+	pkgver = 0.1.0.r0.g0000000
+	pkgrel = 1
+	url = https://github.com/rndaom/lodger
+	arch = any
+	license = MIT
+	makedepends = git
+	makedepends = python-build
+	makedepends = python-installer
+	makedepends = python-setuptools
+	makedepends = python-wheel
+	depends = python
+	depends = python-gguf
+	optdepends = llama.cpp: the engine (or `lodger setup` downloads a release build into ~/.local/share/lodger)
+	optdepends = llama.cpp-vulkan: the engine with Vulkan, for any graphics card
+	optdepends = llama.cpp-hip: the engine with ROCm, for AMD cards
+	optdepends = llama.cpp-cuda: the engine with CUDA, for NVIDIA cards
+	optdepends = vulkan-mesa-layers: Vulkan device selection on PCs with more than one graphics card
+	optdepends = glib2: lodger models rm moves files to the Trash with gio
+	provides = lodger
+	conflicts = lodger
+	source = git+https://github.com/rndaom/lodger.git
+	sha256sums = SKIP
+
+pkgname = lodger-git

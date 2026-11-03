@@ -1,0 +1,53 @@
+# Maintainer: Random <65575762+rndaom@users.noreply.github.com>
+pkgname=lodger-git
+_pkgname=lodger
+pkgver=0.1.0.r0.g0000000
+pkgrel=1
+pkgdesc="Local AI that lives on your PC as a guest: it steps aside when your apps need the graphics card, then grows back"
+arch=(any)
+url="https://github.com/rndaom/lodger"
+license=(MIT)
+depends=(python python-gguf)
+makedepends=(git python-build python-installer python-setuptools python-wheel)
+optdepends=(
+  'llama.cpp: the engine (or `lodger setup` downloads a release build into ~/.local/share/lodger)'
+  'llama.cpp-vulkan: the engine with Vulkan, for any graphics card'
+  'llama.cpp-hip: the engine with ROCm, for AMD cards'
+  'llama.cpp-cuda: the engine with CUDA, for NVIDIA cards'
+  'vulkan-mesa-layers: Vulkan device selection on PCs with more than one graphics card'
+  'glib2: lodger models rm moves files to the Trash with gio'
+)
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+source=("git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$_pkgname"
+  local v
+  v=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' lodger/__init__.py)
+  printf '%s.r%s.g%s' "$v" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+build() {
+  cd "$_pkgname"
+  python -m build --wheel --no-isolation
+}
+
+check() {
+  cd "$_pkgname"
+  # the tests read recorded machines, never this PC's cards or settings
+  LODGER_CONFIG=/dev/null XDG_STATE_HOME="$srcdir/state" python -m unittest discover tests
+}
+
+package() {
+  cd "$_pkgname"
+  python -m installer --destdir="$pkgdir" dist/*.whl
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  # the user unit, for `systemctl --user enable --now lodger` (or `lodger service install`)
+  sed 's|^ExecStart=%h/.local/bin/lodger |ExecStart=/usr/bin/lodger |' systemd/lodger.service \
+    | install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/user/lodger.service"
+  grep -q '^ExecStart=/usr/bin/lodger ' "$pkgdir/usr/lib/systemd/user/lodger.service"
+  install -Dm644 -t "$pkgdir/usr/share/doc/$_pkgname" README.md CHANGELOG.md \
+    systemd/config.example.toml systemd/models.example.toml
+}
