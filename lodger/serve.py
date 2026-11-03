@@ -42,7 +42,7 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-from . import catalog, config, engine, fence, ollama, plan as planner, reserve, sysmem
+from . import answers, catalog, config, engine, fence, ollama, plan as planner, reserve, sysmem
 from .launch import GAME_GUARD_FLAG, RUNS, Watchdog, card_fields, gpu_blockers, router_coming, unit_cgroup, unit_props
 from .neighbors import Neighbors
 
@@ -872,18 +872,17 @@ def check(method, path, headers, key=None):
 
 
 CHAT_PATHS = ("/v1/chat/completions", "/chat/completions")
-# llama-server's other answers, passed through as they are (an answer cut by a move ends with an error)
-PASS_PATHS = ("/v1/completions", "/completions", "/v1/embeddings", "/embeddings", "/infill", "/tokenize",
-              "/detokenize", "/apply-template")
-STREAM_PATHS = ("/v1/completions", "/completions", "/infill")   # of those, the ones that can stream
-
-
-def positive_int(v):
-    try:
-        v = int(v)
-    except (TypeError, ValueError):
-        return None
-    return v if v > 0 else None
+MESSAGES_PATHS = ("/v1/messages",)            # Anthropic's API (Claude Code and other Anthropic clients)
+RESPONSES_PATHS = ("/v1/responses", "/responses")   # OpenAI's Responses API (Codex and other newer OpenAI clients)
+# llama-server's other answers, passed through as they are (a streamed one cut by a move ends with an error, a whole
+# one is asked again of the next engine)
+PASS_PATHS = ("/v1/completions", "/completions", "/completion", "/v1/embeddings", "/embeddings", "/embedding",
+              "/infill", "/tokenize", "/detokenize", "/apply-template", "/v1/rerank", "/rerank", "/v1/reranking",
+              "/reranking", "/v1/messages/count_tokens", "/v1/responses/input_tokens", "/responses/input_tokens",
+              "/v1/chat/completions/input_tokens", "/chat/completions/input_tokens")
+STREAM_PATHS = ("/v1/completions", "/completions", "/completion", "/infill")   # of those, the ones that can stream
+ANTHROPIC_PATHS = ("/v1/messages", "/v1/messages/count_tokens")   # errors in Anthropic's shape
+positive_int = answers.positive_int
 
 
 OLLAMA_PATHS = ("/api/chat", "/api/generate", "/api/embed", "/api/embeddings", "/api/show")
@@ -895,6 +894,8 @@ def make_handler(lodger, key=None, ollama_api=False):
         protocol_version = "HTTP/1.1"
         timeout = 300                            # a connection that sends nothing for this long is closed
         cors = None                              # the local page's origin to allow in the answer, if any
+        api = "openai"                           # the shape of this request's answers: openai, anthropic or ollama
+        started = False                          # a streamed reply's headers went out
         head = False                             # HEAD: headers only
         client_gone = False
         oreq = False                             # this request is Ollama's kind: answered in its shape
@@ -924,8 +925,9 @@ def make_handler(lodger, key=None, ollama_api=False):
         def send_error_json(self, code, msg, close=False):
             if close:
                 self.close_connection = True
-            self.send_json(code, {"error": msg} if self.oreq else {"error": {"message": msg, "code": code}},
-                           [("Connection", "close")] if close else ())
+            body = ({"error": msg} if self.api == "ollama" else answers.anthropic_error(code, msg)
+                    if self.api == "anthropic" else answers.openai_error(code, msg))
+            self.send_json(code, body, [("Connection", "close")] if close else ())
 
         def send_text(self, code, text):
             body = text.encode()
@@ -946,7 +948,9 @@ def make_handler(lodger, key=None, ollama_api=False):
             """Answer a request that may not reach lodger (see check()); True if it was refused."""
             origin = self.headers.get("Origin")
             self.cors = origin if origin and local_origin(origin) else None
-            self.oreq = ollama_api and self.route().startswith("/api/")
+            route = self.route()
+            self.oreq = ollama_api and route.startswith("/api/")
+            self.api = "ollama" if self.oreq else "anthropic" if route in ANTHROPIC_PATHS else "openai"
             why = check(self.command, self.path, self.headers, key)
             if not why:
                 return False
@@ -955,7 +959,8 @@ def make_handler(lodger, key=None, ollama_api=False):
             self.close_connection = True
             if code == 401:
                 extra.append(("WWW-Authenticate", 'Bearer realm="lodger"'))
-            self.send_json(code, {"error": msg} if self.oreq else
+            self.send_json(code, {"error": msg} if self.oreq else answers.anthropic_error(code, msg)
+                           if self.api == "anthropic" else
                            {"error": {"message": msg, "type": "forbidden" if code == 403 else "unauthorized"}}, extra)
             return True
 
@@ -969,7 +974,8 @@ def make_handler(lodger, key=None, ollama_api=False):
             self.send_header("Allow", "GET, HEAD, POST, OPTIONS")
             if self.cors:
                 self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
-                self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+                self.send_header("Access-Control-Allow-Headers",
+                                 "Authorization, Content-Type, X-Api-Key, Anthropic-Version, Anthropic-Beta")
                 self.send_header("Access-Control-Max-Age", "600")
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -1061,6 +1067,7 @@ def make_handler(lodger, key=None, ollama_api=False):
             if self.refused():
                 return
             self.nd = self.conv = None
+            self.started = False
             raw = self.body()
             if raw is None:
                 return
@@ -1071,7 +1078,7 @@ def make_handler(lodger, key=None, ollama_api=False):
                 return self.send_json(200, {"moving": on_card, "where": lodger.engine.where if lodger.engine else None})
             if self.oreq:
                 return self.ollama_post(raw, path)
-            if path not in CHAT_PATHS + PASS_PATHS:
+            if path not in CHAT_PATHS + MESSAGES_PATHS + RESPONSES_PATHS + PASS_PATHS:
                 return self.send_error_json(404, "not found")
             body = self.json_body(raw)
             if body is None:
@@ -1079,27 +1086,34 @@ def make_handler(lodger, key=None, ollama_api=False):
             name = body.get("model")
             if name is not None and not isinstance(name, str):
                 return self.send_error_json(400, "'model' must be a string")
-            if path in CHAT_PATHS and not isinstance(body.get("messages", []), list):
+            if path in CHAT_PATHS + MESSAGES_PATHS and not isinstance(body.get("messages", []), list):
                 return self.send_error_json(400, "'messages' must be a list")
+            if path in RESPONSES_PATHS and not isinstance(body.get("input", ""), (str, list)):
+                return self.send_error_json(400, "'input' must be text or a list")
             if body.get("stream") is not None and not isinstance(body["stream"], bool):
                 return self.send_error_json(400, "'stream' must be true or false")
             entry = lodger.find(name)
             if not entry:
                 return self.no_model(name)
-            self.answer(body, entry, path if path in PASS_PATHS else "/v1/chat/completions")
+            self.answer(body, entry, "/v1/chat/completions" if path in CHAT_PATHS else
+                        "/v1/responses" if path in RESPONSES_PATHS else path)
 
         def answer(self, body, entry, path):
-            """Answer `body` with `entry`'s engine at llama-server's `path` (chat answers continue after a move)."""
+            """Answer `body` with `entry`'s engine at llama-server's `path`. Chat, Messages and Responses answers
+            continue after a move (converse), whole ones too; the others are passed through."""
             with lodger.cv:
                 lodger.active += 1
             try:
-                if not body.get("stream") or path not in STREAM_PATHS + ("/v1/chat/completions",):
+                stream = bool(body.get("stream"))
+                kind = (answers.Chat if path == "/v1/chat/completions" else answers.Messages if path == "/v1/messages"
+                        else answers.Responses if path == "/v1/responses" else None)
+                if kind and not (kind is answers.Chat and not stream and answers.Chat.wanted_plain(body)):
+                    self.converse(kind(body, stream), entry)
+                elif not stream or path not in STREAM_PATHS + ("/v1/chat/completions",):
                     self.whole(body, entry, path)
-                elif path == "/v1/chat/completions":
-                    self.stream(body, entry)
                 else:
                     self.relay(body, entry, path)
-                if self.nd and body.get("stream") and not self.client_gone:
+                if self.nd and stream and self.started and not self.client_gone:
                     self.send_lines(self.nd.close())   # llama-server's own kinds of stream end without [DONE]
             except OSError:                          # the app went away while lodger answered it
                 self.close_connection = True
@@ -1155,11 +1169,12 @@ def make_handler(lodger, key=None, ollama_api=False):
                 self.client_gone = self.close_connection = True
             return gone
 
-        def upstream(self, e, body, path="/v1/chat/completions", ping=False):
+        def upstream(self, e, body, path, ping=None):
             """Send the request to the engine and wait until its answer starts, however long it takes to read the
-            conversation (on the processor, a long one can take many minutes). Meanwhile, a streaming app gets
-            a ping now and then; one that went away ends the wait (and closing the connection stops the engine
-            working on it). Raises OSError if the engine or the app goes away."""
+            conversation (on the processor, a long one can take many minutes). Meanwhile ping() is called every
+            PING seconds: it pings a streaming app, or checks that an app waiting for a whole answer is still there
+            (an app that went away ends the wait, and closing the connection stops the engine working on it).
+            Raises OSError if the engine or the app goes away."""
             c = http.client.HTTPConnection(HOST, e.port, timeout=10)
             try:
                 c.request("POST", path, json.dumps(body), {"Content-Type": "application/json", **e.auth()})
@@ -1167,9 +1182,7 @@ def make_handler(lodger, key=None, ollama_api=False):
                     if not e.alive():
                         raise OSError("the engine went away")
                     if ping:
-                        self.event(":")
-                    elif self.app_gone():
-                        raise OSError("the app went away")
+                        ping()
                 c.sock.settimeout(SILENCE)      # once it answers, llama-server sends something every 30 s
                 return c, c.getresponse()
             except BaseException:
@@ -1196,17 +1209,16 @@ def make_handler(lodger, key=None, ollama_api=False):
             return f"{entry.name} is not available right now: " + (entry.skip or lodger.cooling(entry) or lodger.why)
 
         def whole(self, body, entry, path):
+            """A whole answer passed through as llama-server gives it (asked again of the next engine after a
+            move: nothing of it was sent yet)."""
             for _ in range(4):
-                try:
-                    e = lodger.wait_engine(entry, ping=self.check_gone)
-                except OSError:
-                    return
+                e = lodger.wait_engine(entry, ping=self.check_gone)
                 if not e:
                     return self.send_error_json(503, self.unavailable(entry))
                 c = None
                 try:
                     with lodger.using(e):
-                        c, r = self.upstream(e, body, path)
+                        c, r = self.upstream(e, body, path, ping=self.check_gone)
                         data = r.read()
                 except (OSError, http.client.HTTPException) as ex:
                     if self.client_gone:
@@ -1223,6 +1235,8 @@ def make_handler(lodger, key=None, ollama_api=False):
                     continue
                 if self.conv:
                     return self.send_json(*self.conv(r.status, data))
+                if r.status != 200 and self.api == "anthropic":
+                    return self.send_json(r.status, answers.anthropic_error(r.status, answers.error_message(data)))
                 self.send_response(r.status)
                 self.send_header("Content-Type", r.getheader("Content-Type") or "application/json")
                 self.send_header("Content-Length", str(len(data)))
@@ -1231,7 +1245,107 @@ def make_handler(lodger, key=None, ollama_api=False):
                 return
             self.send_error_json(503, "the model kept moving; try again")
 
+        def converse(self, ans, entry):
+            """An answer that continues after a move (answers.py: chat, Messages, Responses). The engine always
+            streams; a streaming app gets the events as they come (the reply's headers go out with the first one,
+            so an error before that keeps its HTTP status), a whole answer is sent once it's complete."""
+            ping = (lambda: self.event(":")) if ans.stream else self.check_gone
+            for attempt in range(6):
+                e = lodger.wait_engine(entry, ping=ping)
+                if not e:
+                    return self.fail(ans, 503, self.unavailable(entry))
+                c = None
+                try:
+                    with lodger.using(e):
+                        req = ans.request(attempt)
+                        if req is None:             # the length limit was reached just before the move
+                            return self.complete(ans, entry, "length")
+                        if attempt and ans.stream:
+                            self.event(ans.moved_note(e.where))
+                        c, r = self.upstream(e, req, ans.path, ping=ping)
+                        if r.status != 200:
+                            err = r.read()
+                            if self.running(e):
+                                return self.fail(ans, r.status, err)
+                            raise OSError("the engine went away")
+                        if not (r.getheader("Content-Type") or "").startswith("text/event-stream"):
+                            data = r.read()                 # not a stream after all: passed on whole, as it is
+                            if ans.stream:
+                                return self.fail(ans, 502, "the model's engine didn't stream its answer")
+                            return self.send_json(*self.conv(200, data)) if self.conv else self.send_raw(200, data)
+                        look = time.monotonic() + 1
+                        for ev in answers.events(r.readline):
+                            for s in ans.feed(ev):
+                                self.event(s)
+                            if ans.done:
+                                return self.complete(ans, entry)
+                            if not ans.stream and time.monotonic() > look:
+                                look = time.monotonic() + 1
+                                self.check_gone()
+                        raise OSError("stream ended early")
+                except (OSError, http.client.HTTPException):
+                    if self.client_gone:
+                        return
+                    if ans.finished:                # only the end was cut off
+                        return self.complete(ans, entry)
+                    if not self.moved(e):
+                        return self.fail(ans, 502, "the model's engine stopped answering; please retry")
+                    why = ans.cut()
+                    if why and ans.stream:
+                        return self.fail(ans, 503, why)
+                    if why:
+                        ans.reset()                 # the app has seen none of it: start over
+                finally:
+                    if c:
+                        c.close()                   # stops the engine writing if the app went away
+            return self.fail(ans, 503, "the model kept moving; answer cut short")
+
+        def complete(self, ans, entry, why=None):
+            """The answer is complete (or reached its length limit): end the stream, or send the whole answer."""
+            for s in ans.close(entry.name, why):
+                self.event(s)
+            if ans.stream:
+                return
+            status, obj = ans.failure or (200, ans.whole(entry.name))
+            if self.conv:
+                return self.send_json(*self.conv(status, json.dumps(obj).encode()))
+            self.send_json(status, obj)
+
+        def fail(self, ans, status, err):
+            """End the answer with an error: in the stream if one was started, else as the HTTP reply (an
+            engine's own error answer for OpenAI's shapes as it is). `err`: lodger's words, or the engine's reply."""
+            msg = answers.error_message(err) if isinstance(err, bytes) else err
+            if self.started:
+                with contextlib.suppress(OSError):
+                    for s in ans.stream_error(msg):
+                        self.event(s)
+                return
+            if self.oreq or self.api == "anthropic" or not isinstance(err, bytes):
+                return self.send_error_json(status, msg)
+            self.send_raw(status, err)
+
+        def send_raw(self, status, data):
+            """An engine's JSON reply, as it is."""
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            if not self.head:
+                self.wfile.write(data)
+
+        def plain_fail(self, status, err):
+            """fail() for a passed-through stream (llama-server's own kinds)."""
+            msg = answers.error_message(err) if isinstance(err, bytes) else err
+            if self.started:
+                with contextlib.suppress(OSError):
+                    self.event("data: " + answers.compact({"error": {"message": msg, "code": status}}))
+                return
+            if self.oreq or not isinstance(err, bytes):
+                return self.send_error_json(status, msg)
+            self.send_raw(status, err)
+
         def start_stream(self):
+            self.started = True
             self.send_response(200)
             self.send_header("Content-Type", "application/x-ndjson" if self.nd else "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -1239,160 +1353,41 @@ def make_handler(lodger, key=None, ollama_api=False):
             self.end_headers()
             self.close_connection = True
 
-        def wait_pinging(self, entry):
-            """wait_engine() for a streaming app, pinging it while a model loads or switches (minutes, sometimes):
-            it keeps the app's connection open, and an app that went away ends the wait (OSError)."""
-            return lodger.wait_engine(entry, ping=lambda: self.event(":"))
-
         def check_gone(self):
-            """wait_engine()'s ping for an app waiting for a whole answer: one that went away ends the wait."""
+            """The ping for an app waiting for a whole answer: one that went away ends the wait (OSError)."""
             if self.app_gone():
                 raise OSError("the app went away")
 
-        def stream_error(self, msg):
-            self.event(f"data: {json.dumps({'error': {'message': msg}})}")
-
         def relay(self, body, entry, path):
             """A streaming answer of the other kinds (e.g. /v1/completions): passed through; a move ends it."""
-            self.start_stream()
-            e = self.wait_pinging(entry)
+            ping = lambda: self.event(":")  # noqa: E731
+            e = lodger.wait_engine(entry, ping=ping)
             if not e:
-                return self.stream_error(self.unavailable(entry))
+                return self.plain_fail(503, self.unavailable(entry))
             c = None
             try:
                 with lodger.using(e):
-                    c, r = self.upstream(e, body, path, ping=True)
+                    c, r = self.upstream(e, body, path, ping=ping)
                     if r.status != 200:
-                        return self.stream_error(r.read().decode(errors="replace")[:500])
-                    while True:
-                        line = r.readline()
-                        if not line and self.running(e):
-                            return                  # llama-server's own kinds of stream end by closing
-                        if not line.endswith(b"\n"):
-                            raise OSError("stream ended early")
-                        s = line.decode(errors="replace").rstrip("\r\n")
-                        if s:
-                            self.event(s)
-                        if s == "data: [DONE]":
+                        return self.plain_fail(r.status, r.read())
+                    for ev in answers.events(r.readline):
+                        self.event(ev.text())
+                        if ev.data == "[DONE]":
                             return
+                    if not self.running(e):
+                        raise OSError("the engine went away")
             except (OSError, http.client.HTTPException):
                 if not self.client_gone:
-                    with contextlib.suppress(OSError):
-                        self.stream_error("the model moved while writing; please retry")
+                    self.plain_fail(503, "the model moved while writing; please retry")
             finally:
                 if c:
                     c.close()
 
-        def stream(self, body, entry):
-            self.start_stream()
-            content, reasoning, pieces, tooling, finished = "", "", 0, False, False
-            first = {}                              # id, created and model of the answer's first piece
-            limit = next((positive_int(body[k]) for k in ("max_tokens", "max_completion_tokens", "n_predict")
-                          if k in body), None)
-            rf = body.get("response_format")
-            structured = bool(body.get("json_schema") or body.get("grammar")
-                              or isinstance(rf, dict) and rf.get("type", "text") != "text")
-            msgs = list(body.get("messages") or [])
-            last = msgs[-1] if msgs and isinstance(msgs[-1], dict) else {}
-            # the app's own start of the answer (a trailing assistant message) is continued, not repeated
-            prefill = msgs.pop() if (last.get("role") == "assistant" and isinstance(last.get("content"), str)
-                                     and not last.get("tool_calls")) else None
-            try:
-                for attempt in range(6):
-                    e = self.wait_pinging(entry)
-                    if not e:
-                        return self.stream_error(self.unavailable(entry))
-                    c = None
-                    try:
-                        with lodger.using(e):
-                            req = dict(body)
-                            if attempt:
-                                if content or reasoning:
-                                    # continue the answer where the last engine stopped (llama-server continues
-                                    # a trailing assistant message)
-                                    partial = {"role": "assistant", "content": (prefill or {}).get("content", "") + content}
-                                    if reasoning or (prefill or {}).get("reasoning_content"):
-                                        partial["reasoning_content"] = (prefill or {}).get("reasoning_content", "") + reasoning
-                                    req["messages"] = msgs + [partial]
-                                if limit:
-                                    if limit - pieces <= 0:
-                                        return self.end_answer(first, entry, "length")
-                                    for k in ("max_tokens", "max_completion_tokens", "n_predict"):
-                                        if k in req:
-                                            req[k] = limit - pieces
-                                self.event(f": lodger restarted the model on the {e.where}; continuing the answer")
-                            c, r = self.upstream(e, req, ping=True)
-                            if r.status != 200:
-                                err = r.read().decode(errors="replace")
-                                if self.running(e):
-                                    return self.stream_error(err[:500])
-                                raise OSError("engine went away")
-                            while True:
-                                line = r.readline()
-                                if not line.endswith(b"\n"):
-                                    raise OSError("stream ended early")
-                                s = line.decode(errors="replace").rstrip("\r\n")
-                                if not s:
-                                    continue
-                                if s == "data: [DONE]":
-                                    return self.event(s)
-                                if not s.startswith("data:"):
-                                    self.event(s)          # pings and other fields
-                                    continue
-                                try:
-                                    d = json.loads(s[5:])
-                                except ValueError:
-                                    raise OSError("broken line from the engine") from None
-                                if not isinstance(d, dict):
-                                    raise OSError("broken line from the engine")
-                                if "error" in d:
-                                    return self.event(s)
-                                choice = (d.get("choices") or [{}])[0]
-                                choice = choice if isinstance(choice, dict) else {}
-                                delta = choice.get("delta") or {}
-                                text = delta.get("content") or ""
-                                think = delta.get("reasoning_content") or ""
-                                if not first:
-                                    first = {"id": d.get("id"), "created": d.get("created"), "model": d.get("model")}
-                                elif attempt:
-                                    if set(delta) <= {"role"} and not choice.get("finish_reason") and not d.get("usage"):
-                                        continue           # the restarted engine's "assistant here" piece: said already
-                                    d.update({k: v for k, v in first.items() if v is not None})   # one answer to the app
-                                    s = "data: " + json.dumps(d, ensure_ascii=False)
-                                pieces += bool(text or think)
-                                tooling = tooling or bool(delta.get("tool_calls"))
-                                content += text
-                                reasoning += think
-                                finished = finished or bool(choice.get("finish_reason"))
-                                self.event(s)
-                    except (OSError, http.client.HTTPException):
-                        if self.client_gone:
-                            return
-                        if finished:                # only the end was cut off
-                            return self.event("data: [DONE]")
-                        if not self.moved(e):
-                            return self.stream_error("the model's engine stopped answering; please retry")
-                        if tooling:                 # half a tool call can't be continued; the app asks again
-                            return self.stream_error("the model moved while writing a tool call; please retry")
-                        if structured and (content or reasoning):
-                            return self.stream_error("the model moved while writing a structured answer; please retry")
-                    finally:
-                        if c:
-                            c.close()               # stops the engine writing if the app went away
-                self.stream_error("the model kept moving; answer cut short")
-            except OSError:                         # the app went away while lodger was telling it something
-                return
-
-        def end_answer(self, first, entry, why):
-            """End a continued answer that has reached the app's length limit."""
-            self.event("data: " + json.dumps({"id": first.get("id") or "chatcmpl-lodger", "object": "chat.completion.chunk",
-                                              "created": first.get("created") or int(time.time()),
-                                              "model": first.get("model") or entry.name,
-                                              "choices": [{"index": 0, "delta": {}, "finish_reason": why}]}))
-            self.event("data: [DONE]")
-
         def event(self, s):
-            """One server-sent event to the app (an Ollama app gets what it turns into instead)."""
+            """One server-sent event to the app (an Ollama app gets what it turns into instead); the first one
+            sends the reply's headers."""
+            if not self.started:
+                self.start_stream()
             if self.nd:
                 return self.send_lines(self.nd.feed(s))
             self.write((s + "\n\n").encode())
