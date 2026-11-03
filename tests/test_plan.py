@@ -12,14 +12,18 @@ from tests.support import machine
 MiB, GiB = 1 << 20, 1 << 30
 
 
-def fake_model(layers=40, dense=100 * MiB, experts=0, embd=500 * MiB, ctx_train=262144, other=0):
+def fake_model(layers=40, dense=100 * MiB, experts=0, embd=500 * MiB, ctx_train=262144, other=0, output=None,
+               kinds=None, quant=(), tied=False, kv=None):
     m = object.__new__(Model)
     m.path, m.files = "/models/fake.gguf", ["/models/fake.gguf"]
     m.layers = {i: {"dense": dense, "experts": experts} for i in range(layers)}
-    m.token_embd, m.output, m.other = embd, embd, other
+    m.token_embd, m.output, m.other = embd, embd if output is None else output, other
     m.n_layer = layers
     m.meta = {"name": "Fake", "arch": "fake", "ctx_train": ctx_train,
               "expert_count": 128 if experts else None, "expert_used": 8 if experts else None}
+    if kinds:
+        m.kinds = dict(enumerate(kinds))
+    m.quant, m.tied, m.kv = list(quant), tied, kv or {}
     return m
 
 
@@ -409,8 +413,125 @@ class PlanSafetyTest(PlanBase):
         tight = self.make(m, card=None, target_ctx=8192, ram_avail=a["ram_anon_est"] + 6 * GiB, extra=["--no-mmap"])
         self.assertIsNotNone(tight["refuse"])
         self.assertIsNone(self.make(m, card=None, target_ctx=8192, ram_avail=a["ram_anon_est"] + 6 * GiB)["refuse"])
-        self.assertEqual(plan.own_costs(["--load-mode", "mmap", "--no-mmap"]), (["--load-mode", "mmap"], 0, True, True))
-        self.assertEqual(plan.own_costs(["--load-mode", "mmap"])[3], False)
+        o = plan.own_costs(["--load-mode", "mmap", "--no-mmap"])
+        self.assertEqual((o["fit"], o["proj"], o["proj_card"], o["held"]), (["--load-mode", "mmap"], 0, True, True))
+        self.assertFalse(plan.own_costs(["--load-mode", "mmap"])["held"])
+
+
+class PlacementTest(PlanBase):
+    """Where llama.cpp really puts things, and what really takes memory."""
+
+    def test_part_of_the_layers_on_the_card_brings_the_output_layer(self):
+        # llama.cpp's -ngl N puts the output layer on the card first, then the last N - 1 layers: a plan that
+        # counted N layers and left the output in RAM put a whole output layer (here 1 GiB) on the card unplanned
+        m = fake_model(layers=40, dense=300 * MiB, output=GiB)
+        with machine("desktop-amd"):
+            p = self.make(m, vram_free=8 * GiB, target_ctx=8192)
+        self.assertIsNone(p["refuse"])
+        self.assertLess(p["ngl_layers"], 40)
+        self.assertTrue(p["output_on_gpu"])
+        self.assertEqual(p["ngl"], p["ngl_layers"] + 1)
+        on_card = range(40 - p["ngl_layers"], 40)
+        ctx = fake_probe(m, p["ctx"])["context"] * p["ngl_layers"] / 40
+        self.assertEqual(p["gpu_est"], int(m.dense(on_card) + m.output + ctx + 300 * MiB + p["overhead"]))
+        self.assertLessEqual(p["gpu_bytes"], p["vram_budget"])
+        # and the output layer isn't counted in RAM too
+        self.assertEqual(p["ram_weights"], m.token_embd + m.dense(range(40 - p["ngl_layers"])))
+
+    def test_context_of_hybrid_layers_goes_where_it_is_kept(self):
+        # 3 recurrent layers to 1 attention layer: the context's growing part is all in the attention layers,
+        # the fixed part (recurrent state) in the recurrent ones
+        def probe(model, ctx, gpu=None, extra=(), dev=None):
+            return {"model": 0, "context": 400 * MiB + ctx * 64 * 1024, "compute": 300 * MiB}
+        m = fake_model(layers=40, dense=300 * MiB, kinds=["recr", "recr", "recr", "attn"] * 10)
+        with machine("desktop-amd"), mock.patch("lodger.plan.probe", side_effect=probe):
+            c = plan.Costs(m, 4096, 16384)
+            share = plan.layer_ctx(m, c, 16384)
+            p = self.make(m, vram_free=8 * GiB, target_ctx=16384, min_ctx=16384)
+        self.assertAlmostEqual(share[3], 16384 * 64 * 1024 / 10)
+        self.assertAlmostEqual(share[0], 400 * MiB / 30)
+        self.assertAlmostEqual(sum(share.values()), c.context(16384))
+        self.assertEqual(p["ctx"], 16384)
+        n = p["ngl_layers"]
+        self.assertLess(n, 40)
+        card = sum(share[i] for i in range(40 - n, 40))
+        self.assertEqual(p["gpu_est"], int(m.dense(range(40 - n, 40)) + m.output + card + 300 * MiB + p["overhead"]))
+
+    def test_sliding_windows_are_asked_at_their_bend(self):
+        # sliding-window layers grow only up to window + ubatch: a straight line between 4096 and 131072 would
+        # put 32768 words far below llama.cpp's own number
+        def ctx_bytes(c):
+            return c * 16 * 1024 + min(c, 8192 + 512) * 64 * 1024
+        asked = []
+
+        def probe(model, ctx, gpu=None, extra=(), dev=None):
+            asked.append(ctx)
+            return {"model": 0, "context": ctx_bytes(ctx), "compute": 300 * MiB}
+        m = fake_model(kinds=["swa", "swa", "swa", "attn"] * 10, kv={"fake.attention.sliding_window": 8192})
+        with mock.patch("lodger.plan.probe", side_effect=probe):
+            bend = plan.window_bend(m, [])
+            c = plan.Costs(m, 4096, 131072, [], [bend])
+            self.assertEqual(plan.window_bend(m, ["--ubatch-size", "1024"]), 9216)
+            self.assertIsNone(plan.window_bend(m, ["--swa-full"]))
+        self.assertEqual(bend, 8704)
+        self.assertEqual(sorted(asked), [4096, 8704, 131072])
+        for ctx in (4096, 8192, 16384, 32768, 65536, 131072):
+            self.assertGreaterEqual(c.context(ctx), ctx_bytes(ctx) - 1, ctx)
+        self.assertEqual(c.per_tok, 16 * 1024)
+        self.assertEqual(c.fixed(65536), 8704 * 64 * 1024)
+        with machine("desktop-amd"), mock.patch("lodger.plan.probe", side_effect=probe):
+            p = self.make(m, card=None, target_ctx=32768)
+        self.assertIn(8704, asked[3:])
+
+    def test_weights_repacked_for_the_processor_are_its_own_memory(self):
+        # on x86 with AVX2, llama.cpp copies Q4_0 weights the processor runs into its own memory (a faster layout):
+        # they can't be dropped like file pages (seen: LFM2.5 2.6B, 1.3 GiB of 1.7 GiB in RssAnon)
+        quant = [("dense", i, 2, 4096, 100 * MiB) for i in range(40)] + [("output", -1, 2, 4096, 500 * MiB)]
+        m = fake_model(quant=quant)
+        with mock.patch("lodger.plan.cpu_repacks", return_value={}):
+            a = self.make(m, card=None, target_ctx=8192)
+        with mock.patch("lodger.plan.cpu_repacks", return_value={2: 8}):
+            b = self.make(m, card=None, target_ctx=8192)
+            c = self.make(m, card=None, target_ctx=8192, extra=["--no-repack"])
+            with machine("desktop-amd"):
+                d = self.make(m, vram_free=6 * GiB, target_ctx=8192)
+        self.assertEqual(b["ram_copied"], 40 * 100 * MiB + 500 * MiB)
+        self.assertEqual(b["ram_anon_est"] - a["ram_anon_est"], b["ram_copied"])
+        self.assertEqual(c["ram_anon_est"], a["ram_anon_est"])
+        self.assertEqual(d["ram_copied"], (40 - d["ngl_layers"]) * 100 * MiB)     # only what stays on the processor
+        self.assertTrue(any("repack" in w for w in b["why"]), b["why"])
+
+    def test_cpu_features_decide_what_is_repacked(self):
+        cases = {"flags\t\t: fpu sse2 avx avx2 fma\n": {2: 8, 12: 8, 20: 8, 39: 8},
+                 "flags\t\t: fpu avx2 avx512f\n": {2: 8, 12: 8, 20: 8, 39: 8, 10: 8},
+                 "flags\t\t: fpu sse2 avx\n": {},
+                 "Features\t: fp asimd asimddp\n": {2: 4, 8: 4, 41: 4, 20: 4, 39: 4, 12: 8, 13: 8, 14: 8},
+                 "": {}}
+        for text, want in cases.items():
+            with mock.patch("lodger.host.read", return_value=text):
+                self.assertEqual(plan.cpu_repacks(), want, text)
+
+    def test_tied_output_on_the_processor_is_read_once(self):
+        m = fake_model(tied=True, output=500 * MiB)
+        with mock.patch("lodger.plan.cpu_repacks", return_value={}):
+            p = self.make(m, card=None, target_ctx=8192)
+        self.assertEqual(p["ram_copied"], 0)
+        self.assertEqual(p["ram_weights"], m.token_embd + m.dense() + m.output)
+        self.assertTrue(any("Weights kept in RAM: 4.4 GiB" in w for w in p["why"]), p["why"])   # 40 x 100 + 500 MiB
+
+    def test_context_checkpoints_are_counted_in_ram(self):
+        # llama-server keeps up to 32 copies of a hybrid model's recurrent state (or sliding windows) per slot
+        def probe(model, ctx, gpu=None, extra=(), dev=None):
+            return {"model": 0, "context": 150 * MiB + ctx * 64 * 1024, "compute": 300 * MiB}
+        hybrid = fake_model(kinds=["recr", "recr", "recr", "attn"] * 10)
+        with mock.patch("lodger.plan.probe", side_effect=probe):
+            a = self.make(fake_model(), card=None, target_ctx=8192)
+            b = self.make(hybrid, card=None, target_ctx=8192)
+            c = self.make(hybrid, card=None, target_ctx=8192, extra=["--ctx-checkpoints", "4"])
+        self.assertEqual(b["ram_anon_est"] - a["ram_anon_est"], 32 * 150 * MiB)
+        self.assertEqual(c["ram_anon_est"] - a["ram_anon_est"], 4 * 150 * MiB)
+        self.assertEqual(a["checkpoint_bytes"], 0)
+        self.assertEqual(b["checkpoint_bytes"], 32 * 150 * MiB)
 
 
 class ProbeCacheTest(unittest.TestCase):

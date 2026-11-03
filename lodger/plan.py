@@ -1,13 +1,15 @@
 """Decide where each piece of a model goes, from live free memory minus margins.
 Every number is in bytes. Each choice records a plain-words reason in plan["why"]."""
+import bisect
 import contextlib
 import hashlib
 import json
 import os
 import threading
 
-from . import config, engine, fence, reserve, sysmem
+from . import config, engine, fence, host, reserve, sysmem
 from . import gpu as gpus
+from . import model as models
 from .model import Model
 
 MiB, GiB = sysmem.MiB, sysmem.GiB
@@ -27,6 +29,8 @@ SMALLEST_CTX = 256               # shorter than this isn't a usable context (and
 CTX_CAP = 131072
 CTX_SHARE = 0.25
 MMPROJ_SCRATCH = GiB             # a vision projector's working space for pictures, on top of its file size
+CHECKPOINTS = 32                 # llama-server's --ctx-checkpoints: copies of the state a model can't roll back
+UBATCH = 512                     # llama.cpp's default --ubatch-size
 # --load-mode values that keep the weights in the program's own memory instead of the page cache (older builds:
 # --no-mmap, --mlock): then Linux can't drop them again, so they must fit in RAM
 HELD = {"none", "mlock", "mmap+mlock", "dio"}
@@ -150,18 +154,91 @@ def learned_overhead(pci=None, backend=None):
 
 class Costs:
     """Context memory grows in a straight line with the context length (plus a fixed part, e.g. the
-    state of recurrent layers), so two probes give it for any length."""
+    state of recurrent layers), so two probes give it for any length. Sliding-window layers grow only up to
+    their window: then llama.cpp is also asked at the bend (`points`), and lengths between are read off the
+    straight pieces."""
 
-    def __init__(self, model, lo, hi, extra=()):
-        a, b = probe(model, lo, extra=extra), probe(model, hi, extra=extra)
+    def __init__(self, model, lo, hi, extra=(), points=()):
+        got = {c: probe(model, c, extra=extra) for c in sorted({lo, hi} | {p for p in points if lo < p < hi})}
+        a, b = got[lo], got[hi]
         grow = b["context"] - a["context"]
         self.per_tok = grow / (hi - lo) if hi > lo and grow > 0 else 0.0
         # no growth measured: the larger of the two, so neither length is planned below llama.cpp's own number
         self.base = a["context"] - self.per_tok * lo if self.per_tok else max(a["context"], b["context"])
-        self.compute = max(a["compute"], b["compute"])
+        self.compute = max(g["compute"] for g in got.values())
+        self.points = sorted((c, g["context"]) for c, g in got.items()) if len(got) > 2 else None
+        if self.points:
+            # what grows with every word once the windows are full: the slope of the last piece
+            (c1, v1), (c2, v2) = self.points[-2:]
+            self.per_tok = max(0.0, (v2 - v1) / (c2 - c1))
 
     def context(self, ctx):
-        return int(self.base + self.per_tok * ctx)
+        if not self.points:
+            return int(self.base + self.per_tok * ctx)
+        pts = self.points
+        i = max(0, min(len(pts) - 2, bisect.bisect_right([c for c, _ in pts], ctx) - 1))
+        (c1, v1), (c2, v2) = pts[i], pts[i + 1]
+        return max(v1, v2) if v1 >= v2 else int(v1 + (v2 - v1) * (ctx - c1) / (c2 - c1))
+
+    def fixed(self, ctx):
+        """The part of context(ctx) that doesn't grow with more words (recurrent state, full sliding windows)."""
+        return max(0, self.context(ctx) - int(self.per_tok * ctx))
+
+
+def window_bend(m, extra):
+    """The context length where a model's sliding windows stop growing (llama.cpp: window + ubatch, in steps
+    of 256), or None."""
+    w = m.kv.get(f"{m.meta.get('arch')}.attention.sliding_window")
+    if type(w) is not int or w <= 0 or "--swa-full" in extra:
+        return None
+    ub = UBATCH
+    args = list(extra)
+    for i, a in enumerate(args[:-1]):
+        if a == "--ubatch-size" and str(args[i + 1]).isdigit():
+            ub = int(args[i + 1])
+    return (w + ub + 255) // 256 * 256
+
+
+def layer_ctx(m, costs, ctx):
+    """Each layer's part of the context memory at `ctx` (they add up to costs.context(ctx)): what grows with the
+    context belongs to the layers that see all of it, the fixed rest (recurrent state, sliding windows) to the
+    layers that keep it. Where the file doesn't say which layers those are, each layer that keeps anything gets
+    the same (layers that keep nothing, e.g. multi-token prediction, none)."""
+    L = m.n_layer
+    total = costs.context(ctx)
+    kinds = m.kinds or {}
+    grows = [i for i in range(L) if kinds.get(i) == "attn"]
+    keeps = [i for i in range(L) if kinds.get(i) in ("swa", "recr")]
+    out = dict.fromkeys(range(L), 0.0)
+    if not grows and not keeps:
+        grows = list(range(L))
+    if not grows or not keeps:
+        for i in grows or keeps:
+            out[i] = total / len(grows or keeps)
+        return out
+    tok = min(total, costs.per_tok * ctx)
+    for i in grows:
+        out[i] = tok / len(grows)
+    for i in keeps:
+        out[i] = (total - tok) / len(keeps)
+    return out
+
+
+def cpu_repacks():
+    """The weights llama.cpp copies into a faster layout in its own memory when they run on this processor
+    (ggml-cpu/repack.cpp): {ggml type: rows a tensor must be a multiple of}. Such copies can't be dropped and read
+    again like the model file's pages, so they count as the model's own memory."""
+    flags, arm = set(), False
+    for line in (host.read("/proc/cpuinfo") or "").splitlines():
+        k, _, v = line.partition(":")
+        if k.strip() in ("flags", "Features"):
+            flags |= set(v.split())
+            arm |= k.strip() == "Features"
+    if "avx2" in flags:                                 # Q4_0 Q4_K IQ4_NL MXFP4, and Q2_K with AVX-512
+        return {2: 8, 12: 8, 20: 8, 39: 8} | ({10: 8} if "avx512f" in flags else {})
+    if arm and flags & {"asimddp", "i8mm"}:             # Q4_0 Q8_0 Q1_0 IQ4_NL MXFP4 Q4_K Q5_K Q6_K
+        return {2: 4, 8: 4, 41: 4, 20: 4, 39: 4, 12: 8, 13: 8, 14: 8}
+    return {}
 
 
 def physical_cores():
@@ -193,26 +270,30 @@ def ladder(target, lo, ctx_train):
 
 def own_costs(extra):
     """llama-server options that change memory but that llama-fit-params can't size (see catalog.py) are
-    counted here. Returns (options for llama-fit-params, vision projector bytes, projector on the card,
-    weights held in RAM)."""
-    fit, proj, proj_card, held = [], 0, True, False
+    counted here. Returns {fit: options for llama-fit-params, proj: vision projector bytes, proj_card: projector on
+    the card, held: weights held in RAM, repack: weights may be repacked, checkpoints: --ctx-checkpoints}."""
+    out = {"fit": [], "proj": 0, "proj_card": True, "held": False, "repack": True, "checkpoints": CHECKPOINTS}
     args = iter(extra)
     for a in args:
         if a == "--mmproj":
-            proj = os.path.getsize(next(args))
+            out["proj"] = os.path.getsize(next(args))
         elif a in ("--mmproj-offload", "--no-mmproj-offload"):
-            proj_card = a == "--mmproj-offload"
+            out["proj_card"] = a == "--mmproj-offload"
         elif a in ("--no-mmap", "--mlock"):
-            held = True
+            out["held"] = True
         elif a == "--mmap":
             pass
+        elif a == "--ctx-checkpoints":
+            out["checkpoints"] = max(0, int(next(args)))
         elif a == "--load-mode":
             v = next(args)
-            held = v in HELD
-            fit += [a, v]
+            out["held"] = v in HELD
+            out["fit"] += [a, v]
         else:
-            fit.append(a)
-    return fit, proj, proj_card, held
+            if a in ("--repack", "--no-repack"):
+                out["repack"] = a == "--repack"
+            out["fit"].append(a)
+    return out
 
 
 def with_margin(x):
@@ -229,14 +310,15 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
     lodger counts itself.
     card: the graphics card (default: the one lodger chose; None: there is none); mem: /proc/meminfo numbers;
     keep: graphics memory to leave for the desktop (default: reserve.py). model_path may also be a Model."""
-    m = model_path if isinstance(model_path, Model) else Model(model_path)
+    m = model_path if isinstance(model_path, Model) else models.load(model_path)
     L = m.n_layer
     why = []
     if not L:
         return {"model": m.path, "name": m.meta.get("name"), "why": why, "refuse":
                 f"lodger can't place this model: it has no layers it knows ({m.meta.get('arch') or 'unknown'} design)"}
     leave_gpu = max(0, leave_gpu)
-    extra, proj, proj_card, held = own_costs(extra)
+    own_extra = own_costs(extra)
+    extra, proj, proj_card, held = (own_extra[k] for k in ("fit", "proj", "proj_card", "held"))
     card = sysmem.dgpu() if card is AUTO else card
     mem = sysmem.meminfo() if mem is None else mem
     cfg = config.get()
@@ -269,7 +351,8 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
 
     auto = target_ctx is None
     ctxs = ladder(CTX_CAP if auto else target_ctx, min(min_ctx, CTX_CAP if auto else target_ctx), m.meta.get("ctx_train"))
-    costs = Costs(m, ctxs[-1], ctxs[0], extra)
+    bend = window_bend(m, extra)
+    costs = Costs(m, ctxs[-1], ctxs[0], extra, [bend] if bend else ())
 
     def fair(budget):
         """Automatic context: the lengths that cost at most CTX_SHARE of `budget` (at least the shortest)."""
@@ -349,37 +432,61 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
                        f"{max(0, ram_budget) / GiB:.1f} GiB RAM is left for the rest.")
     on_cpu_layers = set(range(L - plan["ngl_layers"]))
     experts_on_cpu = on_cpu_layers | set(range(plan["n_cpu_moe"]))
+    out_cpu = not plan["output_on_gpu"]
     cpu_weights = (m.token_embd + m.other + m.dense(on_cpu_layers) + m.experts(experts_on_cpu)
-                   + (0 if plan["output_on_gpu"] else m.output))
+                   + (m.output if out_cpu else 0))
 
     # RAM: weights not on the card are read from the model file through the page cache. Linux can drop
     # those pages again at any time, so they can't crash anything (if they don't fit they are read from
     # the SSD again: slow, not dangerous). Memory llama.cpp allocates itself can't be dropped: that part
-    # must fit or we refuse. Weights held in RAM (no-mmap, mlock) and a projector off the card count as that.
-    own = PROC_OVERHEAD + (proj_need if gpu is None or not proj_card else 0) + (cpu_weights if held else 0)
+    # must fit or we refuse. Weights held in RAM (no-mmap, mlock) and a projector off the card count as that,
+    # and so do weights llama.cpp repacks for the processor (a copy in a faster layout).
+    if held:
+        copied, cached = cpu_weights, 0
+    else:
+        copied, copied_out = m.repacked(cpu_repacks() if own_extra["repack"] else {}, on_cpu_layers, experts_on_cpu, out_cpu)
+        # a tied output layer reads token_embd's own pages (unless it is copied): counted once
+        cached = cpu_weights - copied - (m.token_embd - copied_out if m.tied and out_cpu else 0)
+    # llama-server's context checkpoints (one per answer, up to --ctx-checkpoints) copy what a model can't roll
+    # back, its recurrent state or sliding windows, into RAM
+    n_ckpt = own_extra["checkpoints"] if any(k in ("swa", "recr") for k in m.kinds.values()) else 0
+
+    def own_at(c):
+        return (PROC_OVERHEAD + (proj_need if gpu is None or not proj_card else 0) + copied
+                + n_ckpt * costs.fixed(c))
     if held:
         why.append(f"The weights kept in RAM ({cpu_weights / GiB:.1f} GiB) are held there (no-mmap or mlock), "
                    "so they count as the model's own memory.")
+    elif copied:
+        why.append(f"llama.cpp copies {copied / GiB:.1f} GiB of the weights the processor runs into a faster layout "
+                   "(repack) in its own memory: counted as the model's own.")
     if gpu is None:
-        ctx = next((c for c in fair(ram_budget) if costs.context(c) + costs.compute + own <= ram_budget), None)
+        def need(c):
+            return costs.context(c) + costs.compute + own_at(c)
+        ctx = next((c for c in fair(ram_budget) if need(c) <= ram_budget), None)
         if ctx is None:
             plan["refuse"] = (f"Not enough RAM even on the processor: context + scratch need "
-                              f"{(costs.context(ctxs[-1]) + costs.compute + own) / GiB:.1f} GiB, "
+                              f"{need(ctxs[-1]) / GiB:.1f} GiB, "
                               f"{max(0, ram_budget) / GiB:.1f} GiB can be spared.")
             return plan
         plan["ctx"] = ctx
-        anon = costs.context(ctx) + costs.compute + own
+        anon = need(ctx)
         why.append(f"Running on the processor only, context {ctx} words.")
     else:
-        cpu_ctx_share = costs.context(plan["ctx"]) * len(on_cpu_layers) / L if plan["ngl_layers"] < L else 0
-        anon = int(cpu_ctx_share) + (costs.compute if plan["n_cpu_moe"] or plan["ngl_layers"] < L else 0) + own
-    cached = 0 if held else cpu_weights             # held weights are counted above: none of it is page cache
+        share = layer_ctx(m, costs, plan["ctx"])
+        cpu_ctx_share = sum(share[i] for i in on_cpu_layers) if plan["ngl_layers"] < L else 0
+        anon = int(cpu_ctx_share) + (costs.compute if plan["n_cpu_moe"] or plan["ngl_layers"] < L else 0) + own_at(plan["ctx"])
+    if n_ckpt and costs.fixed(plan["ctx"]):
+        why.append(f"Context checkpoints: llama-server keeps up to {n_ckpt} copies of the state this model can't roll "
+                   f"back ({costs.fixed(plan['ctx']) / MiB:.0f} MiB each) in RAM, counted as the model's own.")
     if auto:
         why.append(f"Context chosen automatically: {plan['ctx']} words (this model can take up to "
                    f"{m.meta.get('ctx_train') or '?'}; lodger aims for at most {CTX_CAP} and lets the context use "
                    f"at most {CTX_SHARE:.0%} of the memory it may take, so the model itself keeps the rest).")
     plan["ram_anon_est"] = anon
     plan["ram_weights"] = cpu_weights
+    plan["ram_copied"] = copied
+    plan["checkpoint_bytes"] = n_ckpt * costs.fixed(plan["ctx"])
 
     if with_margin(anon) > ram_budget:
         plan["refuse"] = (f"Not enough RAM: the model needs {with_margin(anon) / GiB:.1f} GiB of its own memory "
@@ -388,11 +495,11 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
     room_for_weights = ram_budget - with_margin(anon)
     if cached > room_for_weights:
         plan["slow"] = True
-        why.append(f"Weights kept in RAM: {cpu_weights / GiB:.1f} GiB, but only {room_for_weights / GiB:.1f} GiB fits "
+        why.append(f"Weights kept in RAM: {cached / GiB:.1f} GiB, but only {room_for_weights / GiB:.1f} GiB fits "
                    "next to your apps. The rest is read from the SSD again as needed: safe, but slower.")
     else:
         plan["slow"] = False
-        why.append(f"Weights kept in RAM: {cpu_weights / GiB:.1f} GiB (fits).")
+        why.append(f"Weights kept in RAM: {cached / GiB:.1f} GiB (fits).")
     # RAM fence: own memory + as much of the weights as we can spare; never more than the budget
     plan["ram_cap"] = max(with_margin(anon), min(ram_budget, with_margin(anon) + cached + GiB))
     # llama-server keeps earlier conversations in RAM to answer them faster later (8 GiB by default, counted
@@ -432,14 +539,17 @@ def place_on_gpu(m, costs, ctxs, budget, why, overhead):
             if c != ctxs[0]:
                 why.append(f"Context shortened from {ctxs[0]} to {c} words to make room.")
             return gpu_plan(L, L, L - k, c, need, True)
-    # 3. fewer whole layers on the card (all experts in RAM)
+    # 3. fewer whole layers on the card (all experts in RAM). llama.cpp's -ngl N puts the output layer on the
+    #    card first, then the last N - 1 layers
     for c in ctxs:
-        per_layer_ctx = costs.context(c) / L
-        need = costs.compute + overhead + m.other         # pieces outside the layers: counted on the card to be safe
+        share = layer_ctx(m, costs, c)
+        need = costs.compute + overhead + m.other + m.output    # pieces outside the layers: counted on the card to be safe
+        if with_margin(need) > budget:
+            continue
         n = 0
         while n < L:
-            i = L - 1 - n                       # llama.cpp puts the LAST layers on the card
-            add = m.layers.get(i, {"dense": 0})["dense"] + per_layer_ctx
+            i = L - 1 - n
+            add = m.layers.get(i, {"dense": 0})["dense"] + share[i]
             if with_margin(need + add) > budget:
                 break
             need += add
@@ -449,16 +559,16 @@ def place_on_gpu(m, costs, ctxs, budget, why, overhead):
                 why.append(f"Only {n} of {L} layers would fit on the graphics card: too little to be worth "
                            "taking memory from your apps.")
                 return None
-            why.append(f"Only {n} of {L} layers fit on the card (context {c} words, "
+            why.append(f"Only {n} of {L} layers fit on the card, with the output layer (context {c} words, "
                        f"{with_margin(need) / GiB:.1f} GiB with margin); the rest runs on the processor.")
-            return gpu_plan(L, n, L if m.is_moe else 0, c, int(need), False)
+            return gpu_plan(L, n, L if m.is_moe else 0, c, int(need), True)
     why.append(f"Nothing useful fits on the graphics card ({budget / GiB:.1f} GiB usable after margins).")
     return None
 
 
 def gpu_plan(L, n_layers, n_cpu_moe, ctx, need, output_on_gpu):
     return {
-        "ngl": L + 1 if output_on_gpu else n_layers,   # -ngl counts the output layer as one more
+        "ngl": n_layers + 1 if output_on_gpu else n_layers,   # -ngl counts the output layer as one more
         "ngl_layers": n_layers,
         "n_cpu_moe": n_cpu_moe,
         "ctx": ctx,
