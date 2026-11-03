@@ -158,8 +158,9 @@ class Engine:
     count = 0
     all = []
 
-    def __init__(self, plan, entry, out):
+    def __init__(self, plan, entry, out, card=planner.AUTO):
         Engine.count += 1
+        card = sysmem.dgpu() if card is planner.AUTO else card     # one card for the command, watchdog and notes
         self.plan, self.entry, self.out = plan, entry, out
         self.port = free_port()
         self.where = "card" if plan["ngl"] else "processor"
@@ -178,7 +179,7 @@ class Engine:
                    "-t", str(p["threads"]), "--fit", "off", "-np", "1", "--host", HOST, "--port", str(self.port),
                    "--api-key-file", self.keyfile, "--no-webui", "-a", entry.name,
                    "--cache-ram", str(p.get("cache_ram_mib", 0))] + entry.args()
-            dargs, env = engine.device_args(p["ngl"], sysmem.dgpu(), p["n_cpu_moe"])
+            dargs, env = engine.device_args(p["ngl"], card, p["n_cpu_moe"])
             cmd += dargs
             with open(os.path.join(out, "plan.json"), "w") as f:
                 json.dump({**p, "cmd": cmd, "env": env, "fence": fence.mode()[0]}, f, indent=1)
@@ -195,7 +196,8 @@ class Engine:
         Engine.all.append(self)                  # from here on, lodger's exit stops it whatever happens next
         self.proc = self.fence.proc
         try:
-            self.wd = Watchdog(self.fence, bool(p["ngl"]), out, log=os.path.join(out, "engine.log"), keep=p["keep"])
+            self.wd = Watchdog(self.fence, bool(p["ngl"]), out, log=os.path.join(out, "engine.log"), keep=p["keep"],
+                               card=card)
             self.wd.start()
         except BaseException:                    # never leave a model running without its watchdog
             self.fence.stop()
@@ -204,7 +206,7 @@ class Engine:
             self.logf.close()
             raise
         try:
-            self.card = card_fields(bool(p["ngl"]))   # which card and backend, for calibration
+            self.card = card_fields(bool(p["ngl"]), card)   # which card and backend, for calibration
         except (Exception, SystemExit):
             self.card = {}
 
@@ -495,7 +497,7 @@ class Lodger:
             write_pi_config(self.a.port, [model_info(e) for e in ok], self.default,
                             pi_key(self.a.api_key, self.a.api_key_file))
 
-    def make_plan(self, on_card):
+    def make_plan(self, on_card, card=planner.AUTO):
         e = self.cur
         self.decide_ctx(e)
         if e.skip:
@@ -503,7 +505,7 @@ class Lodger:
         try:
             return planner.make(e.path, target_ctx=e.ctx, min_ctx=e.ctx if on_card else self.a.min_ctx,
                                 cpu_only=not on_card, extra=e.planning_args(),
-                                leave_gpu=self.a.leave_gpu * MiB, threads=self.a.threads, device_check=on_card,
+                                leave_gpu=self.a.leave_gpu * MiB, threads=self.a.threads, device_check=on_card, card=card,
                                 why_gpu_off=None if on_card else (self.why_off_card or "the card is not wanted now"))
         except (Exception, SystemExit) as ex:   # a failed llama.cpp probe must not take the server down
             return {"refuse": f"planning failed: {ex}"}
@@ -550,16 +552,17 @@ class Lodger:
         """Start an engine for the current model (card if wanted and possible, else processor) and wait until
         it answers. card_only: give up instead of falling back to the processor. Returns the Engine, or None
         (self.last_fail says why)."""
+        card = sysmem.dgpu()                     # one card for the checks, the plan, the command and the watchdog
         if want_card:
             self.why_off_card = self.a.allow_gpu and self.pausable_busy()
             if not self.why_off_card:
                 if self.a.allow_gpu:
                     self.pause_others()
-                self.why_off_card = gpu_blockers(self.a.allow_gpu, sysmem.dgpu())
+                self.why_off_card = gpu_blockers(self.a.allow_gpu, card)
         if card_only and self.why_off_card:
             self.last_fail = self.why_off_card
             return None
-        p = self.make_plan(want_card and not self.why_off_card)
+        p = self.make_plan(want_card and not self.why_off_card, card)
         if p["refuse"] or (card_only and not p["ngl"]):
             self.last_fail = p["refuse"] or "it doesn't fit on the graphics card now"
             if p["refuse"]:
@@ -571,7 +574,7 @@ class Lodger:
         out = os.path.join(self.out, f"engine-{n}-{self.cur.name}-{'card' if p['ngl'] else 'processor'}")
         try:
             os.makedirs(out, exist_ok=True)
-            e = Engine(p, self.cur, out)
+            e = Engine(p, self.cur, out, card)
         except (Exception, SystemExit) as ex:   # e.g. llama.cpp's files were moved, the fence can't be made
             self.last_fail = f"it couldn't be started ({ex})"
             self.note(f"can't start {self.cur.name}: {self.last_fail}")
