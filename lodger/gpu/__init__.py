@@ -9,6 +9,11 @@ Adding a kind of card: write lodger/gpu/<vendor>.py with
                       still counts for `gpu = "auto"`, ranked by the size seen while it was awake
   usage(dev, pids)    {pid: {vram, gtt, busy_ns, cycles}} (for drivers with DRM fdinfo: fdinfo.usage, plus
                       a row in fdinfo.DRIVERS)
+  busy(dev)           (optional) how busy the whole card's 3D/compute engine is, 0..1, or None; never wakes
+                      the card (only called while it's awake). With fdinfo, lodger sees only its own user's
+                      apps: this and the card's memory use are how it notices other users' (neighbors.py)
+  has_busy(dev)       (optional) whether busy() can be read on this card, without reading it
+  sees_every_app      (optional) True if usage() covers every user's apps (NVML), so no such fallback is needed
 add its kernel driver to BACKENDS, and tell lodger/engine.py how llama.cpp finds the card."""
 import re
 
@@ -67,6 +72,30 @@ class Device:
 
     def usage(self, pids):
         return self.backend.usage(self, pids)
+
+    @property
+    def sees_every_app(self):
+        """usage() covers every user's apps (NVML). fdinfo, which the kernel shows only for the user's own
+        processes, doesn't."""
+        return getattr(self.backend, "sees_every_app", False)
+
+    def has_busy(self):
+        fn = getattr(self.backend, "has_busy", None)
+        return bool(fn and fn(self))
+
+    def busy(self):
+        """How busy the whole card is right now (3D/compute, 0..1), or None (the driver doesn't say, or it sleeps)."""
+        fn = getattr(self.backend, "busy", None)
+        return fn(self) if fn and not self.asleep() else None
+
+    def whole(self):
+        """The whole card's numbers, for apps lodger can't look into: {busy (0..1), used (bytes on the card)},
+        None where unknown (used: also on built-in graphics, whose own memory is a sliver of RAM); or None
+        where usage() lists every app anyway."""
+        if self.sees_every_app:
+            return None
+        m = None if self.integrated else self.memory()
+        return {"busy": self.busy(), "used": m["used"] if m else None}
 
     def free(self, mem=None, meminfo=None):
         """Graphics memory free right now in bytes, or None if unknown. Built-in graphics share RAM: what

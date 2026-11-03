@@ -57,6 +57,17 @@ def usage(dev, pids):
     return fdinfo.usage(dev.pci, pids)
 
 
+def has_busy(dev):
+    return os.path.exists(host.path(f"{dev.sys}/gpu_busy_percent"))
+
+
+def busy(dev):
+    """How busy the card's graphics engine is, 0..1 (gpu_busy_percent: the power firmware's own average), or
+    None. Only asked while the card is awake: older kernels may wake it to answer."""
+    s = (host.read(f"{dev.sys}/gpu_busy_percent") or "").strip()
+    return int(s) / 100 if s.isdigit() and int(s) <= 100 else None
+
+
 def kfd_index(dev):
     """ROCm's number for this card (HIP_VISIBLE_DEVICES): its place among the GPU nodes in the kernel's KFD
     topology, matched by PCI address. None if ROCm can't see it."""
