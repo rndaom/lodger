@@ -133,12 +133,13 @@ def launch(model, prompt, n, env=None, background=False, extra=()):
 
 
 def wait_writing(t0, proc, limit=300):
-    """Wait until the run started after t0 has loaded and is writing (llama-cli echoes the prompt after
-    loading). Returns False if it ended or didn't get there in time."""
-    while time.time() - t0 < limit and proc.poll() is None:
+    """Wait until the run started after t0 (monotonic) has loaded and is writing (llama-cli echoes the prompt
+    after loading). Returns False if it ended or didn't get there in time."""
+    born = time.time() - (time.monotonic() - t0)        # t0 on the wall clock, which the run folder's time uses
+    while time.monotonic() - t0 < limit and proc.poll() is None:
         for d in os.listdir(RUNS):
             out = os.path.join(RUNS, d, "output.txt")
-            if "-run-" in d and os.path.exists(out) and os.path.getmtime(os.path.join(RUNS, d)) >= t0 - 1:
+            if "-run-" in d and os.path.exists(out) and os.path.getmtime(os.path.join(RUNS, d)) >= born - 1:
                 with open(out, errors="ignore") as f:
                     if "\n> " in f.read():
                         return True
@@ -217,12 +218,12 @@ def start_steam(limit=240):
     subprocess.Popen(["uwsm-app", "--", "steam", "-silent"], stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True)
     STARTED_STEAM.append(1)
-    t0 = time.time()
+    t0 = time.monotonic()
     time.sleep(20)
-    while time.time() - t0 < limit and (running("wineserver") or running("reaper")):
+    while time.monotonic() - t0 < limit and (running("wineserver") or running("reaper")):
         time.sleep(2)
     time.sleep(10)
-    return time.time() - t0
+    return time.monotonic() - t0
 
 
 def start_game(appid, limit=300):
@@ -231,8 +232,8 @@ def start_game(appid, limit=300):
         start_steam()
     subprocess.Popen(["steam", "-applaunch", str(appid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      start_new_session=True)
-    t0 = time.time()
-    while time.time() - t0 < limit:
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < limit:
         if running("reaper"):
             return None
         time.sleep(1)
@@ -240,8 +241,8 @@ def start_game(appid, limit=300):
 
 
 def wait_drawing(limit=180, least=512 * sysmem.MiB):
-    t0, peak = time.time(), 0
-    while time.time() - t0 < limit and peak < least:
+    t0, peak = time.monotonic(), 0
+    while time.monotonic() - t0 < limit and peak < least:
         peak = max(peak, game_vram())
         time.sleep(1)
     return peak
@@ -257,8 +258,8 @@ def close_game():
                 os.kill(pid, sig)
             except OSError:
                 pass
-        t0 = time.time()
-        while game_procs() and time.time() - t0 < wait:
+        t0 = time.monotonic()
+        while game_procs() and time.monotonic() - t0 < wait:
             time.sleep(1)
     time.sleep(5)
 
@@ -308,7 +309,7 @@ def main(argv):
                 return report(results, meas)
 
             def memory():
-                t0 = time.time()
+                t0 = time.monotonic()
                 # the model leaves 4 GiB extra free so the eater has room to work
                 p = launch(a.model, LONG, 6000, env={"LODGER_KILL_VRAM_FREE_MIB": "4096"}, background=True,
                            extra=["--leave-gpu", "4096"])
@@ -329,7 +330,7 @@ def main(argv):
         if a.game_appid:
             if not running("steam"):
                 def steam():
-                    t0 = time.time()
+                    t0 = time.monotonic()
                     p = launch(a.model, LONG, 6000, background=True)
                     if not wait_writing(t0, p):
                         end(p)
@@ -346,7 +347,7 @@ def main(argv):
                     return report(results, meas)
 
             def game():
-                t0 = time.time()
+                t0 = time.monotonic()
                 p = launch(a.model, LONG, 6000, background=True)
                 if not wait_writing(t0, p):
                     end(p)
@@ -355,11 +356,11 @@ def main(argv):
                 if g:
                     end(p)
                     return False, g
-                tg = time.time()
+                tg = time.monotonic()
                 out = finish(p)
                 why = stop_line(out)
                 stepped = STEPPED_ASIDE in out
-                note = (f"model gave the card back {time.time() - tg:.0f} s after the game started ({why}). " if stepped
+                note = (f"model gave the card back {time.monotonic() - tg:.0f} s after the game started ({why}). " if stepped
                         else "model did NOT step aside for the game. ")
                 peak = wait_drawing()
                 note += f"Game drawing ({peak // sysmem.MiB} MiB). "
@@ -369,7 +370,7 @@ def main(argv):
                          if r.returncode == 0 or STEPPED_ASIDE in r.stdout else "Asked again while the game ran: FAILED. ")
                 if STEPPED_ASIDE in r.stdout:
                     note += f"(it then stepped aside: {stop_line(r.stdout)}) "
-                while time.time() - tg < a.game_seconds:
+                while time.monotonic() - tg < a.game_seconds:
                     peak = max(peak, game_vram())
                     time.sleep(1)
                 alive = game_procs() != []
@@ -380,7 +381,7 @@ def main(argv):
                 return report(results, meas)
 
             def race():
-                t0 = time.time()
+                t0 = time.monotonic()
                 p = launch(a.model, LONG, 6000, background=True)
                 g = start_game(a.game_appid)
                 peak = wait_drawing() if not g else 0
