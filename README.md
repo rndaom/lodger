@@ -152,7 +152,8 @@ No models yet? `lodger models` shows a short built-in list and what fits this PC
   matches. If your `models.toml` lists its own `folders`, lodger adds that folder to them.
 - **Remove**: `lodger models rm NAME` moves the file to the Trash (`gio trash` when available).
 
-Restart `lodger serve` (`systemctl --user restart lodger`) after a download or removal to see the change.
+`lodger serve` notices a changed `models.toml`; after a download into a folder it already scans,
+`systemctl --user reload lodger` (or `POST /lodger/reload`) makes it look again.
 
 ## Connect an app
 
@@ -171,16 +172,31 @@ curl http://127.0.0.1:8181/v1/chat/completions \
 ```
 
 Any app or library that lets you set an OpenAI base URL works: add it as a "custom OpenAI-compatible provider"
-and use the URL above. Streaming and non-streaming both work. The API has `/v1/chat/completions`,
-`/v1/models` and `/health`, and passes `/v1/completions`, `/v1/embeddings` (if the model's settings turn
-embeddings on), `/infill`, `/tokenize`, `/detokenize` and `/apply-template` on to llama.cpp as they are. A chat
-answer that is being written when the model moves continues where it stopped; the others end with an error and
-the app asks again.
+and use the URL above. Streaming and non-streaming both work. The API has `/v1/chat/completions`, OpenAI's newer
+`/v1/responses`, Anthropic's `/v1/messages` (with `/v1/messages/count_tokens`), `/v1/models` and `/health`, and
+passes `/v1/completions`, `/v1/embeddings` (if the model's settings turn embeddings on), `/v1/rerank`, `/infill`,
+`/completion`, `/tokenize`, `/detokenize` and `/apply-template` on to llama.cpp as they are. A chat, Responses or
+Messages answer that is being written when the model moves continues where it stopped, streamed or whole; the
+others end with an error and the app asks again.
+
+Tools that speak Anthropic's API, such as Claude Code, take lodger as their server:
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:8181 ANTHROPIC_AUTH_TOKEN=lodger \
+ANTHROPIC_MODEL=qwen3.6-35b ANTHROPIC_DEFAULT_HAIKU_MODEL=qwen3.6-35b claude
+```
+
+Tools that speak OpenAI's Responses API (Codex, for one) need a provider with base URL
+`http://127.0.0.1:8181/v1` and the Responses wire format. Coding agents want a model that handles tools well
+and a long context; lodger gives each model as much context as memory allows.
 
 lodger's own endpoints:
 
-- `GET /lodger/status`: where the model is (card or processor), why, and recent events.
+- `GET /lodger/status`: where the model is (card or processor) and why, the engine and its log, waiting
+  requests, retries and recent events.
 - `POST /lodger/move`: move the model off the card now. It grows back later as usual.
+- `POST /lodger/reload`: read `models.toml` again (lodger also does when the file changes, and on
+  `systemctl --user reload lodger`).
 
 If you use [pi](https://github.com/earendil-works/pi), `lodger pi` adds lodger as a provider listing every model
 and opens pi (your other providers are kept).
