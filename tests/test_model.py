@@ -3,6 +3,7 @@ keeps for the context."""
 import os
 import struct
 import tempfile
+import tracemalloc
 import unittest
 
 from lodger import model
@@ -207,6 +208,86 @@ class ModelTest(Base):
         b = model.load(p)
         self.assertIsNot(b, a)
         self.assertEqual(b.n_layer, 2)
+
+
+class SlidingWindowTest(Base):
+    """Which layers slide: the file's list or period, else llama.cpp's own layout for the design (src/models)."""
+
+    def kinds(self, arch, kv, n=8):
+        kv = {"general.architecture": arch, f"{arch}.block_count": n, **{f"{arch}.{k}": v for k, v in kv.items()}}
+        p = write_gguf(os.path.join(self.dir, f"{arch}-{len(os.listdir(self.dir))}.gguf"), kv,
+                       [x for i in range(n) for x in layer(i)])
+        m = model.Model(p)
+        return [m.kinds[i] for i in range(n)], m.window
+
+    def test_designs_whose_file_gives_only_the_window(self):
+        # gpt-oss: load_swa_pattern(ml, 2): every second layer sees everything
+        self.assertEqual(self.kinds("gpt-oss", {"attention.sliding_window": 128}, 4),
+                         (["swa", "attn", "swa", "attn"], 128))
+        # gemma3: one in six
+        self.assertEqual(self.kinds("gemma3", {"attention.sliding_window": 1024}, 6)[0], ["swa"] * 5 + ["attn"])
+        # deepseek4: set_swa_pattern(0): every layer
+        self.assertEqual(self.kinds("deepseek4", {"attention.sliding_window": 128}, 3)[0], ["swa"] * 3)
+        # gemma2 has a window even when the file leaves it out
+        self.assertEqual(self.kinds("gemma2", {}, 2), (["swa", "attn"], 4096))
+        # phi3's window is ignored by llama.cpp
+        self.assertEqual(self.kinds("phi3", {"attention.sliding_window": 2048}, 2), (["attn", "attn"], None))
+
+    def test_period_with_the_full_layer_first(self):
+        # cohere2moe / laguna / smallthinker: load_swa_pattern(ml, 4, dense_first=true): layer 0 sees everything
+        k, _ = self.kinds("cohere2moe", {"attention.sliding_window": 4096, "attention.sliding_window_pattern": 4})
+        self.assertEqual(k, ["attn", "swa", "swa", "swa"] * 2)
+        k, _ = self.kinds("cohere2", {"attention.sliding_window": 4096, "attention.sliding_window_pattern": 4})
+        self.assertEqual(k, ["swa", "swa", "swa", "attn"] * 2)
+        k, _ = self.kinds("gemma3", {"attention.sliding_window": 1024, "attention.sliding_window_pattern": 0}, 3)
+        self.assertEqual(k, ["swa"] * 3)                                   # period 0: every layer
+
+
+class HostileFileTest(Base):
+    """A damaged or hostile file is a plain ValueError, never a big allocation or a RecursionError."""
+
+    def head(self, n_tensors, n_kv):
+        return b"GGUF" + struct.pack("<IQQ", 3, n_tensors, n_kv)
+
+    def peak(self, path):
+        tracemalloc.start()
+        try:
+            with self.assertRaises(ValueError):
+                model.read_gguf(path)
+            return tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+    def test_a_huge_name_is_not_read_into_memory(self):
+        p = os.path.join(self.dir, "big-key.gguf")
+        with open(p, "wb") as f:
+            f.write(self.head(0, 1) + struct.pack("<Q", 256 * MiB))
+            f.truncate(24 + 8 + 256 * MiB + 64)
+        self.assertLess(self.peak(p), 16 * MiB)
+
+    def test_too_many_dimensions_are_refused(self):
+        p = os.path.join(self.dir, "dims.gguf")
+        with open(p, "wb") as f:
+            f.write(self.head(1, 0) + _s("x") + struct.pack("<I", 0xFFFFFFFF) + b"\xff" * 8_000_000)
+        self.assertLess(self.peak(p), 8 * MiB)
+
+    def test_counts_that_cant_fit_in_the_file_are_refused(self):
+        p = os.path.join(self.dir, "counts.gguf")
+        with open(p, "wb") as f:
+            f.write(self.head(1 << 40, 1 << 40) + b"\0" * 64)
+        self.assertLess(self.peak(p), 1 * MiB)
+
+    def test_lists_of_lists_are_refused_plainly(self):
+        p = os.path.join(self.dir, "nest.gguf")
+        with open(p, "wb") as f:
+            f.write(self.head(0, 1) + _s("k") + struct.pack("<I", 9) + struct.pack("<IQ", 9, 1) * 5000)
+        with self.assertRaises(ValueError):
+            model.read_gguf(p)
+
+    def test_a_long_text_setting_is_skipped_not_kept(self):
+        kv, _ = model.read_gguf(self.file({"toy.chat": "x" * (model.LONG_TEXT + 1), "toy.block_count": 1}, layer(0)))
+        self.assertNotIn("toy.chat", kv)
+        self.assertEqual(kv["toy.block_count"], 1)
 
 
 if __name__ == "__main__":

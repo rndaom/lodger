@@ -121,6 +121,23 @@ TYPES = {0: (1, 4), 1: (1, 2), 2: (32, 18), 3: (32, 20), 6: (32, 22), 7: (32, 24
          34: (256, 54), 35: (256, 66), 39: (32, 17), 40: (64, 36), 41: (128, 18), 42: (64, 18)}
 REPACKABLE = {2, 8, 10, 12, 13, 14, 20, 39, 41}   # Q4_0 Q8_0 Q2_K Q4_K Q5_K Q6_K IQ4_NL MXFP4 Q1_0 (see plan.cpu_repacks)
 SHORT_LIST = 4096            # lists in the header up to this long are kept (per-layer settings); longer ones skipped
+LONG_TEXT = 1 << 20          # a text setting longer than this is skipped (a chat template is ~10 KiB) ...
+NAME_MAX = 1 << 16           # ... and a setting's or tensor's name can't be longer than this
+MAX_DIMS = 4                 # ggml's GGML_MAX_DIMS
+
+# llama.cpp's sliding-window layouts by design (src/models/*.cpp, load_swa_pattern / set_swa_pattern), for files
+# that give the window but not which layers use it: (period, whether the first layer of each period is the one that
+# sees everything, the window llama.cpp uses when the file gives none). Period 0: every layer.
+SWA_LAYOUT = {
+    "gemma2": (2, False, 4096), "gemma3": (6, False, None), "gemma3n": (5, False, None),
+    "gemma-embedding": (6, False, None), "gemma-embedding2": (6, False, None), "gpt-oss": (2, False, None),
+    "cohere2": (4, False, None), "cohere2moe": (4, True, None), "exaone4": (4, False, 4096),
+    "exaone-moe": (4, False, 128), "afmoe": (4, False, None), "llama4": (4, False, 8192), "olmo2": (4, False, None),
+    "mellum": (4, False, None), "plamo3": (8, False, None), "laguna": (4, True, None), "smallthinker": (4, True, None),
+    "muse-glimmer": (4, False, None), "modern-bert": (3, True, None), "deepseek4": (0, False, None),
+    "deepseek41": (0, False, None),
+}
+NO_SWA = {"phi3"}            # llama.cpp ignores these designs' window
 
 
 def read_gguf(path):
@@ -134,8 +151,8 @@ def read_gguf(path):
         buf = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) if size else b""
     try:
         return _parse(buf, size, path)
-    except (struct.error, IndexError, UnicodeDecodeError) as ex:
-        raise ValueError(f"{path}: not a readable GGUF file ({ex})") from None
+    except (struct.error, IndexError, UnicodeDecodeError, OverflowError, RecursionError) as ex:
+        raise ValueError(f"{path}: not a readable GGUF file ({type(ex).__name__}: {ex})") from None
     finally:
         if size:
             buf.close()
@@ -150,18 +167,28 @@ def _parse(buf, size, path):
         pos += struct.calcsize(fmt)
         return v
 
-    def text():
+    def bad(why):
+        return ValueError(f"{path}: not a sensible GGUF header ({why})")
+
+    def text(limit=NAME_MAX):
+        """A text, or None if it is longer than `limit` (then skipped unread)."""
         nonlocal pos
         n = num("<Q")
         if n > size - pos:
-            raise ValueError(f"{path}: not a sensible GGUF header")
+            raise bad("a text runs past the end of the file")
         pos += n
-        return bytes(buf[pos - n:pos]).decode("utf-8", "replace")
+        return bytes(buf[pos - n:pos]).decode("utf-8", "replace") if n <= limit else None
+
+    def name():
+        n = text()
+        if n is None:
+            raise bad(f"a name longer than {NAME_MAX} bytes")
+        return n
 
     def value(kind):
         nonlocal pos
         if kind == 8:
-            return text()
+            return text(LONG_TEXT)
         if kind == 9:
             sub, n = num("<I"), num("<Q")
             if sub in _KINDS and n <= SHORT_LIST:
@@ -170,10 +197,16 @@ def _parse(buf, size, path):
                 pos += struct.calcsize(fmt) * n
                 return out
             if sub in _SIZES:
+                if _SIZES[sub] * n > size - pos:
+                    raise bad("a list runs past the end of the file")
                 pos += _SIZES[sub] * n
-            else:
+            elif sub == 8:
+                if 8 * n > size - pos:
+                    raise bad("a list runs past the end of the file")
                 for _ in range(n):
-                    value(sub)
+                    text(0)
+            else:
+                raise bad(f"a list of type {sub}")     # lists of lists: llama.cpp doesn't read them either
             return None
         if kind not in _KINDS:
             raise ValueError(f"{path}: unknown GGUF value type {kind}")
@@ -185,9 +218,11 @@ def _parse(buf, size, path):
     if num("<I") < 2:
         raise ValueError(f"{path}: GGUF version 1 isn't supported")
     n_tensors, n_kv = num("<Q"), num("<Q")
+    if n_kv * 12 + n_tensors * 24 > size - pos:     # the least each setting and each tensor's entry takes
+        raise bad(f"{n_kv} settings and {n_tensors} tensors don't fit in the file")
     kv = {}
     for _ in range(n_kv):
-        k = text()
+        k = name()
         v = value(num("<I"))
         if v is not None:
             kv[k] = v
@@ -195,10 +230,13 @@ def _parse(buf, size, path):
     align = align if type(align) is int and align > 0 else 32
     infos = []
     for _ in range(n_tensors):
-        name = text()
-        dims = [num("<Q") for _ in range(num("<I"))]
+        t = name()
+        n_dims = num("<I")
+        if n_dims > MAX_DIMS:
+            raise bad(f"a tensor with {n_dims} dimensions")
+        dims = [num("<Q") for _ in range(n_dims)]
         kind, offset = num("<I"), num("<Q")
-        infos.append((name, dims, kind, offset))
+        infos.append((t, dims, kind, offset))
     data = (pos + align - 1) // align * align
     ends = sorted({o for _, _, _, o in infos} | {size - data})
     tensors = []
@@ -307,18 +345,33 @@ class Model:
             self.quant = [q for q in self.quant if q[1] not in self.mtp]
         self.kinds = {i: None if i in self.mtp else _kind(names.get(i, ()), self._swa(i)) for i in range(self.n_layer)}
 
+    @property
+    def window(self):
+        """The sliding window llama.cpp uses for this model (words), or None."""
+        arch = self.meta.get("arch")
+        w = self.kv.get(f"{arch}.attention.sliding_window")
+        if arch in NO_SWA:
+            return None
+        if type(w) is int and w > 0:
+            return w
+        return SWA_LAYOUT.get(arch, (0, False, None))[2] if w is None else None
+
     def _swa(self, i):
-        """Is layer i a sliding-window layer: True, False, or None (the model has sliding windows, but the file
-        doesn't say which layers)."""
-        arch = self.meta["arch"]
-        if not self.kv.get(f"{arch}.attention.sliding_window"):
+        """Is layer i a sliding-window layer: True, False, or None (the model has sliding windows, but neither the
+        file nor lodger knows which layers)."""
+        if not self.window:
             return False
-        pattern = self.kv.get(f"{arch}.attention.sliding_window_pattern")
+        pattern = self.kv.get(f"{self.meta['arch']}.attention.sliding_window_pattern")
         if isinstance(pattern, list):
             return bool(pattern[i]) if i < len(pattern) else None
-        if type(pattern) is int and pattern > 0:
-            return i % pattern < pattern - 1        # llama.cpp's set_swa_pattern: every n-th layer sees everything
-        return None
+        layout = SWA_LAYOUT.get(self.meta["arch"])
+        n = pattern if type(pattern) is int and pattern >= 0 else layout[0] if layout else None
+        if n is None:
+            return None
+        if n == 0:
+            return True
+        # llama.cpp's set_swa_pattern: one layer in n sees everything, the first or the last of each n
+        return i % n != 0 if layout and layout[1] else i % n < n - 1
 
     def with_mtp(self):
         """This model as llama.cpp loads it for multi-token prediction drafting (--spec-type draft-mtp): its MTP
