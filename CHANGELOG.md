@@ -7,6 +7,27 @@ All notable changes to lodger are written here. The format follows
 ## [Unreleased]
 
 ### Added
+- `lodger serve` answers Anthropic's Messages API (`/v1/messages`, `/v1/messages/count_tokens`, `x-api-key`), so tools
+  such as Claude Code can use a local model, and OpenAI's Responses API (`/v1/responses`); both continue an answer
+  after a move like `/v1/chat/completions`. Rerank, token counts and llama-server's own `/completion` are passed on.
+- Whole (non-streaming) answers continue after a move too, and `usage` counts the whole answer.
+- `models.toml` is read again while serving: when it changes, on SIGHUP (`systemctl --user reload lodger`) or
+  `POST /lodger/reload`. `/lodger/status` shows the engine, its log, waiting requests, retries and recent errors.
+- `lodger service install|status|remove`: a systemd user unit for the lodger you run it with, so pip, pipx and uv
+  installs start at login too; a unit it didn't write is left alone.
+- `lodger --version`; a mistyped command gets a suggestion.
+- `lodger doctor` also shows lodger's version, whether `lodger serve` is up, libraries llama.cpp can't load, which
+  apps lodger can see on the card, a learned desktop reserve that looks wrong, a recent card reset, a card at its
+  critical temperature and cgroup memory caps; your home folder is written as `~`.
+- AUR package `lodger-git` (`packaging/aur`), built, tested and installed on Arch in CI; a release workflow that
+  publishes tagged versions to GitHub and PyPI. CI runs on Python 3.14 too.
+- Apps lodger can't look into (another user's game, a root compositor, a system container, ROCm compute) count as
+  needing the card on AMD cards, from the whole card's busy and memory numbers.
+- The model leaves the card when it resets or hangs (the driver's crash report), when a laptop is unplugged
+  (`gpu_on_battery` off) or when the card reaches its critical temperature, and doesn't start there meanwhile.
+- Planned settings: `spec-type draft-mtp` and the n-gram types, `moe-cache-mib`, `ctx-checkpoints`,
+  `image-max-tokens`. Model headers are read by lodger itself, about 20 times faster: the plans before a first
+  answer take a fraction of a second instead of ~13 s.
 - `lodger serve --ollama` (or `ollama = true` in config.toml): Ollama's API on `127.0.0.1:11434` for apps that
   only speak it (Raycast, Home Assistant, Open WebUI, editor plugins): `/api/chat` and `/api/generate` (NDJSON
   streaming or whole; `options`, `format`, tools, images, `think`), `/api/embed`, `/api/embeddings`,
@@ -53,6 +74,22 @@ All notable changes to lodger are written here. The format follows
   is none); when it lists its own, `lodger models get` adds the download folder to them.
 
 ### Fixed
+- Plans count the output layer on partial card placements (up to ~1 GiB more on the card than planned), the
+  weights llama.cpp repacks for the processor, llama-server's context checkpoints for hybrid and sliding-window
+  models (2-8 GiB of RAM), and where those models keep their context.
+- The learned desktop reserve could take lodger's own or another lodger's model, or an idle game, for desktop use
+  (5.8 GiB on a 16 GiB card): no lodger model is noted any more, and the learned part is capped at a quarter of the
+  card.
+- The watchdog, "who needs the card" and the settle wait use the monotonic clock: setting the clock back or waking
+  from suspend no longer blinds them or stops a healthy model. The watchdog stops a model with one write to its
+  cgroup and no `systemctl` call can hang it; the kernel picks the model first if memory runs out.
+- One card for the plan, the engine's command and its watchdog, also in `lodger serve`.
+- RAM available respects container and user-slice memory limits.
+- Two apps asking for different models take turns instead of making lodger switch back and forth; a waiting app
+  that leaves ends its wait; `stream` must be true or false.
+- `lodger models get` never replaces a file it didn't download, and a symlinked models.toml stays a link; a file
+  named in two `[models.X]` sections is listed with why.
+- `llama_cpp` and `runs_dir` must be full paths; `lodger setup --keep 0` is refused.
 - `lodger stress-serve` takes a model's name from `models.toml` as well as a file (a name used to end in "no models
   found"), and `lodger serve` says which file it was given doesn't exist. A request cut off because lodger is
   stopping is told so, instead of where the model was.
