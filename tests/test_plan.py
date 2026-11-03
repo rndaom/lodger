@@ -184,7 +184,7 @@ class ProbeTest(unittest.TestCase):
         config.use(None)
         subprocess.run(["rm", "-rf", self.runs])
 
-    def run_probe(self, libs, gpu_place, out):
+    def run_probe(self, libs, gpu_place, out, code=0, err="", took=0):
         build = fake_build(*libs)
         self.addCleanup(subprocess.run, ["rm", "-rf", build])
         cfg = config.load("/nonexistent")
@@ -196,8 +196,9 @@ class ProbeTest(unittest.TestCase):
 
         def run(cmd, env, props, timeout=300):
             calls.append((cmd, env, props))
-            return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
-        with machine("desktop-amd"), mock.patch("lodger.fence.run", side_effect=run):
+            return subprocess.CompletedProcess(cmd, code, stdout=out, stderr=err)
+        with machine("desktop-amd"), mock.patch("lodger.fence.run", side_effect=run), \
+                mock.patch("lodger.plan.time.monotonic", side_effect=[0, took]):
             r = plan.probe(m, 4096, gpu_place, dev=gpu.choose() if gpu_place else None)
         return r, calls[0]
 
@@ -221,6 +222,30 @@ class ProbeTest(unittest.TestCase):
         self.assertEqual(props["PrivateDevices"], "yes")
         self.assertEqual(env, {"GGML_VK_VISIBLE_DEVICES": ""})
         self.assertEqual(cmd[cmd.index("--device") + 1], "none")
+
+    def test_output_with_more_columns_or_on_stderr_is_still_read(self):
+        r, _ = self.run_probe([], None, "Host 10 20 30 40\n")
+        self.assertEqual((r["model"], r["context"], r["compute"]), (10 * MiB, 20 * MiB, 30 * MiB))
+        r, _ = self.run_probe([], None, "", err="llama_fit: ...\nHost 11 21 31\n")
+        self.assertEqual(r["model"], 11 * MiB)
+
+    def test_failures_say_what_happened_in_plain_words(self):
+        # a SystemExit with why, never a ValueError from a line lodger didn't expect
+        for out, code, err, took, want in (
+                ("Host 10 20\n", 0, "", 0, "gave no estimate for Host"),
+                ("Hostile 1 2 3\n", 0, "", 0, "gave no estimate"),
+                ("Host ten 20 30\n", 0, "", 0, "gave no estimate"),
+                ("", -11, "", 1, "crashed (SIGSEGV)"),
+                ("", -9, "", plan.PROBE_TIMEOUT, f"didn't answer within {plan.PROBE_TIMEOUT} s"),
+                ("", 1, "error: unknown argument: --spec-type", 0, "failed (exit 1)")):
+            with self.assertRaises(SystemExit) as e:
+                self.run_probe([], None, out, code, err, took)
+            self.assertIn(want, str(e.exception), out)
+            self.assertIn("llama-cli", str(e.exception))      # names the model file (here: any file)
+        with self.assertRaises(SystemExit) as e:
+            self.run_probe([], None, "", 1, "error: unknown argument: --spec-type", 0)
+        self.assertIn("unknown argument", str(e.exception))
+        self.assertEqual(os.listdir(os.path.join(self.runs, "probe-cache")), [])          # nothing cached
 
 
 class EngineTest(unittest.TestCase):
@@ -348,6 +373,13 @@ class PlanSafetyTest(PlanBase):
     def test_no_layers_is_refused(self):
         p = self.make(fake_model(layers=0), vram_free=15 * GiB, card=None)
         self.assertIn("no layers", p["refuse"])
+
+    def test_a_context_past_the_training_is_capped_and_says_so(self):
+        p = self.make(fake_model(ctx_train=32768), card=None, target_ctx=65536)
+        self.assertEqual(p["ctx"], 32768)
+        self.assertTrue(any("trained for (asked for 65536)" in w for w in p["why"]), p["why"])
+        p = self.make(fake_model(ctx_train=None), card=None, target_ctx=8192)
+        self.assertTrue(any("doesn't say how long" in w for w in p["why"]), p["why"])
 
     def test_zero_min_ctx_is_refused_not_looped(self):
         with self.assertRaises(ValueError):

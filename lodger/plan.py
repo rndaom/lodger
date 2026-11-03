@@ -5,7 +5,10 @@ import contextlib
 import hashlib
 import json
 import os
+import re
+import signal
 import threading
+import time
 
 from . import config, engine, fence, host, reserve, sysmem
 from . import gpu as gpus
@@ -36,6 +39,7 @@ UBATCH = 512                     # llama.cpp's default --ubatch-size
 # --no-mmap, --mlock): then Linux can't drop them again, so they must fit in RAM
 HELD = {"none", "mlock", "mmap+mlock", "dio"}
 PROBE_KEYS = ("model", "context", "compute")
+PROBE_TIMEOUT = 120              # llama-fit-params answers in well under a second on the processor, seconds with a card
 
 
 def cache_dir():
@@ -73,12 +77,23 @@ def probe(model, ctx, gpu=None, extra=(), dev=None):
     else:
         args += dargs
         prefix = name + " "                     # --fit-print lines start with the device's name
-    r = fence.run(args, denv, props, timeout=300)
-    line = next((l for l in r.stdout.splitlines() if l.startswith(prefix)), None)
-    if r.returncode or not line:
-        raise SystemExit(f"llama-fit-params failed (exit {r.returncode}):\n{r.stderr[-2000:]}")
-    _, mdl, ctx_mib, comp_mib = line.split()
-    out = {"model": int(mdl) * MiB, "context": int(ctx_mib) * MiB, "compute": int(comp_mib) * MiB}
+    started = time.monotonic()
+    r = fence.run(args, denv, props, timeout=PROBE_TIMEOUT)
+    # the device's line: model, context and compute in MiB (llama.cpp's common_fit_print)
+    row = re.compile(re.escape(prefix) + r"\s*(\d+)\s+(\d+)\s+(\d+)(?:\s|$)")
+    found = next((m for l in (r.stdout + "\n" + r.stderr).splitlines() if (m := row.match(l))), None)
+    if r.returncode or not found:
+        if r.returncode and time.monotonic() - started >= PROBE_TIMEOUT - 1:
+            why = f"didn't answer within {PROBE_TIMEOUT} s and was stopped"
+        elif r.returncode and r.returncode < 0:
+            why = f"crashed ({signal.Signals(-r.returncode).name if -r.returncode in signal.valid_signals() else r.returncode})"
+        elif r.returncode:
+            why = f"failed (exit {r.returncode})"
+        else:
+            why = f"gave no estimate for {prefix.strip()} (its --fit-print output isn't what lodger reads)"
+        tail = (r.stderr.strip()[-2000:] + ("\n" + r.stdout.strip()[-500:] if not found else "")).strip()
+        raise SystemExit(f"llama-fit-params {why} for {os.path.basename(model.files[0])}" + (f":\n{tail}" if tail else "."))
+    out = {k: int(v) * MiB for k, v in zip(PROBE_KEYS, found.groups())}
     tmp = f"{cf}.{os.getpid()}-{threading.get_ident()}.tmp"     # two plans may probe at once
     try:
         with open(tmp, "w") as f:
@@ -464,6 +479,11 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
                + (f" + {leave_gpu / GiB:.1f} GiB you asked to leave" if leave_gpu else "")
                + f", {ram_keep / GiB:.1f} GiB RAM for everything else. "
                f"Our estimates get +{EST_MARGIN:.0%} + {EST_MARGIN_FIXED // MiB} MiB extra on top.")
+    trained = m.meta.get("ctx_train")
+    if not (type(trained) is int and trained > 0):
+        why.append("The model file doesn't say how long a context it was trained for; lodger doesn't limit it to that.")
+    elif not auto and target_ctx > trained:
+        why.append(f"Context at most {trained} words, what this model was trained for (asked for {target_ctx}).")
 
     if own_extra["mtp"]:
         why.append(f"Multi-token prediction drafting (spec-type draft-mtp): its {len(m.mtp)} MTP layer(s) are loaded "
