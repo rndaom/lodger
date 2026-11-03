@@ -134,6 +134,8 @@ class SettleTest(unittest.TestCase):
         def time(self):
             return self.t
 
+        monotonic = time
+
         def sleep(self, s):
             self.t += s
 
@@ -191,7 +193,7 @@ class NeighborsOrderTest(unittest.TestCase):
                 return {p: fdinfo.empty() for p in pids}
         nb = Neighbors(Card(), ours=lambda: ())
         nb.gpu_pids = {200: "b", 100: "a", 30: "c"}            # found in this order by earlier full scans
-        nb.scanned = time.time()
+        nb.scanned = time.monotonic()
         nb._sample()
         self.assertEqual(seen, [[30, 100, 200]])
 

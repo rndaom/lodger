@@ -4,7 +4,7 @@ another AI tool), with no list of names: it watches what each app does on the ca
 An app "needs the card" when, on the card the model uses, it either
 - keeps the card's 3D or compute engine busy BUSY_FRAC of the time for BUSY_SECONDS in a row, or
 - takes GROWTH more graphics memory within GROWTH_SECONDS (something is loading).
-The model's own processes (systemd unit lodger-*) never count."""
+The model's own processes (systemd unit lodger-*) never count. Times are monotonic: the wall clock can jump."""
 import collections
 import os
 import time
@@ -30,7 +30,7 @@ class Neighbors:
         self.gpu_pids, self.scanned = {}, 0  # pid -> app, for processes that hold the card (rescanned every 2 s)
 
     def _sample(self):
-        now = time.time()
+        now = time.monotonic()
         full = now - self.scanned > 2
         if full:
             self.scanned = now
@@ -55,7 +55,7 @@ class Neighbors:
 
     def update(self):
         """Take a sample; return the reason another app needs the card, or None."""
-        now = time.time()
+        now = time.monotonic()
         cur = self._sample()
         self.hist.append((now, cur))
         while self.hist and now - self.hist[0][0] > max(GROWTH_SECONDS, BUSY_SECONDS) + 1:
@@ -91,8 +91,8 @@ class Neighbors:
 
     def watch(self, seconds, interval=0.25):
         """Sample for `seconds`; return the first reason seen, or None."""
-        end = time.time() + seconds
-        while time.time() < end:
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
             r = self.update()
             if r:
                 return r

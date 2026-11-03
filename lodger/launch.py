@@ -63,8 +63,8 @@ def settle(card, seconds=None, limit=30.0):
     enough to see an app that is busy for BUSY_SECONDS in a row, measured over 1-second windows)."""
     seconds = max(seconds or 0, neighbors.BUSY_SECONDS + 1.5)
     nb = Neighbors(card, ours=fence.our_pids)
-    t0 = time.time()
-    while time.time() - t0 < limit:
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < limit:
         start = sysmem.vram_free(card)
         busy = nb.watch(seconds)
         if busy:
@@ -155,13 +155,15 @@ class Watchdog(threading.Thread):
         self.low = {"vram_free": None, "ram_avail": None}
         self.card = sysmem.dgpu()
         self.neighbors = Neighbors(self.card, ours=fence.our_pids) if on_gpu else None
-        self.beat = time.time()                 # when the safety checks last finished (time.time())
+        # when the safety checks last finished, on the monotonic clock: a wall-clock step back would hide a stuck
+        # watchdog, and a resume from suspend (wall time jumps, monotonic doesn't) would look like one
+        self.beat = time.monotonic()
         self.last_nb = 0.0
         self._lock = threading.Lock()
 
     def healthy(self, stale=None):
         """True while the thread runs and its last round of checks finished within `stale` seconds."""
-        return self.is_alive() and time.time() - self.beat < (stale or self.STALE)
+        return self.is_alive() and time.monotonic() - self.beat < (stale or self.STALE)
 
     def kill(self, why, graceful=False):
         """Stop the model (the first reason given is kept). Every call sends SIGKILL again, so a kill that
@@ -174,10 +176,10 @@ class Watchdog(threading.Thread):
             print(f"\n[lodger] STOPPING THE MODEL: {why}", file=sys.stderr, flush=True)
             if graceful:
                 self.fenced.kill(signal.SIGTERM)
-                t0 = time.time()
-                while time.time() - t0 < 1.5 and not self.fenced.gone():
+                t0 = time.monotonic()
+                while time.monotonic() - t0 < 1.5 and not self.fenced.gone():
                     time.sleep(0.1)
-                    self.beat = time.time()     # waiting on purpose, not stuck
+                    self.beat = time.monotonic()    # waiting on purpose, not stuck
         self.fenced.kill(signal.SIGKILL)
 
     def check_device(self):
@@ -248,7 +250,7 @@ class Watchdog(threading.Thread):
             f.flush()
 
     def run(self):
-        t0 = time.time()
+        t0 = time.monotonic()
         last_log = last_dev = 0.0
         f = None
         try:                                    # the log is a nice-to-have: watching goes on without it
@@ -257,7 +259,7 @@ class Watchdog(threading.Thread):
         except OSError:
             pass
         while not self.stop_flag.is_set():
-            now = time.time()
+            now = time.monotonic()
             loading = now - t0 < LOAD_SECONDS
             dev_due = now - last_dev >= (0.1 if loading else 1.0)          # which card is the model on?
             if dev_due:
@@ -275,7 +277,7 @@ class Watchdog(threading.Thread):
                     self.kill(f"the watchdog couldn't check the model ({type(ex).__name__}: {ex}); stopped to be safe")
                 except Exception:
                     traceback.print_exc()
-            self.beat = time.time()
+            self.beat = time.monotonic()
             if now - last_log >= 0.5:                                       # logged twice a second
                 last_log = now
                 try:
@@ -363,7 +365,7 @@ def do_run(a):
     with open(os.path.join(out, "plan.json"), "w") as f:
         json.dump({**p, "cmd": cmd, "env": env, "cgroup": props, "fence": kind}, f, indent=1)
 
-    t0 = time.time()
+    t0 = time.monotonic()
     if interactive:
         o = e = None
         fenced = fence.Fenced(cmd, env, props, stdin=None, pty=True, name=f"lodger-{os.getpid()}")
@@ -378,7 +380,7 @@ def do_run(a):
         raise
     signal.signal(signal.SIGINT, lambda *_: wd.kill("you pressed Ctrl+C", graceful=True))
     rc = wait_watched(fenced, wd)
-    secs = time.time() - t0
+    secs = time.monotonic() - t0
     wd.stop_flag.set()
     wd.join()
     fenced.stop() if fenced.pids() else fenced.close()

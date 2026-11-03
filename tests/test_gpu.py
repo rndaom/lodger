@@ -112,7 +112,8 @@ class LaptopNvidiaTest(unittest.TestCase):
             with mock.patch("time.time", return_value=t / 1e6):
                 card.usage([500])
             fake.samples.append((500, t + 1_000_000, 60))     # one second later, 60% busy
-            b = card.usage([500])[500]["busy_ns"]
+            with mock.patch("time.time", return_value=t / 1e6 + 1):
+                b = card.usage([500])[500]["busy_ns"]
             self.assertAlmostEqual(b - 100_000_000, 600_000_000, delta=1_000_000)
 
     def test_cuda_number(self):
@@ -156,7 +157,7 @@ class NeighborsTest(unittest.TestCase):
             fd = "/proc/700/fdinfo/5"
             text = read(root, fd)
             clock = [1000.0]
-            with mock.patch("lodger.neighbors.time.time", side_effect=lambda: clock[0]), \
+            with mock.patch("lodger.neighbors.time.monotonic", side_effect=lambda: clock[0]), \
                     mock.patch("lodger.sysmem.app_name", return_value="game"):
                 total, rcs = 7655183225, 28257900
                 reason = None
