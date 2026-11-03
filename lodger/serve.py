@@ -42,7 +42,7 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-from . import answers, catalog, config, engine, fence, gpu as gpus, host, ollama, plan as planner, reserve, sysmem
+from . import answers, catalog, config, engine, fence, gpu as gpus, ollama, plan as planner, reserve, sysmem
 from .launch import GAME_GUARD_FLAG, RUNS, Watchdog, card_fields, gpu_blockers, router_coming, unit_cgroup, unit_props
 from .neighbors import Neighbors
 
@@ -908,10 +908,9 @@ class Lodger:
         if e and (e.stopping or not (e.alive() and e.ready_at)):
             return                                # loading or stopping: its memory changes faster than it's logged
         key = "gtt" if card.integrated else "vram"
-        pids = sorted(lodger_pids())
-        before = sum(u[key] for u in card.usage(pids).values())
+        before = sysmem.lodger_use(card)[key]
         m = card.memory()
-        after = sum(u[key] for u in card.usage(pids).values())
+        after = sysmem.lodger_use(card)[key]
         if not m or abs(after - before) > MOVING:
             return                                # another lodger's model is loading or stopping
         ours = e.wd.now[key] if e and e.where == "card" else 0
@@ -1646,20 +1645,6 @@ def serve(argv):
             stop_all()
         lodger.unpause()
     return 0
-
-
-def lodger_pids():
-    """Every process of any lodger's model on this PC: in a lodger-* unit or cgroup, started in one of fence.py's
-    process fences (LODGER_FENCE_NAME), or in a fence of this lodger."""
-    out = set(fence.our_pids())
-    for pid in sysmem.pids():
-        if sysmem.app_name(pid) == sysmem.OURS:
-            out.add(pid)
-            continue
-        env = host.read(f"/proc/{pid}/environ") or ""
-        if env.startswith("LODGER_FENCE_NAME=") or "\0LODGER_FENCE_NAME=" in env:
-            out.add(pid)
-    return out
 
 
 def on_hangup(lodger):

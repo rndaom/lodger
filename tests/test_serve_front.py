@@ -498,7 +498,8 @@ class DesktopNoteTest(unittest.TestCase):
         self.noted = []
         for p in (mock.patch.object(serve.sysmem, "dgpu", return_value=self.card),
                   mock.patch.object(serve.reserve, "note", lambda pci, used: self.noted.append(used)),
-                  mock.patch.object(serve, "lodger_pids", return_value={900})):
+                  mock.patch.object(serve.sysmem, "lodger_use",
+                                    lambda dev, ours=None: serve.sysmem.gpu_use(dev, [900]))):
             p.start()
             self.addCleanup(p.stop)
 
@@ -529,20 +530,3 @@ class DesktopNoteTest(unittest.TestCase):
         self.l.install(e)
         self.l.note_desktop()
         self.assertEqual(self.noted, [])
-
-
-class LodgerPidsTest(unittest.TestCase):
-    def test_finds_every_lodgers_model(self):
-        procs = {1: ("0::/user.slice/user-1000.slice/user@1000.service/app.slice/lodger-4242-1.service", ""),
-                 2: ("0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-firefox-1.scope", ""),
-                 3: ("0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-x.scope",
-                     "HOME=/h\0LODGER_FENCE_NAME=lodger-77-2\0"),
-                 4: ("0::/user.slice/user-1000.slice/user@1000.service/app.slice/lodger.service", "")}
-
-        def read(path, default=None):
-            pid, what = int(path.split("/")[2]), path.rsplit("/", 1)[1]
-            return procs[pid][0 if what == "cgroup" else 1]
-        with mock.patch.object(serve.sysmem, "pids", return_value=sorted(procs)), \
-                mock.patch.object(serve.sysmem, "_read", read), mock.patch.object(serve.host, "read", read), \
-                mock.patch.object(serve.fence, "our_pids", return_value={5}):
-            self.assertEqual(serve.lodger_pids(), {1, 3, 5})
