@@ -33,6 +33,8 @@ After=graphical-session.target
 
 [Service]
 ExecStart={exe} serve{flags}
+# `systemctl --user reload lodger`: read models.toml again
+ExecReload=/bin/kill -HUP $MAINPID
 Environment=PYTHONUNBUFFERED=1
 # lodger stops its model itself on SIGTERM; give it time to
 TimeoutStopSec=40

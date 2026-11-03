@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import sys
 
-from . import __version__, config, engine, fence, gpu, host, reserve
+from . import __version__, config, engine, fence, gpu, host, neighbors, reserve
 from .gpu import nvidia
 
 GiB = 1 << 30
@@ -39,7 +39,9 @@ def system():
 def memory():
     m = host.meminfo()
     swap = f", swap {gib(m['SwapTotal'])}" if m.get("SwapTotal") else ", no swap"
-    return f"RAM {gib(m.get('MemTotal', 0))}, {gib(m.get('MemAvailable', 0))} available now{swap}"
+    lim = host.cgroup_limit()
+    capped = f"; the cgroups lodger runs in cap it at {gib(lim[0])} ({gib(lim[1])} of that free)" if lim else ""
+    return f"RAM {gib(m.get('MemTotal', 0))}, {gib(m.get('MemAvailable', 0))} available now{swap}{capped}"
 
 
 def private(text, home=None):
@@ -176,6 +178,20 @@ def report():
         if total:
             keep, why = reserve.reserve(chosen.pci, total)
             print(f"  left free for your desktop: {gib(keep)}" + (f" ({why})" if why else ""))
+            r = reserve.report(chosen.pci, total)
+            if r["warning"]:
+                print("  note: " + r["warning"] + (f"; lodger keeps {gib(r['keep'])} at most" if r["capped"] else ""))
+                problems.append("the learned desktop reserve looks too high")
+        sees_all, how = neighbors.coverage(chosen)
+        print("  apps lodger sees on it: " + ("all" if sees_all else "yours") + f" ({how})")
+        if chosen.crash_report():
+            print("  the card reset or hung in the last few minutes (the kernel holds its driver's crash report): "
+                  "lodger keeps off it for now")
+            problems.append("the graphics card reset or hung recently")
+        hot = chosen.too_hot()
+        if hot:
+            print(f"  at its critical temperature: {hot} (lodger keeps off it while it is)")
+            problems.append("the graphics card is at its critical temperature")
 
     e = engine.describe()
     print("\nllama.cpp:")

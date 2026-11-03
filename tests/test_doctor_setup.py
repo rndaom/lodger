@@ -79,6 +79,20 @@ class DoctorTest(unittest.TestCase):
         self.assertIn("MISSING library libvulkan.so.1 (needed by libggml-vulkan.so)", text)
         self.assertIn("llama.cpp can't load libvulkan.so.1", text)
 
+    def test_reserve_warning_coverage_and_card_trouble(self):
+        rep = {"floor": 2 << 30, "measured": 6 << 30, "keep": 4 << 30, "notes": 900, "capped": True,
+               "warning": "lodger learned that your desktop needs 6.0 GiB"}
+        with machine("desktop-amd"), mock.patch("lodger.reserve.report", return_value=rep), \
+                mock.patch("lodger.gpu.Device.crash_report", return_value=True), \
+                mock.patch("lodger.gpu.Device.too_hot", return_value="junction 112 °C (critical 110 °C)"):
+            text = run_doctor()
+        self.assertIn("note: lodger learned that your desktop needs 6.0 GiB; lodger keeps 4.0 GiB at most", text)
+        self.assertIn("apps lodger sees on it:", text)
+        self.assertIn("reset or hung", text)
+        self.assertIn("junction 112", text)
+        for p in ("desktop reserve looks too high", "reset or hung recently", "critical temperature"):
+            self.assertIn(p, text.rsplit("To look at:", 1)[1])
+
     def test_desktop(self):
         with machine("desktop-amd"):
             text = run_doctor()
