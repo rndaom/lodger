@@ -147,7 +147,7 @@ class Answer:
     def wrote(self):
         """A piece of text or thinking came: count it and its writing time."""
         self.pieces += 1
-        now = time.time()
+        now = time.monotonic()
         self.t_first = self.t_first or now
         self.t_last = now
 

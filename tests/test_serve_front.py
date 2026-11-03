@@ -321,7 +321,18 @@ class SleepTest(MonitorCase):
         e.fence.stop.assert_not_called()
         self.assertIsNone(e.wd.reason)
         self.assertTrue(any("slept" in n for n in self.notes), self.notes)
-        self.assertGreater(l.quiet_since, time.time() - 5)     # the card wasn't watched meanwhile: no grow-back yet
+        self.assertGreater(l.quiet_since, time.monotonic() - 5)     # the card wasn't watched meanwhile: no grow-back yet
+
+    def test_clock_set_forward_does_not_unload_a_model_in_use(self):
+        l = self.l
+        e = FakeEng(l.models["a"])
+        l.install(e)
+        l.a.idle = 10
+        l.last_used = time.monotonic()                      # used just now
+        wall = time.time() + 3600                           # the clock is set an hour ahead (NTP, a time zone fix)
+        with mock.patch.object(serve.time, "time", return_value=wall):
+            l.tick(QUIET)
+        self.assertFalse(e.stopped)
 
     def test_a_dead_watchdog_still_stops_the_model(self):
         l = self.l
@@ -554,11 +565,11 @@ class ReloadTest(MonitorCase):
         st = os.stat(self.cfg)
         os.utime(self.cfg, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))
         with mock.patch.object(l, "reload") as reload:
-            l.watch_models(time.time())
+            l.watch_models(time.monotonic())
             reload.assert_not_called()                          # just changed: maybe still being written
-            l.watch_models(time.time() + 1)
+            l.watch_models(time.monotonic() + 1)
             reload.assert_not_called()
-            l.watch_models(time.time() + 5)
+            l.watch_models(time.monotonic() + 5)
             reload.assert_called_once()
 
     def test_sighup_asks_for_a_reload(self):
@@ -632,7 +643,7 @@ class StatusTest(MonitorCase):
     def test_status_says_enough_to_find_a_problem(self):
         l = self.l
         e = FakeEng(l.models["a"])
-        e.started, e.out = time.time() - 30, "/runs/x"
+        e.started, e.out = time.monotonic() - 30, "/runs/x"
         l.install(e)
         got = l.wait_engine(l.models["a"], limit=1)
         st = json.loads(json.dumps(l.status()))
