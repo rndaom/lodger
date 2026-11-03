@@ -75,6 +75,9 @@ def check(path=None):
                     cfg["extras"][e] = ev
         elif k == "gpu" and not GPU.match(v.strip().lower()):
             errors.append(f"{p}: gpu must be \"auto\", \"none\" or a PCI address like \"0000:03:00.0\", not {v!r}")
+        elif k in ("llama_cpp", "runs_dir") and v is not None and not os.path.isabs(os.path.expanduser(v)):
+            errors.append(f"{p}: {k} must be a full path (or start with ~/), not {v!r}: lodger runs from "
+                          "different folders (a login service starts in your home folder)")
         elif k == "desktop_reserve_mib" and v is not None and v < 0:
             errors.append(f"{p}: desktop_reserve_mib can't be negative")
         else:

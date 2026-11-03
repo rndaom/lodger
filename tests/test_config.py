@@ -64,6 +64,14 @@ class ConfigTest(unittest.TestCase):
         self.assertTrue(c["wake_gpu"])
         self.assertEqual(len(errors), 1)
 
+    def test_paths_must_be_full(self):
+        self.write('runs_dir = "runs"\nllama_cpp = "~/llama.cpp"\n')
+        c, errors, _ = config.check(self.path)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("runs_dir must be a full path", errors[0])
+        self.assertIsNone(c["runs_dir"])
+        self.assertEqual(c["llama_cpp"], "~/llama.cpp")
+
 
 if __name__ == "__main__":
     unittest.main()
