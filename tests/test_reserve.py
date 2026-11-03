@@ -35,5 +35,21 @@ class ReserveNotesTest(unittest.TestCase):
         self.assertEqual(reserve.reserve("0000:09:00.0", 16 * GiB), (2 * GiB, None))
 
 
+    def test_learned_part_is_at_most_a_quarter_of_the_card(self):
+        # an idle game or a test's memory grabber noted as "desktop" (seen on the project's PC: 5.8 GiB learned on
+        # a 16 GiB card whose desktop uses ~1 GiB) must not take the card away for a week
+        notes = reserve._load("0000:09:00.0")
+        for m in range(120):
+            notes[m] = [GiB, GiB] if m % 20 < 10 else [GiB, 12 * GiB]
+        keep, why = reserve.reserve("0000:09:00.0", 16 * GiB)
+        self.assertEqual(keep, 4 * GiB)
+        self.assertIn("4.0 GiB", why)
+
+    def test_a_small_learned_rise_is_kept(self):
+        notes = reserve._load("0000:09:00.0")
+        for m in range(120):
+            notes[m] = [GiB, GiB] if m % 20 < 10 else [GiB, 3 * GiB]
+        self.assertEqual(reserve.reserve("0000:09:00.0", 16 * GiB)[0], 2 * GiB + reserve.HEADROOM)
+
 if __name__ == "__main__":
     unittest.main()

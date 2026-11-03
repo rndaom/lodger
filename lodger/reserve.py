@@ -6,8 +6,10 @@ It is the larger of
 - what the desktop showed it needs: while `lodger serve` runs and no app is busy on the card, it notes how
   much memory everything but lodger's model uses, minute by minute (kept 7 days, per card). The reserve is
   how far that use rises within 10 minutes, at worst 1 time in 20, plus 256 MiB. It counts once there is at
-  least an hour of notes.
-Apps that really need the card (a game loading) aren't covered by this: lodger steps aside for those."""
+  least an hour of notes, and at most a quarter of the card (MAX_SHARE).
+Apps that really need the card (a game loading) aren't covered by this: lodger steps aside for those. But an
+app that holds a lot while idle (a game in its menu, a test's memory grabber) looks like the desktop in the
+notes: the quarter-of-the-card limit keeps such notes from taking the card away for a week."""
 import json
 import math
 import os
@@ -21,6 +23,7 @@ KEEP = 7 * 24 * 60     # minutes of notes kept
 MIN_NOTES = 60         # minutes of notes before the measured part counts
 HEADROOM = 256 * MiB
 SHARE = 0.95           # rises at or below this share of all windows are covered
+MAX_SHARE = 0.25       # the measured part never asks for more than this share of the card
 
 _notes = {}            # pci -> {minute: [lowest, highest]}
 
@@ -101,8 +104,16 @@ def reserve(pci, total):
     r = rise(_load(pci)) if pci else None
     if r is None or r + HEADROOM <= f:
         return f, None
-    return r + HEADROOM, (f"your desktop's graphics memory use rose by up to {r / GiB:.1f} GiB within "
-                          f"{WINDOW} minutes lately, so lodger keeps more than its usual {f / GiB:.1f} GiB")
+    keep = int(r + HEADROOM)
+    if total and keep > total * MAX_SHARE:
+        keep = max(f, int(total * MAX_SHARE))
+        if keep <= f:
+            return f, None
+        return keep, (f"your desktop's graphics memory use rose by up to {r / GiB:.1f} GiB within {WINDOW} minutes "
+                      f"lately (likely an app holding memory while idle), so lodger keeps {keep / GiB:.1f} GiB, "
+                      f"a quarter of the card, instead of its usual {f / GiB:.1f} GiB")
+    return keep, (f"your desktop's graphics memory use rose by up to {r / GiB:.1f} GiB within "
+                  f"{WINDOW} minutes lately, so lodger keeps more than its usual {f / GiB:.1f} GiB")
 
 
 def kill_line(keep):
