@@ -130,9 +130,8 @@ def unit_props(p, runtime=None):
 
 def unit_cgroup(unit):
     """The cgroup of a systemd user service (for --pause services)."""
-    r = subprocess.run(["systemctl", "--user", "show", "-p", "ControlGroup", "--value", unit + ".service"],
-                       capture_output=True, text=True)
-    cg = r.stdout.strip()
+    r = fence._systemctl("show", "-p", "ControlGroup", "--value", unit + ".service")
+    cg = r.stdout.strip() if r and r.returncode == 0 else ""
     return "/sys/fs/cgroup" + cg if cg else None
 
 

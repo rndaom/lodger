@@ -206,6 +206,49 @@ class SystemdCapTest(unittest.TestCase):
             self.assertIn("cgroup v1", fence.systemd_memory()[1])
 
 
+class SystemdKillTest(unittest.TestCase):
+    """Stopping a model must not wait on systemd: under memory pressure (when the watchdog acts) starting
+    systemctl and the D-Bus round trip can take seconds, or hang."""
+
+    def fenced(self):
+        with mock.patch("lodger.fence.mode", return_value=("systemd", "systemd user session")), \
+                mock.patch("subprocess.Popen"):
+            f = fence.Fenced(["x"], {}, {"MemoryMax": str(1 << 30)}, name="lodger-1-3")
+        f.close()
+        return f
+
+    @staticmethod
+    def hung(cmd, **kw):
+        if "timeout" not in kw:
+            raise AssertionError(f"{cmd} would wait forever on a hung systemd")
+        raise subprocess.TimeoutExpired(cmd, kw["timeout"])
+
+    def test_kill_writes_the_units_cgroup_kill(self):
+        f = self.fenced()
+        with tempfile.TemporaryDirectory() as cg:
+            open(os.path.join(cg, "cgroup.kill"), "w").close()
+            f.cg = cg
+            with mock.patch("lodger.fence.subprocess.run", side_effect=self.hung) as run:
+                f.kill(signal.SIGKILL)
+            with open(os.path.join(cg, "cgroup.kill")) as fh:
+                self.assertEqual(fh.read(), "1")
+        run.assert_not_called()
+
+    def test_a_hung_systemctl_never_hangs_the_watchdog(self):
+        f = self.fenced()
+        with mock.patch("lodger.fence.subprocess.run", side_effect=self.hung):
+            self.assertIsNone(f.cgroup())
+            self.assertEqual(f.pids(), [])
+            f.kill(signal.SIGKILL)
+            f.kill(signal.SIGTERM)
+
+    def test_stop_gives_up_on_a_hung_systemctl(self):
+        f = self.fenced()
+        f.proc.wait.return_value = 0
+        with mock.patch("lodger.fence.subprocess.run", side_effect=self.hung):
+            f.stop()
+
+
 class OrphanTest(unittest.TestCase):
     """Models a lodger that is gone left running: found by name and by LODGER_FENCE_NAME, then stopped."""
     UNITS = ("lodger.service loaded active running lodger: local AI that steps aside for your apps\n"
