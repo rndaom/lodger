@@ -101,6 +101,15 @@ class LodgerUseTest(unittest.TestCase):
             card = gpu.choose()
             self.assertEqual(sysmem.lodger_use(card, ours=[100]), sysmem.gpu_use(card, [100]))
 
+    def test_another_lodgers_unfenced_model_counts(self):
+        # a 'none' fence has no lodger-* cgroup: its programs carry LODGER_FENCE_NAME instead (fence.find_orphans)
+        from lodger import gpu
+        with machine("desktop-amd", writable=True) as root:
+            card = gpu.choose()
+            write(root, "/proc/100/environ", "PATH=/usr/bin\0LODGER_FENCE_NAME=lodger-4242-1\0")
+            write(root, "/proc/300/environ", "PATH=/usr/bin\0NOT_LODGER_FENCE_NAME=lodger-1-1\0")
+            self.assertEqual(sysmem.lodger_use(card, ours=()), sysmem.gpu_use(card, [100]))
+
     def test_no_card(self):
         self.assertEqual(sysmem.lodger_use(None, ours=()), {"vram": 0, "gtt": 0})
 

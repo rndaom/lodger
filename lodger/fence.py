@@ -460,6 +460,19 @@ def owner_alive(pid):
     return any(os.path.basename(a) == "lodger" or a == "lodger.cli" for a in args)
 
 
+def named():
+    """Programs started in a cgroup/'none' fence by any lodger, found by the LODGER_FENCE_NAME they carry (they have
+    no lodger-* systemd unit or cgroup to tell them by): {fence name: [pids]}. Only this user's are readable."""
+    procs = {}
+    for p in host.listdir("/proc"):
+        if p.isdigit():
+            env = host.read(f"/proc/{p}/environ") or ""
+            i = env.find("LODGER_FENCE_NAME=")
+            if i >= 0 and (i == 0 or env[i - 1] == "\0"):
+                procs.setdefault(env[i + len("LODGER_FENCE_NAME="):].split("\0", 1)[0], []).append(int(p))
+    return {name: pids for name, pids in procs.items() if NAME.match(name)}
+
+
 def find_orphans():
     """Fences whose lodger is gone, with the model maybe still in them: [{kind, name, owner, where}]. Reads
     only (systemctl list-units, the delegated cgroup folder, /proc)."""
@@ -486,14 +499,7 @@ def find_orphans():
         if m and os.path.isdir(os.path.join(parent, n)) and not owner_alive(int(m.group(1))):
             out.append({"kind": "cgroup", "name": n, "owner": int(m.group(1)), "where": os.path.join(parent, n)})
             seen.add(n)
-    procs = {}
-    for p in host.listdir("/proc"):
-        if p.isdigit():
-            env = host.read(f"/proc/{p}/environ") or ""
-            i = env.find("LODGER_FENCE_NAME=")
-            if i >= 0 and (i == 0 or env[i - 1] == "\0"):
-                procs.setdefault(env[i + len("LODGER_FENCE_NAME="):].split("\0", 1)[0], []).append(int(p))
-    for name, pids in sorted(procs.items()):
+    for name, pids in sorted(named().items()):
         m = NAME.match(name)
         if m and name not in seen and not owner_alive(int(m.group(1))):
             out.append({"kind": "process", "name": name, "owner": int(m.group(1)), "where": sorted(pids)})
