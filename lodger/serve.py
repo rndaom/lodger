@@ -306,8 +306,28 @@ class Lodger:
         self.failures = 0                     # the current model's starts that failed in a row
         self.retry_at, self.retry_delay = 0.0, 10
         self.ollama = None                    # where Ollama's API is answered, or why not
+        self.clock_off = time.time() - time.monotonic()   # moves when the PC sleeps or the clock is set (clock())
+        self.grace_until = 0.0                # monotonic: until then a stale watchdog heartbeat may be the clock's doing
         self.out = os.path.join(RUNS, time.strftime("%Y-%m-%d-%H%M%S") + "-serve")
         os.makedirs(self.out)
+
+    def clock(self):
+        """Did the PC sleep, or the clock get set, since the last look? The monotonic clock stops while the PC is
+        suspended, the wall clock doesn't. After such a jump the watchdog's heartbeat (wall time) looks stale until
+        its next round, so it gets a short grace instead of its model being stopped; and the card wasn't watched
+        meanwhile, so its quiet time starts again."""
+        off = time.time() - time.monotonic()
+        jump, self.clock_off = off - self.clock_off, off
+        if abs(jump) > 5:
+            self.grace_until = time.monotonic() + 15
+            self.quiet_since = time.time()
+            self.note(f"the PC slept or its clock was set ({jump / 60:+.0f} min): carrying on")
+        return jump
+
+    def watched(self, e):
+        """Is engine `e`'s watchdog on duty (or, just after the clock jumped, not yet known to be off it)?"""
+        self.clock()
+        return e.watched() or time.monotonic() < self.grace_until
 
     def note(self, text):
         log(text)
@@ -457,9 +477,9 @@ class Lodger:
         self.note(f"starting {self.cur.name} on the {e.where}"
                   + (f" ({self.why_off_card})" if self.why_off_card and not p["ngl"] else "")
                   + f", context {p['ctx']}" + (f", {p['ngl']} layers on the card" if p["ngl"] else ""))
-        if not e.wait_ready(abort=lambda: self.closing or not e.watched()) or self.closing or not e.watched():
+        if not e.wait_ready(abort=lambda: self.closing or not self.watched(e)) or self.closing or not self.watched(e):
             reason = e.wd.reason or ("lodger is stopping" if self.closing else "its watchdog stopped working"
-                                     if not e.watched() else "it exited while loading (see engine.log)")
+                                     if not self.watched(e) else "it exited while loading (see engine.log)")
             if e.alive():
                 e.stop()
             else:
@@ -653,6 +673,7 @@ class Lodger:
 
     def tick(self, nb):
         """One round of the monitor."""
+        self.clock()
         now = time.time()
         if nb.update() or self.others_coming():
             self.quiet_since = now
@@ -669,7 +690,7 @@ class Lodger:
             if self.wake:
                 self.wake_up()
             return
-        if e and e.alive() and not e.watched():
+        if e and e.alive() and not self.watched(e):
             # nothing would stop the model if memory ran out: stop it now (planned stops tell the watchdog first)
             e.wd.reason = "lodger's watchdog stopped working, so the model was stopped to be safe"
             self.note(e.wd.reason)
@@ -746,9 +767,22 @@ class Lodger:
                 # (a tool call cut by a move must be asked again), then the rest continues on the card
                 end = time.time() + GROW_WAIT
                 with self.cv:
-                    while (time.time() < end and self.busy.get(old) and not self.closing
-                           and new.watched() and old.watched()):        # the monitor is busy here: watch them
+                    while (time.time() < end and self.busy.get(old) and not self.closing and new.alive()
+                           and not new.wd.reason and self.watched(new) and self.watched(old)):   # watch them here
                         self.cv.wait(1)
+                if not new.alive() or new.wd.reason:
+                    # the card engine had to stop before the hand-over was done: the processor one carries on
+                    reason = new.wd.reason or "it stopped (see engine.log)"
+                    self.stepped_aside()
+                    self.why_off_card = "stepped aside: " + reason
+                    self.install(old)
+                    if new.alive():
+                        new.stop()
+                    else:
+                        new.finish()
+                    self.note(f"stepped aside from the card while growing back: {reason}")
+                    self.unpause()
+                    return
                 old.stop()
 
     def note_desktop(self):

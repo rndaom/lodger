@@ -254,5 +254,81 @@ class FairnessTest(unittest.TestCase):
         self.assertEqual(l.waiting, {})
 
 
+QUIET = SimpleNamespace(update=lambda: None)
+
+
+class MonitorCase(unittest.TestCase):
+    def setUp(self):
+        self.l = lodger()
+        self.notes = []
+        self.l.note = self.notes.append
+        self.quiet = [mock.patch.object(self.l, "others_coming", return_value=None),
+                      mock.patch.object(self.l, "note_desktop"), mock.patch.object(self.l, "unpause")]
+        for p in self.quiet:
+            p.start()
+
+    def tearDown(self):
+        for p in self.quiet:
+            p.stop()
+
+
+class SleepTest(MonitorCase):
+    def test_wake_from_sleep_does_not_stop_a_healthy_model(self):
+        l = self.l
+        e = FakeEng(l.models["a"], where="card")
+        beat = time.time()
+        e.watched = lambda: time.time() - beat < 10      # the watchdog's heartbeat runs on wall time
+        e.fence = mock.Mock()
+        l.install(e)
+        l.clock_off -= 3600                             # as after an hour of sleep: the wall clock moved, monotonic didn't
+        beat -= 3600
+        l.quiet_since = 0
+        with mock.patch.object(l, "bring_up", return_value=True):
+            l.tick(QUIET)
+        e.fence.stop.assert_not_called()
+        self.assertIsNone(e.wd.reason)
+        self.assertTrue(any("slept" in n for n in self.notes), self.notes)
+        self.assertGreater(l.quiet_since, time.time() - 5)     # the card wasn't watched meanwhile: no grow-back yet
+
+    def test_a_dead_watchdog_still_stops_the_model(self):
+        l = self.l
+        e = FakeEng(l.models["a"], where="card")
+        e.watched = lambda: False
+        e.fence = mock.Mock(stop=lambda: setattr(e, "_alive", False))
+        l.install(e)
+        l.clock_off -= 3600
+        with mock.patch.object(l, "bring_up", return_value=True):
+            l.tick(QUIET)                               # grace after waking ...
+            self.assertTrue(e.alive())
+            l.grace_until = 0                           # ... but not longer than that
+            l.tick(QUIET)
+        self.assertFalse(e.alive())
+
+
+class GrowBackTest(MonitorCase):
+    def test_card_engine_stopped_during_the_hand_over_keeps_the_processor(self):
+        l = self.l
+        l.a.allow_gpu = True
+        old = FakeEng(l.models["a"])
+        l.install(old)
+        l.quiet_since = l.last_aside = 0
+        new = FakeEng(l.models["a"], where="card")
+        got = l.wait_engine(l.models["a"], limit=1)     # an answer is being written on the processor
+        self.assertIs(got, old)
+
+        def game_starts():
+            new.wd.reason = "an app needs the graphics card"
+            new._alive = False
+            time.sleep(0.3)
+            l.release(old)
+        with mock.patch.object(l, "make_plan", return_value={"refuse": None, "ngl": 99}), \
+                mock.patch.object(l, "launch", return_value=new), mock.patch.object(serve, "GROW_WAIT", 5):
+            threading.Timer(0.2, game_starts).start()
+            l.tick(QUIET)
+        self.assertIs(l.engine, old)
+        self.assertFalse(old.stopped)
+        self.assertEqual(l.why_off_card, "stepped aside: an app needs the graphics card")
+
+
 if __name__ == "__main__":
     unittest.main()
