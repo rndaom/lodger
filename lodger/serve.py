@@ -806,6 +806,7 @@ CHAT_PATHS = ("/v1/chat/completions", "/chat/completions")
 # llama-server's other answers, passed through as they are (an answer cut by a move ends with an error)
 PASS_PATHS = ("/v1/completions", "/completions", "/v1/embeddings", "/embeddings", "/infill", "/tokenize",
               "/detokenize", "/apply-template")
+STREAM_PATHS = ("/v1/completions", "/completions", "/infill")   # of those, the ones that can stream
 
 
 def positive_int(v):
@@ -833,6 +834,12 @@ def make_handler(lodger, key=None, ollama_api=False):
 
         def log_message(self, *args):
             pass
+
+        def handle_expect_100(self):
+            """Say "go ahead" only to a request that may reach lodger; the others get their refusal at once."""
+            if check(self.command, self.path, self.headers, key):
+                return True                      # do_POST refuses it (and closes: the body is never sent)
+            return super().handle_expect_100()
 
         def send_json(self, code, obj, headers=()):
             body = json.dumps(obj).encode()
@@ -1005,6 +1012,8 @@ def make_handler(lodger, key=None, ollama_api=False):
                 return self.send_error_json(400, "'model' must be a string")
             if path in CHAT_PATHS and not isinstance(body.get("messages", []), list):
                 return self.send_error_json(400, "'messages' must be a list")
+            if body.get("stream") is not None and not isinstance(body["stream"], bool):
+                return self.send_error_json(400, "'stream' must be true or false")
             entry = lodger.find(name)
             if not entry:
                 return self.no_model(name)
@@ -1015,7 +1024,7 @@ def make_handler(lodger, key=None, ollama_api=False):
             with lodger.cv:
                 lodger.active += 1
             try:
-                if not body.get("stream"):
+                if not body.get("stream") or path not in STREAM_PATHS + ("/v1/chat/completions",):
                     self.whole(body, entry, path)
                 elif path == "/v1/chat/completions":
                     self.stream(body, entry)
