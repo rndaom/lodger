@@ -53,6 +53,9 @@ All notable changes to lodger are written here. The format follows
   is none); when it lists its own, `lodger models get` adds the download folder to them.
 
 ### Fixed
+- `lodger stress-serve` takes a model's name from `models.toml` as well as a file (a name used to end in "no models
+  found"), and `lodger serve` says which file it was given doesn't exist. A request cut off because lodger is
+  stopping is told so, instead of where the model was.
 - Nothing runs unwatched: an error in the watchdog's checks stops the model, a watchdog that stops beating gets the
   model stopped, and `lodger serve`'s monitor carries on after an error.
 - llama-server settings in `models.toml` that change memory are now planned for; settings lodger sets itself, or

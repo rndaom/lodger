@@ -3,10 +3,11 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
-from lodger import stress
+from lodger import serve, servetest, stress
 
 KLOG = """[drm:amdgpu_job_timedout [amdgpu]] *ERROR* ring gfx_0.0.0 timeout, signaled seq=1, emitted seq=2
 NVRM: Xid (PCI:0000:01:00): 79, pid=1234, name=llama-server, GPU has fallen off the bus.
@@ -57,3 +58,38 @@ class CommandTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ModelFileTest(unittest.TestCase):
+    """stress-serve takes a model's file or its name in models.toml; serve itself takes files."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.file, big = (os.path.join(self.tmp.name, n) for n in ("Alpha.gguf", "Big.gguf"))
+        for p in (self.file, big):
+            with open(p, "wb") as f:
+                f.write(b"GGUF")
+        self.config = os.path.join(self.tmp.name, "models.toml")
+        with open(self.config, "w") as f:
+            f.write(f'[models.alpha]\nfile = "{self.file}"\n'
+                    f'[models.big]\nfile = "{big}"\nskip = "needs special setup"\n')
+
+    def test_a_file_is_used_as_it_is(self):
+        self.assertEqual(servetest.model_file(self.file, self.config), self.file)
+
+    def test_a_name_becomes_its_file(self):
+        self.assertEqual(servetest.model_file("alpha", self.config), self.file)
+
+    def test_unknown_or_skipped_names_stop_with_why(self):
+        with self.assertRaises(SystemExit) as e:
+            servetest.model_file("qwen", self.config)
+        self.assertIn("names there: alpha", str(e.exception))
+        with self.assertRaises(SystemExit) as e:
+            servetest.model_file("big", self.config)
+        self.assertIn("needs special setup", str(e.exception))
+
+    def test_serve_says_which_file_is_missing(self):
+        with self.assertRaises(SystemExit) as e:
+            serve.serve([os.path.join(self.tmp.name, "nope.gguf")])
+        self.assertIn("no such file", str(e.exception))
+        self.assertIn("--default NAME", str(e.exception))

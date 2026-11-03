@@ -1362,6 +1362,10 @@ def serve(argv):
     ap.add_argument("--ollama-port", type=int, default=11434, metavar="PORT")
     a = ap.parse_args(argv)
     a.api_key = read_key(a.api_key_file)
+    missing = [p for p in a.files if not os.path.exists(os.path.expanduser(p))]
+    if missing:
+        sys.exit(f"no such file: {', '.join(missing)} (lodger serve takes model files; to start with one of the "
+                 f"models in {catalog.CONFIG}, name it with --default NAME)")
     models, default = catalog.load(a.files or None)
     if not models:
         sys.exit(f"no models found: add folders or files to {catalog.CONFIG}, or download one: `lodger models`")
@@ -1397,6 +1401,7 @@ def serve(argv):
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         lodger.closing = True
+        lodger.why = "lodger is stopping"            # what a request still waiting is told
         with lodger.cv:
             lodger.cv.notify_all()
         httpd.shutdown()

@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 
-from . import sysmem
+from . import catalog, sysmem
 from .launch import RUNS
 from .serve import auth_header, read_key
 from .stress import EATER, STARTED_STEAM, close_game, eater_env, eater_why, health, router_running, start_game, wait_drawing
@@ -158,13 +158,28 @@ def answered(box, why_ok=""):
     return True, f"answer finished ({len(text)} characters, {box.get('seconds')} s, restarted at {box.get('moves')} s){why_ok}"
 
 
+def model_file(model, config=None):
+    """The file to serve: MODEL itself, or the file of the model by that name in models.toml (its settings
+    there still apply, since serve looks the file up in models.toml too)."""
+    if os.path.isfile(model):
+        return model
+    models, _ = catalog.load(config=config or catalog.CONFIG)
+    if model not in models:
+        sys.exit(f"{model}: no such file, and no model by that name in {config or catalog.CONFIG} "
+                 f"(names there: {', '.join(models) or 'none'})")
+    if models[model].skip:
+        sys.exit(f"{model} is not served: {models[model].skip}")
+    return models[model].path
+
+
 def main(argv):
     ap = argparse.ArgumentParser(prog="lodger stress-serve", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("model")
+    ap.add_argument("model", help=f"a model file, or a model's name in {catalog.CONFIG}")
     ap.add_argument("--port", type=int, default=8182)
     ap.add_argument("--game-appid", type=int)
     a = ap.parse_args(argv)
+    path = model_file(a.model)
     if router_running():
         sys.exit("Stop llama-router first: systemctl --user stop llama-router (and start it again afterwards).")
     other = serving()
@@ -175,7 +190,7 @@ def main(argv):
     os.makedirs(out)
     low = LowWatch()
     low.start()
-    srv = Server(a.model, a.port, out)
+    srv = Server(path, a.port, out)
     results, children = [], []
 
     def phase(name, fn):

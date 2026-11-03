@@ -469,3 +469,17 @@ on a PC with two cards of the same vendor:device id; the cgroup/none fences on o
   Live on the processor (2.6B, port 8383, user's service left alone): answers streamed and whole, completions and
   tokenize passed through; the engine killed mid-count of 1-120: one answer, no gaps or repeats; double TERM: clean.
   Not tested on the card yet (the user's service holds it); every card plan of this PC's models is unchanged.
+- 2026-11-03 **the hardening pass on the card** (RX 7800 XT, 35B, user's service stopped for the test and started again):
+  `lodger stress-serve qwen3.6-35b`, phases 1-4 PASS, no card errors or crashes, lowest free 2.23 GiB:
+  on the card after 37 s (planning and the settle wait ~18 s, load 19 s); moved mid-answer, finished on the
+  processor (3803 characters); grew back after the doubled quiet wait (121 s); memory grab mid-answer: stepped
+  aside, answer finished, grew back 96 s after. Then on the real service (port 8181): the card engine killed
+  mid-count of 1-150: one answer, no gaps or repeats (back on the processor 15 s later, grew back as usual);
+  lodger itself killed (SIGKILL) with the model on the card: systemd restarted it 30 s later and it stopped the
+  leftover model; double TERM mid-answer: stopped in under 1 s, nothing left, card memory given back.
+  Found and fixed: `stress-serve` took only a file, though serve's models go by their names (`stress-serve
+  qwen3.6-35b` ended in "no models found"): it now takes a name too, and `serve` says which file is missing; a
+  request cut off by a stop was told "not available right now: <model> on the card", now "lodger is stopping".
+  Noted, not changed: the first answer waits ~18 s before loading starts (settle >= 4.5 s, more while card memory
+  moves, plus ~4 s planning); a killed lodger's leftover model holds the card for RestartSec (30 s) until the new
+  lodger stops it. The Steam-game phase (5) wasn't run: it starts a game on the user's screen.
