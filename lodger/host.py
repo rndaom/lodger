@@ -1,5 +1,6 @@
 """Where lodger reads the PC's state from (/sys and /proc). Tests point ROOT at recorded copies."""
 import os
+import re
 
 ROOT = ""
 
@@ -55,18 +56,24 @@ def _stat(path, *keys):
 
 
 def _levels(path):
-    """The cgroup folders a model lodger starts is inside too: the root and every folder down to lodger's own,
-    leaving out lodger's own when it is a systemd service or scope (the model runs in a unit of its own)."""
+    """The cgroup folders a model lodger starts is inside, from lodger's own cgroup `path`. Inside a systemd user
+    manager the model runs in a unit of its own in the manager's app.slice (the 'systemd' fence): the folders
+    down to app.slice, whichever unit lodger itself runs in. Anywhere else (a session, a container's scope, the
+    system), and with LODGER_FENCE=none or cgroup, the model is in lodger's own cgroup or under it: lodger's
+    folder and every one above it."""
     parts = [p for p in path.split("/") if p]
-    if parts and parts[-1].endswith((".service", ".scope")):
-        parts = parts[:-1]
+    mgr = next((i for i, p in enumerate(parts) if re.fullmatch(r"user@\d+\.service", p)), None)
+    if mgr is not None and os.environ.get("LODGER_FENCE") not in ("none", "cgroup"):
+        parts = parts[:mgr + 1] + ["app.slice"]
     return ["/".join(parts[:n]) for n in range(len(parts) + 1)]
 
 
 def cgroup_limit():
-    """(limit, room) in bytes for the memory limits on the cgroups lodger runs in (cgroup v2 memory.max and
-    memory.high, v1 memory.limit_in_bytes), or None without any: limit is the smallest, room the least left
-    under one (limit - charged + file cache the kernel can drop)."""
+    """(limit, room) in bytes for the memory limits on the cgroups lodger's model runs in (_levels; cgroup v2
+    memory.max and memory.high, v1 memory.limit_in_bytes), or None without any: limit is the smallest, room the
+    least left under one (limit - charged + file cache the kernel can drop). memory.high counts as a limit on
+    purpose: over it the kernel throttles everything in the cgroup (the desktop too, when that is the user's
+    slice), so a cgroup over it has no room and the watchdog gives the memory back."""
     lim = room = None
     for line in (read("/proc/self/cgroup") or "").splitlines():
         hid, ctl, path = (line.split(":", 2) + ["", ""])[:3]

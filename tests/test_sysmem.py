@@ -2,6 +2,7 @@
 a capped user slice): available RAM is then the room under the tightest limit."""
 import os
 import unittest
+from unittest import mock
 
 from lodger import host, sysmem
 from tests.support import machine, write
@@ -47,6 +48,43 @@ class MeminfoTest(unittest.TestCase):
             write(root, "/sys/fs/cgroup" + OWN + "/memory.max", str(GiB) + "\n")
             write(root, "/sys/fs/cgroup" + OWN + "/memory.current", str(GiB // 2) + "\n")
             self.assertEqual(sysmem.meminfo()["MemAvailable"], 12365144 * 1024)
+
+    def test_a_none_fence_model_shares_lodgers_own_limit(self):
+        with machine("desktop-amd", writable=True) as root, mock.patch.dict(os.environ, {"LODGER_FENCE": "none"}):
+            write(root, "/proc/self/cgroup", "0::" + OWN + "\n")
+            write(root, "/sys/fs/cgroup" + OWN + "/memory.max", str(4 * GiB) + "\n")
+            write(root, "/sys/fs/cgroup" + OWN + "/memory.current", str(GiB) + "\n")
+            self.assertEqual(sysmem.meminfo()["MemAvailable"], 3 * GiB)
+
+    def test_a_containers_scope_limit_holds(self):
+        # docker without a cgroup namespace: the container's limit is on its scope, lodger's own folder
+        with machine("desktop-amd", writable=True) as root:
+            write(root, "/proc/self/cgroup", "0::/system.slice/docker-0123abcd.scope\n")
+            write(root, "/sys/fs/cgroup/system.slice/docker-0123abcd.scope/memory.max", str(6 * GiB) + "\n")
+            write(root, "/sys/fs/cgroup/system.slice/docker-0123abcd.scope/memory.current", str(2 * GiB) + "\n")
+            self.assertEqual(sysmem.meminfo()["MemAvailable"], 4 * GiB)
+
+    def test_under_systemd_the_models_own_slice_counts(self):
+        # lodger started from somewhere else in the user manager: its model goes to app.slice all the same
+        mgr = SLICE + "/user@1000.service"
+        with machine("desktop-amd", writable=True) as root:
+            write(root, "/proc/self/cgroup", "0::" + mgr + "/session.slice/lodger.service\n")
+            write(root, "/sys/fs/cgroup" + mgr + "/session.slice/memory.max", str(GiB) + "\n")
+            write(root, "/sys/fs/cgroup" + mgr + "/session.slice/memory.current", "0\n")
+            self.assertEqual(sysmem.meminfo()["MemAvailable"], 12365144 * 1024)
+            write(root, "/sys/fs/cgroup" + mgr + "/app.slice/memory.max", str(4 * GiB) + "\n")
+            write(root, "/sys/fs/cgroup" + mgr + "/app.slice/memory.current", str(3 * GiB) + "\n")
+            self.assertEqual(sysmem.meminfo()["MemAvailable"], GiB)
+
+    def test_above_memory_high_there_is_no_room(self):
+        # the kernel throttles everything in a cgroup over memory.high (the desktop too, when it is the user's
+        # slice): no room, so the watchdog gives the memory back, as it would near memory.max
+        with machine("desktop-amd", writable=True) as root:
+            write(root, "/proc/self/cgroup", "0::" + OWN + "\n")
+            write(root, "/sys/fs/cgroup" + SLICE + "/memory.high", str(4 * GiB) + "\n")
+            write(root, "/sys/fs/cgroup" + SLICE + "/memory.current", str(5 * GiB) + "\n")
+            write(root, "/sys/fs/cgroup" + SLICE + "/memory.stat", f"inactive_file {GiB // 2}\n")
+            self.assertEqual(sysmem.meminfo()["MemAvailable"], 0)
 
     def test_container_limit_cgroup_v2(self):
         with machine("desktop-amd", writable=True) as root:
