@@ -15,9 +15,11 @@ from lodger.gpu import nvidia
 from tests.support import FakeNVML, machine
 
 
-def run_doctor(orphans=(), capped=(True, None), describe=None, settings=os.devnull):
+def run_doctor(orphans=(), capped=(True, None), describe=None, settings=os.devnull, serving=(None, None), libs=None):
     out = io.StringIO()
     with contextlib.ExitStack() as st:
+        st.enter_context(mock.patch("lodger.doctor.serving", return_value=serving))
+        st.enter_context(mock.patch("lodger.doctor.missing_libs", return_value=libs or {}))
         st.enter_context(contextlib.redirect_stdout(out))
         st.enter_context(mock.patch("lodger.fence.mode", return_value=("systemd", "systemd user session")))
         st.enter_context(mock.patch("lodger.fence.systemd_memory", return_value=capped))
@@ -38,6 +40,44 @@ class DoctorTest(unittest.TestCase):
 
     def tearDown(self):
         config.use(None)
+
+    def test_home_folder_is_written_as_tilde(self):
+        self.assertEqual(doctor.private("/home/u/x /home/ux /home/u_b /home/u: /home/u", "/home/u"),
+                         "~/x /home/ux /home/u_b ~: ~")
+        self.assertEqual(doctor.private("/x", "/"), "/x")
+        with machine("desktop-amd"), mock.patch.dict(os.environ, {"HOME": "/home/tester"}):
+            text = run_doctor(settings="/home/tester/.config/lodger/config.toml")
+        self.assertIn("Settings: ~/.config/lodger/config.toml", text)
+        self.assertNotIn("/home/tester", text)
+
+    def test_version_and_serving(self):
+        from lodger import __version__
+        with machine("desktop-amd"):
+            text = run_doctor(serving=("active, enabled", '200 {"status": "ok"}'))
+        self.assertIn(f"lodger doctor {__version__}", text)
+        self.assertIn("lodger.service active, enabled; 127.0.0.1:8181 answers /health: 200", text)
+        with machine("desktop-amd"):
+            text = run_doctor()
+        self.assertIn("no lodger.service; 127.0.0.1:8181 doesn't answer", text)
+
+    def test_missing_libraries_are_found_and_listed(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d))
+        for n in ("llama-server", "llama-fit-params", "libggml-vulkan.so", "libggml-base.so"):
+            open(os.path.join(d, n), "w").close()
+
+        def ldd(cmd, **kw):
+            gone = "\tlibvulkan.so.1 => not found\n" if cmd[1].endswith("libggml-vulkan.so") else ""
+            return mock.Mock(stdout="\tlibc.so.6 => /usr/lib/libc.so.6 (0x1)\n" + gone, returncode=0)
+        with mock.patch("shutil.which", return_value="/usr/bin/ldd"), mock.patch("subprocess.run", side_effect=ldd):
+            self.assertEqual(doctor.missing_libs(d), {"libvulkan.so.1": ["libggml-vulkan.so"]})
+        self.assertEqual(doctor.missing_libs(None), {})
+        desc = {"root": d, "from": "test", "bin": d, "backends": ["vulkan"], "cuda": None, "llama-server": True,
+                "llama-fit-params": True, "kfd": False}
+        with machine("desktop-amd"), mock.patch("lodger.engine.vulkan_layer", return_value="/x.json"):
+            text = run_doctor(describe=desc, libs={"libvulkan.so.1": ["libggml-vulkan.so"]})
+        self.assertIn("MISSING library libvulkan.so.1 (needed by libggml-vulkan.so)", text)
+        self.assertIn("llama.cpp can't load libvulkan.so.1", text)
 
     def test_desktop(self):
         with machine("desktop-amd"):

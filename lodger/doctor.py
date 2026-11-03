@@ -3,12 +3,20 @@ writes nothing, and never wakes a graphics card that is asleep (its memory isn't
 
   lodger doctor
 
-Paste its output into a bug report: it holds no personal files, only the hardware, the settings and paths."""
+Paste its output into a bug report: it holds no personal files, only the hardware, the settings and paths
+(your home folder is written as ~)."""
+import contextlib
+import glob
+import http.client
+import io
 import os
 import platform
+import re
+import shutil
+import subprocess
 import sys
 
-from . import config, engine, fence, gpu, host, reserve
+from . import __version__, config, engine, fence, gpu, host, reserve
 from .gpu import nvidia
 
 GiB = 1 << 30
@@ -32,6 +40,58 @@ def memory():
     m = host.meminfo()
     swap = f", swap {gib(m['SwapTotal'])}" if m.get("SwapTotal") else ", no swap"
     return f"RAM {gib(m.get('MemTotal', 0))}, {gib(m.get('MemAvailable', 0))} available now{swap}"
+
+
+def private(text, home=None):
+    """The report with the home folder written as ~ (it names the user)."""
+    home = (os.path.expanduser("~") if home is None else home).rstrip("/")
+    if not home:
+        return text
+    return re.sub(re.escape(home) + r"(?=/|\b|$)", "~", text)
+
+
+def missing_libs(bin_dir):
+    """{library: [programs or backends that need it]} that the system's loader can't find, for llama.cpp's
+    programs and the backend libraries it loads later (ldd reads them; nothing of llama.cpp runs)."""
+    if not bin_dir or not shutil.which("ldd"):
+        return {}
+    files = [os.path.join(bin_dir, n) for n in ("llama-server", "llama-fit-params")]
+    for sub in (bin_dir, os.path.join(bin_dir, "..", "lib"), os.path.join(bin_dir, "..", "lib64")):
+        files += sorted(glob.glob(os.path.join(sub, "libggml*.so*")) + glob.glob(os.path.join(sub, "libllama*.so*")))
+    gone = {}
+    for f in dict.fromkeys(os.path.realpath(f) for f in files if os.path.isfile(f)):
+        try:
+            r = subprocess.run(["ldd", f], capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        for line in r.stdout.splitlines():
+            m = re.match(r"\s*(\S+) => not found", line)
+            if m:
+                gone.setdefault(m.group(1), []).append(os.path.basename(f))
+    return gone
+
+
+def serving(port=8181):
+    """lodger serve on this PC: (systemd unit state or None, what /health on `port` answered or None)."""
+    unit = None
+    if shutil.which("systemctl"):
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            r = subprocess.run(["systemctl", "--user", "show", "-P", "ActiveState,UnitFileState", "lodger.service"],
+                               capture_output=True, text=True, timeout=10)
+            got = [x.strip() for x in r.stdout.splitlines() if x.strip()]
+            if r.returncode == 0 and len(got) == 2 and got[1]:
+                unit = f"{got[0]}, {got[1]}"
+    health = None
+    try:
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        c.request("GET", "/health")
+        resp = c.getresponse()
+        body = resp.read(4096).decode(errors="replace")
+        c.close()
+        health = f"{resp.status} {body.strip()}"
+    except (OSError, http.client.HTTPException):
+        pass
+    return unit, health
 
 
 def card_lines(dev, chosen):
@@ -62,6 +122,16 @@ def main(argv):
     if argv and argv[0] in ("-h", "--help"):
         print(__doc__)
         return 0
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            return report()
+    finally:
+        sys.stdout.write(private(out.getvalue()))
+        sys.stdout.flush()
+
+
+def report():
     checked, errors, warnings = config.check()
     try:
         cfg = config.get()
@@ -69,7 +139,7 @@ def main(argv):
         cfg = checked                       # a broken setting keeps its default here, and is listed
         config.use(cfg)
     problems = list(errors)
-    print("lodger doctor (reads only; wakes nothing)\n")
+    print(f"lodger doctor {__version__} (reads only; wakes nothing)\n")
     print("System:   " + system())
     print("Memory:   " + memory())
     src, detail = gpu.power_source()
@@ -127,6 +197,12 @@ def main(argv):
             else:
                 env = " ".join(f"{k}={v}" for k, v in t["env"].items())
                 print(f"  reaches the chosen card as {t['name']} ({env})")
+        gone = missing_libs(e["bin"])
+        for lib, who in sorted(gone.items()):
+            print(f"  MISSING library {lib} (needed by {', '.join(sorted(set(who)))})")
+        if gone:
+            problems.append("llama.cpp can't load " + ", ".join(sorted(gone)) + " (install them, or `lodger setup "
+                            "--backend` another build)")
         if "vulkan" in e["backends"]:
             layer = engine.vulkan_layer()
             print("  Vulkan: " + (f"Mesa's device-select layer found ({layer})" if layer else
@@ -177,6 +253,10 @@ def main(argv):
     except Exception as ex:                  # a broken models.toml is a finding, not a crash
         print(f"Models:   can't read {catalog.CONFIG}: {ex}")
         problems.append("models.toml unreadable")
+
+    unit, health = serving()
+    print("Serving:  " + ("lodger.service " + unit if unit else "no lodger.service")
+          + "; 127.0.0.1:8181 " + (f"answers /health: {health}" if health else "doesn't answer"))
 
     print("\n" + ("All fine." if not problems else "To look at: " + "; ".join(problems)))
     return 0

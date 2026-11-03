@@ -239,6 +239,8 @@ def main(argv):
     ap.add_argument("--rocm", metavar="VERSION", help="ROCm build to take when there are several (default: the newest)")
     ap.add_argument("--keep", type=int, default=2, help="downloads to keep, the new one included (default 2)")
     a = ap.parse_args(argv)
+    if a.keep < 1:
+        ap.error("--keep must be 1 or more (the new download is always kept)")
     safe_tar()
     arch = ARCH.get(platform.machine().lower())
     if not arch:
