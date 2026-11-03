@@ -203,7 +203,11 @@ def download(pick, base=None):
     base = base or folder()
     dest = os.path.join(base, pick.name + ".gguf")
     part = dest + ".part"
-    if os.path.lexists(dest) and read_marker(dest) is None:
+    note = read_marker(dest) if os.path.lexists(dest) else None
+    with contextlib.suppress(OSError):
+        if note and os.path.getsize(dest) != note.get("size"):
+            note = None                             # a note left from before, next to another file
+    if os.path.lexists(dest) and note is None:
         raise SystemExit(f"{dest} is already there and lodger didn't download it: move or rename it first, so it "
                          "isn't replaced")
     have = os.path.getsize(part) if os.path.exists(part) else 0
@@ -380,10 +384,16 @@ def register(base=None, config=None):
                 "so lodger serve finds it")
     target = os.path.realpath(config)           # a link (e.g. to a dotfiles folder) stays a link
     tmp = target + ".lodger-tmp"
-    with open(tmp, "w", encoding="utf-8", newline="") as f:     # as it was, \r\n included
-        f.write(new)
-    shutil.copymode(target, tmp)
-    os.replace(tmp, target)
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="") as f:     # as it was, \r\n included
+            f.write(new)
+        shutil.copymode(target, tmp)
+        os.replace(tmp, target)
+    except OSError as ex:                       # e.g. a link into a read-only folder: the download is fine
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        return (f"NOTE: lodger couldn't write {target} ({ex.strerror or ex}); add \"{entry}\" to its `folders` "
+                "so lodger serve finds it")
     return f"Added \"{entry}\" to `folders` in {config}, so lodger serve finds it"
 
 
