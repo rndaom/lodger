@@ -1,0 +1,6 @@
+# The source release is for installing: the tests need recorded machines with symlinks that sdists can't carry,
+# so they live in git (and in GitHub's tag archives) only.
+include CHANGELOG.md CONTRIBUTING.md SECURITY.md
+recursive-include systemd *.service *.toml
+prune tests
+global-exclude __pycache__ *.py[co]
