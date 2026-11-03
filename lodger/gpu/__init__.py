@@ -118,6 +118,35 @@ class Device:
             return m.get("gtt_total") or (meminfo or host.meminfo()).get("MemTotal", 0)
         return m["total"]
 
+    def crash_report(self):
+        """True while the kernel keeps a crash report (devcoredump) from this card's driver: the card reset or
+        hung in the last few minutes (the kernel deletes them after 5). Reads only sysfs links."""
+        base = "/sys/class/devcoredump"
+        return any(host.realname(f"{base}/{n}/failing_device") == self.pci
+                   for n in host.listdir(base) if n.startswith("devcd"))
+
+    def heat(self):
+        """[(sensor, degrees C now, critical)] from the card's hwmon, for sensors with a critical line; [] without
+        them, and while the card sleeps (reading may wake it)."""
+        if self.asleep():
+            return []
+        out = []
+        for h in sorted(host.listdir(f"{self.sys}/hwmon")):
+            d = f"{self.sys}/hwmon/{h}"
+            for n in sorted(host.listdir(d)):
+                m = re.fullmatch(r"(temp\d+)_input", n)
+                if not m:
+                    continue
+                now, crit = host.read_int(f"{d}/{n}", None), host.read_int(f"{d}/{m.group(1)}_crit", None)
+                if now is not None and crit:
+                    out.append(((host.read(f"{d}/{m.group(1)}_label") or m.group(1)).strip(), now / 1000, crit / 1000))
+        return out
+
+    def too_hot(self):
+        """Plain words for the sensors at or over their critical temperature, or None."""
+        hot = [f"{name} {t:.0f} °C (critical {c:.0f} °C)" for name, t, c in self.heat() if t >= c]
+        return ", ".join(hot) or None
+
     def outputs(self):
         """Connected screens, e.g. ['DP-1', 'HDMI-A-1']."""
         if not self.card:

@@ -296,5 +296,35 @@ class NvmlLifeTest(unittest.TestCase):
         self.assertTrue(nvidia.cuda_ok(13, (580, 65, 6)))
 
 
+class CardTroubleSignsTest(unittest.TestCase):
+    def test_crash_report_names_the_card(self):
+        with machine("desktop-amd", writable=True) as root:
+            d = gpu.choose()
+            self.assertFalse(d.crash_report())
+            os.makedirs(os.path.join(root, "sys/class/devcoredump/devcd3"))
+            os.symlink(os.path.join(root, "sys/bus/pci/devices/0000:11:00.0"),
+                       os.path.join(root, "sys/class/devcoredump/devcd3/failing_device"))
+            self.assertFalse(d.crash_report())                  # the built-in graphics' report
+            os.makedirs(os.path.join(root, "sys/class/devcoredump/devcd4"))
+            os.symlink(os.path.join(root, "sys/bus/pci/devices/0000:03:00.0"),
+                       os.path.join(root, "sys/class/devcoredump/devcd4/failing_device"))
+            self.assertTrue(d.crash_report())
+
+    def test_heat_from_hwmon(self):
+        with machine("desktop-amd", writable=True) as root:
+            h = "/sys/bus/pci/devices/0000:03:00.0/hwmon/hwmon2"
+            for name, now, crit in (("temp1", 43000, 100000), ("temp2", 111000, 110000), ("temp3", 66000, 0)):
+                write(root, f"{h}/{name}_input", f"{now}\n")
+                write(root, f"{h}/{name}_crit", f"{crit}\n")
+            write(root, f"{h}/temp2_label", "junction\n")
+            d = gpu.choose()
+            self.assertEqual(d.heat()[:2], [("temp1", 43.0, 100.0), ("junction", 111.0, 110.0)])
+            self.assertIn("junction 111", d.too_hot())
+            write(root, f"{h}/temp2_input", "90000\n")
+            self.assertIsNone(d.too_hot())
+            write(root, "/sys/bus/pci/devices/0000:03:00.0/power/runtime_status", "suspended\n")
+            self.assertEqual(d.heat(), [])                      # never woken to look
+
+
 if __name__ == "__main__":
     unittest.main()

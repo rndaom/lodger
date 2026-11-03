@@ -22,7 +22,7 @@ import threading
 import time
 import traceback
 
-from . import config, engine, fence, neighbors, plan as planner, reserve, sysmem
+from . import config, engine, fence, gpu, neighbors, plan as planner, reserve, sysmem
 from .gpu import fdinfo
 from .neighbors import Neighbors
 
@@ -33,6 +33,7 @@ RUNS = config.runs_dir()
 KILL_RAM_AVAIL = max(1536, int(os.environ.get("LODGER_KILL_RAM_AVAIL_MIB", 0))) * MiB
 LOAD_SECONDS = 90          # watch faster while the model loads (its biggest allocations happen then)
 OTHER_CARD = 256 * MiB     # the model holding this much on a card lodger didn't choose: wrong card, stop it
+HOT_SECONDS = 5.0          # the card at its critical temperature this long: step aside
 # The author's own setup (extras.llama_router in config.toml): ~/.local/bin/llama-game-guard leaves this while it
 # has llama-router stopped for a game; the router comes back after
 GAME_GUARD_FLAG = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"),
@@ -75,11 +76,23 @@ def settle(card, seconds=None, limit=30.0):
     return "memory on the graphics card kept changing for 30 s (another app is loading)"
 
 
+def card_trouble(card):
+    """Why a card is in no state for a model right now (None = fine): it reset or hung a few minutes ago, or it
+    is at its critical temperature."""
+    if card is None:
+        return None
+    if card.crash_report():
+        return ("the graphics card reset or hung in the last few minutes (its driver saved a crash report); "
+                "lodger stays off it for now")
+    hot = card.too_hot()
+    return f"the graphics card is too hot: {hot}" if hot else None
+
+
 def gpu_blockers(allowed, card):
     """Reasons the graphics card must not be used right now (None = fine)."""
     if not allowed:
         return "the graphics card is only used when you allow it (pass --allow-gpu)"
-    return router_coming() or settle(card)
+    return card_trouble(card) or router_coming() or settle(card)
 
 
 def fmt_cmd(cmd, env):
@@ -160,7 +173,8 @@ class Watchdog(threading.Thread):
         # when the safety checks last finished, on the monotonic clock: a wall-clock step back would hide a stuck
         # watchdog, and a resume from suspend (wall time jumps, monotonic doesn't) would look like one
         self.beat = time.monotonic()
-        self.last_nb = 0.0
+        self.last_nb = self.last_slow = 0.0
+        self.hot_since = None
         self._lock = threading.Lock()
 
     def healthy(self, stale=None):
@@ -244,12 +258,35 @@ class Watchdog(threading.Thread):
             self.kill(f"the model went over its RAM cap ({self.fenced.cap // MiB} MiB)")
         elif dev_due and self.check_device():
             pass
+        elif self.on_gpu and now - self.last_slow >= 1.0 and self.check_card(now):
+            pass
         elif self.on_gpu and now - self.last_nb >= 0.25:
             self.last_nb = now
             why = self.neighbors.update() or router_coming()
             if why:
                 self.kill(why + "; giving the graphics card back", graceful=True)
         return vf, ra
+
+    def check_card(self, now):
+        """Once a second, for a model on the card: did the card reset or hang, did the laptop go on battery, is
+        the card overheating? True if stopped."""
+        self.last_slow = now
+        if not self.card:
+            return False
+        if self.card.crash_report():
+            # the card is in trouble already: no waiting for the model to wind down
+            self.kill("the graphics card reset or hung (its driver saved a crash report); stopped to be safe")
+            return True
+        if (not self.card.integrated and not config.get()["gpu_on_battery"]
+                and gpu.power_source()[0] == "battery"):
+            self.kill("the PC went on battery (gpu_on_battery in config.toml); giving the graphics card back", graceful=True)
+            return True
+        hot = self.card.too_hot()
+        self.hot_since = (self.hot_since or now) if hot else None
+        if hot and now - self.hot_since >= HOT_SECONDS:
+            self.kill(f"the graphics card is too hot ({hot}); giving the graphics card back", graceful=True)
+            return True
+        return False
 
     def note(self, f, t, vf, ra):
         """The model's own use, for the log and for learning (not a safety check)."""
