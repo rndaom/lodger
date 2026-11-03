@@ -46,6 +46,7 @@ WRAP = ('cg="$1"; shift; if [ -n "$cg" ]; then echo $$ > "$cg/cgroup.procs" || e
         'echo 1000 > /proc/self/oom_score_adj 2>/dev/null; ulimit -c 0; exec nice -n 10 "$@"')
 
 SYSTEMCTL_WAIT = 5          # seconds: a systemd that hasn't answered by then counts as failed (it may hang)
+ASK_AGAIN = 30              # seconds before a systemd that didn't answer is asked again
 _mode = None
 _live = set()
 _count = 0
@@ -98,17 +99,19 @@ def delegated():
     return None, "no cgroup this user may write to with the memory controller (not delegated)"
 
 
+def _manager():
+    """The systemd user manager's cgroup folder: its units' cgroups are under it."""
+    uid = os.getuid()
+    m = re.match(rf"^(.*/user@{uid}\.service)(?:/|$)", own_cgroup() or "")
+    return CGROOT + m.group(1) if m else f"{CGROOT}/user.slice/user-{uid}.slice/user@{uid}.service"
+
+
 def systemd_memory():
     """(True, None) if the systemd user manager can cap its services' memory (it has the memory controller),
     else (False, why). Each unit is checked again once it runs (Fenced.hard)."""
     if not os.path.exists(host.path(CGROOT + "/cgroup.controllers")):
         return False, "cgroup v1 or hybrid: the systemd user manager can't cap memory"
-    uid = os.getuid()
-    mgr = f"{CGROOT}/user.slice/user-{uid}.slice/user@{uid}.service"
-    m = re.match(rf"^(.*/user@{uid}\.service)(?:/|$)", own_cgroup() or "")
-    if m:
-        mgr = CGROOT + m.group(1)
-    ctl = host.read(mgr + "/cgroup.controllers")
+    ctl = host.read(_manager() + "/cgroup.controllers")
     if ctl is None:
         return True, None                   # an unusual layout: each unit's own check decides
     if "memory" not in ctl.split():
@@ -207,6 +210,7 @@ class Fenced:
     """One program inside a fence. props are systemd unit properties (MemoryMax, MemorySwapMax, LimitCORE,
     CPUWeight, IOWeight, Nice, PrivateDevices, RuntimeMaxSec); the other kinds apply what they can.
     env: what lodger sets for it (see engine.child_env for the rest of its environment)."""
+    _ask_after = 0.0            # monotonic time before which systemd isn't asked for the unit's cgroup again
 
     def __init__(self, cmd, env, props, stdin=subprocess.DEVNULL, stdout=None, stderr=None, pty=False,
                  new_session=False, name=None):
@@ -272,11 +276,19 @@ class Fenced:
 
     # ---- all kinds ----
     def cgroup(self):
-        """The cgroup folder, or None ('none' kind, or a systemd unit that is gone)."""
+        """The cgroup folder, or None ('none' kind, or a systemd unit that is gone). A unit's is looked for where
+        systemd-run puts it; systemd is asked only where it isn't there (an unusual layout), and a systemd
+        that didn't answer isn't asked again for a while: the watchdog calls this every tick."""
         if self.kind == "systemd" and not self.cg:
-            r = _systemctl("show", "-p", "ControlGroup", "--value", self.name + ".service")
-            cg = r.stdout.strip() if r and r.returncode == 0 else ""
-            self.cg = CGROOT + cg if cg else None
+            d = f"{_manager()}/app.slice/{self.name}.service"
+            if os.path.isdir(d):
+                self.cg = d
+            elif time.monotonic() >= self._ask_after:
+                r = _systemctl("show", "-p", "ControlGroup", "--value", self.name + ".service")
+                if r is None:
+                    self._ask_after = time.monotonic() + ASK_AGAIN
+                cg = r.stdout.strip() if r and r.returncode == 0 else ""
+                self.cg = CGROOT + cg if cg else None
         return self.cg
 
     def pids(self):
@@ -358,14 +370,15 @@ class Fenced:
             return False
 
     def kill(self, sig=signal.SIGKILL):
-        # SIGKILL goes straight through the cgroup where it can: no systemd round trip, which can take seconds
-        # (or hang) exactly when memory runs low and the watchdog needs the model gone
+        """Signal everything in the fence. Never through systemctl: a systemd round trip can take seconds (or
+        hang) exactly when memory runs low and the watchdog needs the model gone. SIGKILL goes through
+        cgroup.kill where it can, else to each process in the fence's cgroup."""
         if sig == signal.SIGKILL and self._cgroup_kill():
             return
-        if self.kind == "systemd":
-            _systemctl("kill", "-s", signal.Signals(sig).name[3:], self.name + ".service")
-            return
-        for pid in self.pids() or ([self.proc.pid] if self.proc.poll() is None else []):
+        pids = self.pids()
+        if not pids and self.kind != "systemd" and self.proc.poll() is None:
+            pids = [self.proc.pid]              # (a systemd unit's client isn't the model: killing it does nothing)
+        for pid in pids:
             try:
                 os.kill(pid, sig)
             except OSError:
@@ -431,7 +444,7 @@ def _first_int(path):
 
 def _text(path):
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             return f.read()
     except OSError:
         return None
@@ -466,11 +479,22 @@ def named():
     procs = {}
     for p in host.listdir("/proc"):
         if p.isdigit():
-            env = host.read(f"/proc/{p}/environ") or ""
-            i = env.find("LODGER_FENCE_NAME=")
-            if i >= 0 and (i == 0 or env[i - 1] == "\0"):
-                procs.setdefault(env[i + len("LODGER_FENCE_NAME="):].split("\0", 1)[0], []).append(int(p))
-    return {name: pids for name, pids in procs.items() if NAME.match(name)}
+            name = fence_name(p)
+            if name:
+                procs.setdefault(name, []).append(int(p))
+    return procs
+
+
+def fence_name(pid):
+    """The lodger fence a process was started in, from the LODGER_FENCE_NAME it carries, or None."""
+    env = host.read(f"/proc/{pid}/environ") or ""
+    if "LODGER_FENCE_NAME=" not in env:
+        return None
+    for var in env.split("\0"):
+        if var.startswith("LODGER_FENCE_NAME="):
+            name = var[len("LODGER_FENCE_NAME="):]
+            return name if NAME.match(name) else None
+    return None
 
 
 def find_orphans():

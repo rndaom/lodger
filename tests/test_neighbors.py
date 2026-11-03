@@ -109,6 +109,26 @@ class UnseenBusyTest(unittest.TestCase):
         with Run(c, ours=[DEAD]) as r, mock.patch.object(fdinfo, "holds", side_effect=lambda pid, path: path == "/dev/kfd"):
             self.assertIsNone(r.run(10))
 
+    def test_another_lodgers_rocm_model_isnt_a_stranger(self):
+        # another lodger's model, in its lodger-* unit: grouped with lodger's own, and judged the same way
+        c = Card()
+        c.apps = {10: [0.05, 300 * MiB, 0, 0], 30: [0.0, 8 * GiB, 0, 0]}
+        c.hidden_busy = 0.9
+        with Run(c, names={30: neighbors.OURS}) as r, \
+                mock.patch.object(fdinfo, "holds", side_effect=lambda pid, path: pid == 30 and path == "/dev/kfd"):
+            self.assertIsNone(r.run(10))
+
+    def test_another_lodgers_unfenced_rocm_model_isnt_a_stranger(self):
+        # a 'none' fence: the model shares that lodger's cgroup, and only its LODGER_FENCE_NAME tells it apart
+        c = Card()
+        c.apps = {10: [0.05, 300 * MiB, 0, 0], 30: [0.0, 8 * GiB, 0, 0]}
+        c.hidden_busy = 0.9
+        with Run(c, names={30: "lodger"}) as r, \
+                mock.patch.object(fdinfo, "holds", side_effect=lambda pid, path: pid == 30 and path == "/dev/kfd"), \
+                mock.patch("lodger.fence.fence_name", side_effect=lambda pid: "lodger-4242-1" if int(pid) == 30 else None):
+            self.assertIsNone(r.run(10))
+            self.assertNotIn("lodger", r.nb._sample())
+
     def test_a_rocm_app_lodger_can_see_counts_through_the_whole_card(self):
         c = Card()
         c.apps = {10: [0.05, 300 * MiB, 0, 0], 20: [0.0, 2 * GiB, 0, 0]}     # its compute shows nowhere per app

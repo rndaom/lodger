@@ -242,6 +242,37 @@ class SystemdKillTest(unittest.TestCase):
             f.kill(signal.SIGKILL)
             f.kill(signal.SIGTERM)
 
+    def test_sigkill_with_no_cgroup_known_asks_systemd_once_at_most(self):
+        f = self.fenced()
+        calls = []
+        with mock.patch.object(fence, "_manager", return_value="/nonexistent"), \
+                mock.patch.object(fence, "_systemctl", side_effect=lambda *a: calls.append(a[0])):
+            f.kill(signal.SIGKILL)
+            f.kill(signal.SIGKILL)                     # a systemd that didn't answer isn't asked every tick
+            f.kill(signal.SIGTERM)
+        self.assertEqual(calls, ["show"])
+
+    def test_signals_go_to_the_units_processes_not_through_systemd(self):
+        f = self.fenced()
+        with tempfile.TemporaryDirectory() as cg:
+            with open(os.path.join(cg, "cgroup.procs"), "w") as fh:
+                fh.write("4001\n4002\n")
+            f.cg = cg
+            with mock.patch.object(fence, "_systemctl") as ctl, mock.patch("lodger.fence.os.kill") as kill:
+                f.kill(signal.SIGTERM)
+                f.kill(signal.SIGKILL)                 # no cgroup.kill (a kernel before 5.14): one by one
+        ctl.assert_not_called()
+        self.assertEqual(kill.call_args_list, [mock.call(4001, signal.SIGTERM), mock.call(4002, signal.SIGTERM),
+                                               mock.call(4001, signal.SIGKILL), mock.call(4002, signal.SIGKILL)])
+
+    def test_the_units_cgroup_is_found_without_systemctl(self):
+        f = self.fenced()
+        with tempfile.TemporaryDirectory() as mgr:
+            os.makedirs(os.path.join(mgr, "app.slice", "lodger-1-3.service"))
+            with mock.patch.object(fence, "_manager", return_value=mgr), mock.patch.object(fence, "_systemctl") as ctl:
+                self.assertEqual(f.cgroup(), os.path.join(mgr, "app.slice", "lodger-1-3.service"))
+        ctl.assert_not_called()
+
     def test_stop_gives_up_on_a_hung_systemctl(self):
         f = self.fenced()
         f.proc.wait.return_value = 0

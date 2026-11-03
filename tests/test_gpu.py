@@ -313,18 +313,43 @@ class CardTroubleSignsTest(unittest.TestCase):
     def test_heat_from_hwmon(self):
         with machine("desktop-amd", writable=True) as root:
             h = "/sys/bus/pci/devices/0000:03:00.0/hwmon/hwmon2"
-            for name, now, crit in (("temp1", 43000, 100000), ("temp2", 111000, 110000), ("temp3", 66000, 0)):
+            for name, now, crit in (("temp1", 43000, 100000), ("temp2", 113000, 110000), ("temp3", 66000, 0)):
                 write(root, f"{h}/{name}_input", f"{now}\n")
                 write(root, f"{h}/{name}_crit", f"{crit}\n")
             write(root, f"{h}/temp2_label", "junction\n")
+            write(root, f"{h}/temp2_emergency", "115000\n")
             d = gpu.choose()
-            self.assertEqual(d.heat()[:2], [("temp1", 43.0, 100.0), ("junction", 111.0, 110.0)])
-            self.assertIn("junction 111", d.too_hot())
-            write(root, f"{h}/temp2_input", "90000\n")
-            self.assertIsNone(d.too_hot())
+            self.assertEqual(d.heat()[:2], [("temp1", 43.0, 100.0, None), ("junction", 113.0, 110.0, 115.0)])
+            self.assertIn("junction 113", d.too_hot())
             write(root, "/sys/bus/pci/devices/0000:03:00.0/power/runtime_status", "suspended\n")
             self.assertEqual(d.heat(), [])                      # never woken to look
 
+    def test_a_card_held_at_its_throttle_point_isnt_too_hot(self):
+        # amdgpu's critical temperature is where the card slows itself down to stay there (an RX 7800 XT's
+        # junction: 110 °C under long full load); its emergency line (115 °C) is where it shuts down
+        with machine("desktop-amd", writable=True) as root:
+            h = "/sys/bus/pci/devices/0000:03:00.0/hwmon/hwmon2"
+            write(root, f"{h}/temp2_label", "junction\n")
+            write(root, f"{h}/temp2_crit", "110000\n")
+            write(root, f"{h}/temp2_emergency", "115000\n")
+            d = gpu.choose()
+            for t, running, starting in ((110, False, True), (112, False, True), (113, True, True),
+                                         (104, False, True), (100, False, False)):
+                write(root, f"{h}/temp2_input", f"{t * 1000}\n")
+                self.assertEqual(bool(d.too_hot()), running, f"{t} °C, running")
+                # a model starts only once the card has cooled well below its throttle point: a card at its
+                # limit doesn't stop and start a model in turns
+                self.assertEqual(bool(d.too_hot(starting=True)), starting, f"{t} °C, starting")
+
+    def test_without_an_emergency_line_a_few_degrees_over_critical_is_too_hot(self):
+        with machine("desktop-amd", writable=True) as root:
+            h = "/sys/bus/pci/devices/0000:03:00.0/hwmon/hwmon2"
+            write(root, f"{h}/temp1_crit", "100000\n")
+            d = gpu.choose()
+            write(root, f"{h}/temp1_input", "101000\n")
+            self.assertIsNone(d.too_hot())
+            write(root, f"{h}/temp1_input", "103000\n")
+            self.assertIn("103", d.too_hot())
 
 if __name__ == "__main__":
     unittest.main()

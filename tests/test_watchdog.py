@@ -85,6 +85,35 @@ class FailClosedTest(unittest.TestCase):
         self.assertEqual(w.reason, "first")
         self.assertEqual(f.signals, [signal.SIGKILL, signal.SIGKILL])
 
+    def test_a_closed_terminal_never_stops_a_kill(self):
+        f = FakeFence([], gone=False)
+        closed = io.StringIO()
+        closed.close()                                         # lodger's terminal went away
+        with machine("desktop-amd"), contextlib.redirect_stderr(closed), contextlib.redirect_stdout(closed):
+            w = launch.Watchdog(f, False, self.tmp.name)
+            w.kill("only 100 MiB of RAM left")
+        self.assertEqual(f.signals, [signal.SIGKILL])
+        self.assertEqual(w.reason, "only 100 MiB of RAM left")
+
+    def test_a_closed_terminal_never_ends_the_watching(self):
+        f = FakeFence([], gone=False)
+        closed = io.StringIO()
+        closed.close()
+        with machine("desktop-amd"), contextlib.redirect_stderr(closed), \
+                mock.patch.object(launch.sysmem, "meminfo", return_value={}):
+            w = self.start(f)
+            self.assertTrue(wait_for(lambda: f.signals.count(signal.SIGKILL) >= 3))
+            self.assertTrue(w.is_alive())
+
+    def test_watching_is_false_once_the_thread_is_gone_with_the_model_alive(self):
+        f = FakeFence([], gone=False)
+        with machine("desktop-amd"):
+            w = launch.Watchdog(f, False, self.tmp.name)
+            w.reason = "only 100 MiB of RAM left"              # decided to stop it, then the thread died
+            self.assertFalse(w.watching())
+            f._gone = True
+            self.assertTrue(w.watching())                      # nothing left to watch
+
     def test_logging_trouble_never_stops_the_watching(self):
         f = FakeFence([1234])
         low = {"MemTotal": 32 << 30, "MemAvailable": 100 * MiB}
@@ -270,7 +299,7 @@ class FakeCard:
     def crash_report(self):
         return self.crashed
 
-    def too_hot(self):
+    def too_hot(self, starting=False):
         return self.hot
 
 

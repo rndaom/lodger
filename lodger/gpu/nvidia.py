@@ -202,8 +202,13 @@ def usage(dev, pids):
             # than the last one seen would return none until the clock caught up (blind for that long)
             st["since_us"], st["seen"] = now_us - 1_000_000, {}
         for pid, ts, sm in sorted(nvml().utilization(dev.pci, st["since_us"]), key=lambda s: s[1]):
+            if ts > now_us + 1_000_000:
+                continue        # stamped before the clock was set back: its time to the last sample is unknown
             prev = st["seen"].get(pid, ts - 1_000_000 // 6)           # NVML samples about 6 times a second
-            st["ns"][pid] = st["ns"].get(pid, 0) + int(sm / 100 * max(0, ts - prev) * 1000)
+            # a sample stands for at most one sampling period (a second at the slowest): a process idle in
+            # between leaves no samples, and its share then must not cover the whole gap
+            gap = min(max(0, ts - prev), 1_000_000)
+            st["ns"][pid] = st["ns"].get(pid, 0) + int(sm / 100 * gap * 1000)
             st["seen"][pid] = ts
             st["since_us"] = max(st["since_us"], ts)
     except OSError:

@@ -33,7 +33,7 @@ RUNS = config.runs_dir()
 KILL_RAM_AVAIL = max(1536, int(os.environ.get("LODGER_KILL_RAM_AVAIL_MIB", 0))) * MiB
 LOAD_SECONDS = 90          # watch faster while the model loads (its biggest allocations happen then)
 OTHER_CARD = 256 * MiB     # the model holding this much on a card lodger didn't choose: wrong card, stop it
-HOT_SECONDS = 5.0          # the card at its critical temperature this long: step aside
+HOT_SECONDS = 5.0          # the card past its critical temperature this long: step aside (Device.too_hot)
 # The author's own setup (extras.llama_router in config.toml): ~/.local/bin/llama-game-guard leaves this while it
 # has llama-router stopped for a game; the router comes back after
 GAME_GUARD_FLAG = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"),
@@ -78,13 +78,13 @@ def settle(card, seconds=None, limit=30.0):
 
 def card_trouble(card):
     """Why a card is in no state for a model right now (None = fine): it reset or hung a few minutes ago, or it
-    is at its critical temperature."""
+    is too hot to start on (see Device.too_hot)."""
     if card is None:
         return None
     if card.crash_report():
         return ("the graphics card reset or hung in the last few minutes (its driver saved a crash report); "
                 "lodger stays off it for now")
-    hot = card.too_hot()
+    hot = card.too_hot(starting=True)
     return f"the graphics card is too hot: {hot}" if hot else None
 
 
@@ -149,6 +149,21 @@ def unit_cgroup(unit):
     return "/sys/fs/cgroup" + cg if cg else None
 
 
+def _say(text):
+    """A line on lodger's terminal; never fails (the terminal may be closed, or a pipe nobody reads)."""
+    try:
+        print(text, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
+def _trace():
+    try:
+        traceback.print_exc()
+    except Exception:
+        pass
+
+
 class Watchdog(threading.Thread):
     """Watches a running model and stops it when memory gets low or another app needs the card.
     It fails closed: an error in its checks stops the model too, and once it has decided to stop the model it
@@ -181,22 +196,27 @@ class Watchdog(threading.Thread):
         """True while the thread runs and its last round of checks finished within `stale` seconds."""
         return self.is_alive() and time.monotonic() - self.beat < (stale or self.STALE)
 
+    def watching(self, stale=None):
+        """Is the model watched? Yes while healthy() or once the model is gone; a watchdog that decided to stop the
+        model (reason set) but died before it was gone is not watching it."""
+        return self.healthy(stale) or self.fenced.gone()
+
     def kill(self, why, graceful=False):
         """Stop the model (the first reason given is kept). Every call sends SIGKILL again, so a kill that
-        didn't land (systemctl failed, say) is retried."""
+        didn't land (cgroup.kill failed, say) is retried."""
         with self._lock:
             first = self.reason is None
             if first:
                 self.reason = why
-        if first:
-            print(f"\n[lodger] STOPPING THE MODEL: {why}", file=sys.stderr, flush=True)
-            if graceful:
-                self.fenced.kill(signal.SIGTERM)
-                t0 = time.monotonic()
-                while time.monotonic() - t0 < 1.5 and not self.fenced.gone() and not self.short():
-                    time.sleep(0.1)
-                    self.beat = time.monotonic()    # waiting on purpose, not stuck
+        if first and graceful:
+            self.fenced.kill(signal.SIGTERM)
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < 1.5 and not self.fenced.gone() and not self.short():
+                time.sleep(0.1)
+                self.beat = time.monotonic()    # waiting on purpose, not stuck
         self.fenced.kill(signal.SIGKILL)
+        if first:                               # said after: a terminal that's gone must not stop the kill
+            _say(f"\n[lodger] STOPPING THE MODEL: {why}")
 
     def card_free(self):
         """Free memory on the model's card, or None if it can't be read (a reset, an unplugged card)."""
@@ -328,11 +348,11 @@ class Watchdog(threading.Thread):
                 else:
                     vf, ra = self.check(now, dev_due)
             except Exception as ex:                                         # can't check: don't guess, stop it
-                traceback.print_exc()
+                _trace()
                 try:
                     self.kill(f"the watchdog couldn't check the model ({type(ex).__name__}: {ex}); stopped to be safe")
                 except Exception:
-                    traceback.print_exc()
+                    _trace()
             self.beat = time.monotonic()
             if now - last_log >= 0.5:                                       # logged twice a second
                 last_log = now

@@ -97,13 +97,34 @@ class NvidiaClockTest(unittest.TestCase):
             from lodger import gpu
             card = gpu.choose()
             with mock.patch("time.time", return_value=t / 1e6):
-                card.usage([500])
+                before = card.usage([500])[500]["busy_ns"]
             back = t - int(HOUR * 1e6)                          # the clock went back an hour; NVML stamps follow it
             fake.samples += [(500, back + 1_000_000, 60), (500, back + 2_000_000, 60)]
             with mock.patch("time.time", return_value=(back + 2_000_000) / 1e6):
                 card.usage([500])
                 b = card.usage([500])[500]["busy_ns"]
-            self.assertGreater(b, 500_000_000)
+            self.assertGreater(b - before, 0)
+            # NVML still holds the sample stamped an hour ahead: it must not count as an hour of work
+            self.assertLess(b - before, 1_000_000_000)
+            fake.samples += [(500, back + 3_000_000, 60)]
+            with mock.patch("time.time", return_value=(back + 3_000_000) / 1e6):
+                b2 = card.usage([500])[500]["busy_ns"]
+            self.assertAlmostEqual(b2 - b, 600_000_000, delta=1_000_000)   # a second at 60 %, as before the step
+
+    def test_a_long_gap_between_samples_counts_one_sample_period_at_most(self):
+        with machine("laptop-nvidia", writable=True) as root:
+            write(root, "/sys/bus/pci/devices/0000:01:00.0/power/runtime_status", "active\n")
+            t = 1_700_000_000_000_000
+            fake = FakeNVML(procs={500: 1 << 30}, samples=[(500, t, 100)])
+            nvidia._nvml = fake
+            from lodger import gpu
+            card = gpu.choose()
+            with mock.patch("time.time", return_value=t / 1e6):
+                before = card.usage([500])[500]["busy_ns"]
+            fake.samples += [(500, t + 60_000_000, 100)]       # one busy sample after a minute without any
+            with mock.patch("time.time", return_value=(t + 60_000_000) / 1e6):
+                b = card.usage([500])[500]["busy_ns"]
+            self.assertLessEqual(b - before, 1_000_000_000)
 
 
 if __name__ == "__main__":

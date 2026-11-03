@@ -36,11 +36,11 @@ def main(argv):
     d = next((c for c in sysmem.cards() if c["pci"] == pci), None)
     peaks = {}          # app -> {vram, gtt, vram_igpu, pss}
     totals = []         # (t, vram_used, gtt_used, ram_avail, swap_used)
-    t0 = time.time()
+    t0 = time.monotonic()
     with open(os.path.join(out, "samples.jsonl"), "w") as f:
-        while not stop and time.time() - t0 < a.seconds:
+        while not stop and time.monotonic() - t0 < a.seconds:
             snap = sysmem.snapshot()
-            t = round(time.time() - t0, 1)
+            t = round(time.monotonic() - t0, 1)
             card = next((c for c in snap["cards"] if c["pci"] == pci), None)
             mem = snap["mem"]
             row = {
@@ -67,7 +67,7 @@ def main(argv):
             totals.append((t, row["vram_used"], row["gtt_used"], row["ram_avail"], row["swap_used"]))
             if not a.quiet:
                 live(row)
-            time.sleep(max(0.0, a.interval - (time.time() - t0 - t)))
+            time.sleep(max(0.0, a.interval - (time.monotonic() - t0 - t)))
 
     summary = summarize(out, d, peaks, totals)
     print(summary)

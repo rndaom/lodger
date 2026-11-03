@@ -86,7 +86,7 @@ def app_name(pid):
     if leaf.startswith("wayland-wm@"):                       # the compositor, as uwsm starts it
         return re.split(r"[.@]", leaf[len("wayland-wm@"):])[0].lower()
     name = re.sub(r"\.(service|scope|slice)$", "", leaf)
-    name = name.encode().decode("unicode_escape")          # gtk\x2dlaunch -> gtk-launch
+    name = re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m[1], 16)), name)   # gtk\x2dlaunch -> gtk-launch
     if name.startswith("app-"):
         name = name[4:]
         name = re.sub(r"^(Hyprland|gnome|kde|niri|sway)-", "", name)   # launched by the desktop's own launcher
