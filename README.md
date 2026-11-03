@@ -77,7 +77,8 @@ whether it worked or not.
 - **llama.cpp**: `lodger setup` downloads a ready-made build (Vulkan by default) and checks it. Your own build
   works too: set `llama_cpp` in `~/.config/lodger/config.toml` or `LODGER_LLAMA_CPP`.
 - **A model** as a `.gguf` file, from [Hugging Face](https://huggingface.co/models?library=gguf) for example.
-  Check the model's licence yourself; lodger never downloads or redistributes models for you.
+  Check the model's licence yourself. lodger downloads a model only when you ask (`lodger models get`, below)
+  and never redistributes one.
 - **RAM:** 16 GB or more is comfortable. The only machine tested has 30 GiB. 8 GB works for small models on the
   processor, but is untested.
 
@@ -98,6 +99,10 @@ Not on PyPI yet? Install from source instead:
 uv tool install git+https://github.com/rndaom/lodger
 ```
 
+On Arch Linux (and Omarchy, Manjaro, EndeavourOS): an AUR package, [`lodger-git`](packaging/aur/lodger-git/PKGBUILD),
+is ready and checked in CI, but not on the AUR yet. Until it is, `makepkg -si` in that folder builds and installs it
+(install `python-gguf` from the AUR first).
+
 lodger serves every model it finds in the folders listed in `~/.config/lodger/models.toml`, or, without that
 file, the models `lodger models get` downloaded. Already have models? Copy
 [`systemd/models.example.toml`](systemd/models.example.toml) there and point `folders` at them. You can also
@@ -112,9 +117,16 @@ Then connect an app at **`http://127.0.0.1:8181/v1`** (see below), or just try i
 lodger ask "Why is the sky blue?"
 ```
 
-To start lodger at login, copy [`systemd/lodger.service`](systemd/lodger.service) to `~/.config/systemd/user/`
-and `systemctl --user enable --now lodger`. It runs `~/.local/bin/lodger` (where pipx, `uv tool` and `pip --user`
-put it); the file says how to point it elsewhere.
+To start lodger at login:
+
+```bash
+lodger service install        # a systemd user unit for this lodger: enabled and started, holds no memory until asked
+```
+
+It runs `lodger serve --allow-gpu --idle 10` (`--no-gpu`, `--idle MIN` and `--ollama` change that), and leaves a
+`lodger.service` it didn't write alone. `lodger service status` and `lodger service remove` do what they say; the
+logs are in `journalctl --user -u lodger`. The AUR package brings the unit with it: `systemctl --user enable --now
+lodger`.
 
 ## Models to start with
 
@@ -217,7 +229,8 @@ middle of a move: that answer ends with an error, and well-behaved clients retry
 | `lodger measure` | Log what each app uses, read-only |
 | `lodger unpause` | Start again any service lodger paused, after a crash |
 | `lodger stress MODEL`, `lodger stress-serve MODEL` | Tests that grab the card on purpose. See [Safety](#safety) |
-| `lodger doctor` | What lodger sees on this PC (cards, power, memory, llama.cpp, fence), read-only. Paste it into hardware reports |
+| `lodger service install` | Start `lodger serve` with your desktop session (systemd user unit); `status`, `remove` |
+| `lodger doctor` | What lodger sees on this PC (cards, power, memory, llama.cpp and its libraries, fence, whether lodger serve is up), read-only, with your home folder written as `~`. Paste it into hardware reports |
 | `lodger setup` | Download a llama.cpp release (Vulkan, ROCm, CUDA or CPU) into `~/.local/share/lodger`, checksum checked |
 | `lodger models` | Models to start with and which fit this PC; `get NAME` downloads one (checked), `rm NAME` moves it to the Trash. See [Models to start with](#models-to-start-with) |
 
