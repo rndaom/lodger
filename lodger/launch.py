@@ -33,7 +33,7 @@ RUNS = config.runs_dir()
 KILL_RAM_AVAIL = max(1536, int(os.environ.get("LODGER_KILL_RAM_AVAIL_MIB", 0))) * MiB
 LOAD_SECONDS = 90          # watch faster while the model loads (its biggest allocations happen then)
 OTHER_CARD = 256 * MiB     # the model holding this much on a card lodger didn't choose: wrong card, stop it
-HOT_SECONDS = 5.0          # the card at its critical temperature this long: step aside
+HOT_SECONDS = 5.0          # the card past its critical temperature this long: step aside (Device.too_hot)
 # The author's own setup (extras.llama_router in config.toml): ~/.local/bin/llama-game-guard leaves this while it
 # has llama-router stopped for a game; the router comes back after
 GAME_GUARD_FLAG = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"),
@@ -78,13 +78,13 @@ def settle(card, seconds=None, limit=30.0):
 
 def card_trouble(card):
     """Why a card is in no state for a model right now (None = fine): it reset or hung a few minutes ago, or it
-    is at its critical temperature."""
+    is too hot to start on (see Device.too_hot)."""
     if card is None:
         return None
     if card.crash_report():
         return ("the graphics card reset or hung in the last few minutes (its driver saved a crash report); "
                 "lodger stays off it for now")
-    hot = card.too_hot()
+    hot = card.too_hot(starting=True)
     return f"the graphics card is too hot: {hot}" if hot else None
 
 

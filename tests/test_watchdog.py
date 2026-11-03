@@ -299,7 +299,7 @@ class FakeCard:
     def crash_report(self):
         return self.crashed
 
-    def too_hot(self):
+    def too_hot(self, starting=False):
         return self.hot
 
 

@@ -32,6 +32,9 @@ def _hex(s):
         return 0
 
 
+HOT_OVER = 3        # degrees C past critical (where the card gives no emergency line): a running model steps aside
+COOL_UNDER = 10     # degrees C below critical before a model starts on the card
+
 class Device:
     """One graphics card (or built-in graphics), named by its PCI address."""
 
@@ -126,8 +129,8 @@ class Device:
                    for n in host.listdir(base) if n.startswith("devcd"))
 
     def heat(self):
-        """[(sensor, degrees C now, critical)] from the card's hwmon, for sensors with a critical line; [] without
-        them, and while the card sleeps (reading may wake it)."""
+        """[(sensor, degrees C now, critical, emergency or None)] from the card's hwmon, for sensors with a critical
+        line; [] without them, and while the card sleeps (reading may wake it)."""
         if self.asleep():
             return []
         out = []
@@ -137,14 +140,25 @@ class Device:
                 m = re.fullmatch(r"(temp\d+)_input", n)
                 if not m:
                     continue
-                now, crit = host.read_int(f"{d}/{n}", None), host.read_int(f"{d}/{m.group(1)}_crit", None)
+                t = m.group(1)
+                now, crit = host.read_int(f"{d}/{n}", None), host.read_int(f"{d}/{t}_crit", None)
                 if now is not None and crit:
-                    out.append(((host.read(f"{d}/{m.group(1)}_label") or m.group(1)).strip(), now / 1000, crit / 1000))
+                    emergency = host.read_int(f"{d}/{t}_emergency", None)
+                    out.append(((host.read(f"{d}/{t}_label") or t).strip(), now / 1000, crit / 1000,
+                                emergency / 1000 if emergency and emergency > crit else None))
         return out
 
-    def too_hot(self):
-        """Plain words for the sensors at or over their critical temperature, or None."""
-        hot = [f"{name} {t:.0f} °C (critical {c:.0f} °C)" for name, t, c in self.heat() if t >= c]
+    def too_hot(self, starting=False):
+        """Plain words for the sensors too hot, or None. A card's critical temperature is where it slows itself
+        down to stay there (amdgpu; an RX 7800 XT's junction sits at 110 °C under long full load), so reaching it
+        isn't trouble: a running model steps aside only once the card is past it, halfway to its emergency line
+        (where it shuts down), or HOT_OVER degrees past it where there's no such line. A model starts only once
+        the card is COOL_UNDER degrees below critical, so a card at its limit doesn't stop and start one in turns."""
+        hot = []
+        for name, t, crit, emergency in self.heat():
+            line = crit - COOL_UNDER if starting else (crit + emergency) / 2 if emergency else crit + HOT_OVER
+            if (t > line) if starting else (t >= line):
+                hot.append(f"{name} {t:.0f} °C (critical {crit:.0f} °C)")
         return ", ".join(hot) or None
 
     def outputs(self):
