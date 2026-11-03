@@ -192,9 +192,6 @@ this PC loads models onto the card and lodger uses it freely.
 - **Card scratch space was guessed**: now llama.cpp's own estimate + learned overhead.
 
 ## Later (promise 2 and 3)
-- Non-streaming answers start over after a move (streaming ones continue): stream from the engine inside lodger and
-  build the one JSON answer, so they keep what was written too.
-- Usage numbers (`usage`, `timings`) in a continued streaming answer count only the part after the move.
 - Shrink in place without a restart (grow-back is done, but every move restarts the engine).
 - `lodger serve --think`: continuing a half-written *reasoning* part after a move is untested.
 - Save the stress test's answers, to check the seam of a moved answer by eye on the card too (checked on
@@ -203,7 +200,10 @@ this PC loads models onto the card and lodger uses it freely.
   Linux compressed ~2 GB of other apps' idle memory).
 - Lower graphics-card priority for the model's work, so other apps' frames come first.
 - Keep the user's most-used experts on the card: b11936 has `--moe-cache-mib N` ("GPU cache for the MoE
-  experts kept in the CPU"), found 2026-10-28; try it in the plan's spare card memory.
+  experts kept in the CPU"). Sized in the plan since 2026-11-03 (`moe_cache_room_mib`); needs a card test, and
+  serve to pass it.
+- First answer: `launch.settle()` costs >= 4.5 s before every card start, though serve already watches the card
+  all the time (`quiet_since`); serve could skip settle when its own watch has seen that long a quiet card.
 - Two-drive striping for any model too big for RAM (from ds41-local).
 - Auto-setup: a one-time benchmark that writes the PC's profile.
 
@@ -279,7 +279,8 @@ check; no kernel errors, no crashes. Not tested: NVIDIA, Intel, AMD APUs on real
 on a PC with two cards of the same vendor:device id; the cgroup/none fences on other distros.
 
 ## Layout
-- `bin/lodger` - the one command: `lodger plan|run|measure|stress|serve|ask|stress-serve|doctor|setup` (`--help` on each).
+- `bin/lodger` - the one command: `lodger plan|run|measure|stress|serve|ask|pi|stress-serve|doctor|setup|models|service`
+  (`--help` on each).
 - `systemd/config.example.toml` - every setting, documented (live copy: `~/.config/lodger/config.toml`).
 - `systemd/models.example.toml` - the model list used here (live copy: `~/.config/lodger/models.toml`).
 - `lodger/` - the code: `catalog.py` (the model list), `launch.py` (plan/run, watchdog), `plan.py` (placement), `neighbors.py` (who
@@ -287,7 +288,10 @@ on a PC with two cards of the same vendor:device id; the cgroup/none fences on o
   `serve.py` (serve, ask, step aside, grow back), `servetest.py` (stress-serve), `gpu/` (cards: `fdinfo.py`,
   `amd.py`, `nvidia.py`, `intel.py`, `generic.py`), `engine.py` (llama.cpp and the card it uses), `config.py`,
   `reserve.py` (desktop reserve), `fence.py`, `host.py` (sysfs/proc reads, redirectable for tests),
-  `doctor.py`, `setup.py`.
+  `doctor.py`, `setup.py`, `picker.py` (`lodger models`), `ollama.py` (Ollama's API), `answers.py` (continuing
+  Chat, Messages and Responses answers across a move), `service.py` (`lodger service`).
+- `packaging/aur/lodger-git` - the AUR package; `packaging/aur/check.sh` builds, tests and installs it in an Arch
+  container (CI job `aur`). `.github/workflows/release.yml` publishes a `v*` tag to GitHub and PyPI.
 - `tests/` - stdlib unittest; `tests/fixtures/` recorded machines.
 - `systemd/lodger.service` - starts `lodger serve --allow-gpu --idle 10` (all models) with the desktop session;
   linked into `~/.config/systemd/user/` and enabled. The repo's unit runs an installed `~/.local/bin/lodger`; this PC
