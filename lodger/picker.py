@@ -40,7 +40,7 @@ import urllib.parse
 import urllib.request
 from typing import NamedTuple
 
-from . import catalog
+from . import catalog, host
 
 MiB, GiB = 1 << 20, 1 << 30
 HF = "https://huggingface.co"
@@ -71,7 +71,7 @@ class Pick(NamedTuple):
         return f"{HF}/{self.repo}"
 
 
-# smallest first; checked on Hugging Face 2026-10-29 (sizes and SHA-256 from its API, licences on both repos)
+# smallest first; checked on Hugging Face 2026-10-29 and 2026-11-03 (sizes and SHA-256 from its API, licences on both repos)
 LIST = (
     Pick("granite-4.2-3b", "ibm-granite/granite-4.2-3b-GGUF", "c40945d71cd90f249a56985e8155551a9188dc30",
          "granite-4.2-3b-Q4_K_M.gguf", 2244011552, "e0406663965846ae22a403456eb826ccce5f450840491f71952f18a7cb78e7d5",
@@ -203,6 +203,9 @@ def download(pick, base=None):
     base = base or folder()
     dest = os.path.join(base, pick.name + ".gguf")
     part = dest + ".part"
+    if os.path.lexists(dest) and read_marker(dest) is None:
+        raise SystemExit(f"{dest} is already there and lodger didn't download it: move or rename it first, so it "
+                         "isn't replaced")
     have = os.path.getsize(part) if os.path.exists(part) else 0
     if have > pick.size:                            # not this file: start again
         os.remove(part)
@@ -375,15 +378,38 @@ def register(base=None, config=None):
     if new is None:
         return (f"NOTE: lodger couldn't add the folder to {config} by itself; add \"{entry}\" to its `folders` "
                 "so lodger serve finds it")
-    tmp = config + ".lodger-tmp"
-    with open(tmp, "w") as f:
+    target = os.path.realpath(config)           # a link (e.g. to a dotfiles folder) stays a link
+    tmp = target + ".lodger-tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as f:     # as it was, \r\n included
         f.write(new)
-    shutil.copymode(config, tmp)
-    os.replace(tmp, config)
+    shutil.copymode(target, tmp)
+    os.replace(tmp, target)
     return f"Added \"{entry}\" to `folders` in {config}, so lodger serve finds it"
 
 
 # ---------- the Trash ----------
+
+def in_use(path):
+    """Processes (pids) that have `path` mapped or open, e.g. a running lodger serve's llama-server."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    real, out = os.path.realpath(path), []
+    for pid in host.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        maps = host.read(f"/proc/{pid}/maps") or ""
+        mapped = any(len(f := line.split(maxsplit=5)) == 6 and f[4] == str(st.st_ino) and f[5] == real
+                     for line in maps.splitlines())
+        if not mapped:
+            fds = host.path(f"/proc/{pid}/fd")
+            with contextlib.suppress(OSError):
+                mapped = any(os.readlink(os.path.join(fds, fd)) == real for fd in os.listdir(fds))
+        if mapped:
+            out.append(int(pid))
+    return out
+
 
 def trash(path):
     """Move `path` to the desktop's Trash: `gio trash` when there is one, else the freedesktop.org Trash in
@@ -693,8 +719,12 @@ def rm(name):
     with locked(base):
         for x in (path, path + ".part"):
             if os.path.lexists(x):
+                users = [p for p in in_use(x) if p != os.getpid()]
                 trash(x)
                 print(f"Moved to the Trash: {x}")
+                if users:
+                    print(f"It is in use right now (process {', '.join(map(str, users))}): that keeps running from the "
+                          "Trash until it stops, and the disk space comes back only then.")
         with contextlib.suppress(FileNotFoundError):
             os.remove(marker(path))
     print("If lodger serve is running, restart it so it stops offering it (systemctl --user restart lodger).")

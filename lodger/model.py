@@ -1,6 +1,8 @@
 """What a model file holds: the exact size of every piece, grouped the way the planner places them.
-Reads only the file headers with the `gguf` package (PyPI; or, if that isn't installed, the gguf-py folder of
-the llama.cpp source tree lodger uses). Split models are read from all parts."""
+Reads only the file headers, itself (read_gguf: a few milliseconds; the `gguf` package took seconds for a big
+tokenizer). Split models are read from all parts. gguf_reader() is for `lodger doctor`."""
+import bisect
+import copy
 import glob
 import os
 import re
@@ -32,7 +34,8 @@ def gguf_reader():
     return _gguf
 
 
-EXPERT = re.compile(r"^blk\.(\d+)\.ffn_.*_(?:ch)?exps(?:\.|$)")
+# the experts llama.cpp's --n-cpu-moe keeps in RAM (common.h LLM_FFN_EXPS_REGEX)
+EXPERT = re.compile(r"^blk\.(\d+)\.ffn_(?:up|down|gate|gate_up)_(?:ch)?exps")
 LAYER = re.compile(r"^blk\.(\d+)\.")
 
 
@@ -110,20 +113,133 @@ def architecture(path, keys=64):
     return v if isinstance(v, str) else None
 
 
-def _field(reader, key):
-    f = reader.fields.get(key)
-    if f is None:
-        return None
+# ggml's tensor types: (elements per block, bytes per block), as in gguf-py's GGML_QUANT_SIZES
+TYPES = {0: (1, 4), 1: (1, 2), 2: (32, 18), 3: (32, 20), 6: (32, 22), 7: (32, 24), 8: (32, 34), 9: (32, 36),
+         10: (256, 84), 11: (256, 110), 12: (256, 144), 13: (256, 176), 14: (256, 210), 15: (256, 292),
+         16: (256, 66), 17: (256, 74), 18: (256, 98), 19: (256, 50), 20: (32, 18), 21: (256, 110), 22: (256, 82),
+         23: (256, 136), 24: (1, 1), 25: (1, 2), 26: (1, 4), 27: (1, 8), 28: (1, 8), 29: (256, 56), 30: (1, 2),
+         34: (256, 54), 35: (256, 66), 39: (32, 17), 40: (64, 36), 41: (128, 18), 42: (64, 18)}
+REPACKABLE = {2, 8, 10, 12, 13, 14, 20, 39, 41}   # Q4_0 Q8_0 Q2_K Q4_K Q5_K Q6_K IQ4_NL MXFP4 Q1_0 (see plan.cpu_repacks)
+SHORT_LIST = 4096            # lists in the header up to this long are kept (per-layer settings); longer ones skipped
+
+
+def read_gguf(path):
+    """(settings, [(tensor name, bytes, ggml type, shape)]) from a GGUF file's header, without the gguf package: numbers, text and
+    short lists of numbers (per-layer settings); the tokenizer's long lists are skipped. A tensor's size comes
+    from its type and shape; for a type lodger doesn't know (or a size that doesn't fit where the next tensor
+    starts), from where the next one starts, which is how much of the file it really takes."""
+    import mmap
+    with open(path, "rb") as f:
+        size = os.fstat(f.fileno()).st_size
+        buf = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) if size else b""
     try:
-        return f.contents()
-    except Exception:
-        return None
+        return _parse(buf, size, path)
+    except (struct.error, IndexError, UnicodeDecodeError) as ex:
+        raise ValueError(f"{path}: not a readable GGUF file ({ex})") from None
+    finally:
+        if size:
+            buf.close()
+
+
+def _parse(buf, size, path):
+    pos = 0
+
+    def num(fmt):
+        nonlocal pos
+        v = struct.unpack_from(fmt, buf, pos)[0]
+        pos += struct.calcsize(fmt)
+        return v
+
+    def text():
+        nonlocal pos
+        n = num("<Q")
+        if n > size - pos:
+            raise ValueError(f"{path}: not a sensible GGUF header")
+        pos += n
+        return bytes(buf[pos - n:pos]).decode("utf-8", "replace")
+
+    def value(kind):
+        nonlocal pos
+        if kind == 8:
+            return text()
+        if kind == 9:
+            sub, n = num("<I"), num("<Q")
+            if sub in _KINDS and n <= SHORT_LIST:
+                fmt = _KINDS[sub]
+                out = list(struct.unpack_from("<" + fmt[1] * n, buf, pos))
+                pos += struct.calcsize(fmt) * n
+                return out
+            if sub in _SIZES:
+                pos += _SIZES[sub] * n
+            else:
+                for _ in range(n):
+                    value(sub)
+            return None
+        if kind not in _KINDS:
+            raise ValueError(f"{path}: unknown GGUF value type {kind}")
+        return num(_KINDS[kind])
+
+    if bytes(buf[:4]) != b"GGUF":
+        raise ValueError(f"{path}: not a GGUF file")
+    pos = 4
+    if num("<I") < 2:
+        raise ValueError(f"{path}: GGUF version 1 isn't supported")
+    n_tensors, n_kv = num("<Q"), num("<Q")
+    kv = {}
+    for _ in range(n_kv):
+        k = text()
+        v = value(num("<I"))
+        if v is not None:
+            kv[k] = v
+    align = kv.get("general.alignment")
+    align = align if type(align) is int and align > 0 else 32
+    infos = []
+    for _ in range(n_tensors):
+        name = text()
+        dims = [num("<Q") for _ in range(num("<I"))]
+        kind, offset = num("<I"), num("<Q")
+        infos.append((name, dims, kind, offset))
+    data = (pos + align - 1) // align * align
+    ends = sorted({o for _, _, _, o in infos} | {size - data})
+    tensors = []
+    for name, dims, kind, offset in infos:
+        room = ends[bisect.bisect_right(ends, offset)] - offset if offset < ends[-1] else 0
+        n = 1
+        for d in dims:
+            n *= d
+        block, nbytes = TYPES.get(kind, (0, 0))
+        exact = n // block * nbytes if block and n % block == 0 else None
+        tensors.append((name, exact if exact is not None and exact <= room < exact + align else max(room, exact or 0),
+                        kind, dims))
+    return kv, tensors
+
+
+_cache = {}
+
+
+def load(path):
+    """A Model, read once per change of its files (serve plans the same model again and again)."""
+    path = os.path.abspath(os.path.expanduser(path))
+    key = tuple((f, st.st_size, st.st_mtime_ns) for f in parts(path) for st in [os.stat(f)])
+    hit = _cache.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    m = Model(path)
+    if len(_cache) >= 32:
+        _cache.clear()
+    _cache[path] = (key, m)
+    return m
 
 
 class Model:
     """Sizes in bytes.
     layers[i] = {"dense": bytes, "experts": bytes}; also token_embd, output (on the card only when
-    every layer is there), other (anything not in a layer)."""
+    every layer is there), other (anything not in a layer).
+    Layers that only multi-token prediction (MTP) uses are loaded by llama.cpp only when asked to: they are
+    counted in mtp (same form as layers), and in layers as empty, so the layer numbers stay llama.cpp's.
+    kinds[i]: what a layer keeps for the context: "attn" (grows with it), "swa" (a sliding window: fixed once
+    the context is longer), "recr" (a fixed state), or None (nothing)."""
+    kv, mtp, mtp_quant, kinds, quant, tied = {}, {}, (), {}, (), False    # what a model made by hand (tests) lacks
 
     def __init__(self, path):
         self.path = os.path.abspath(os.path.expanduser(path))   # not realpath: split parts may be links to two drives
@@ -133,40 +249,84 @@ class Model:
         self.output = 0
         self.other = 0
         self.meta = {}
+        self.kv = {}
+        self.mtp = {}
+        self.quant = []           # (group, layer, ggml type, rows, bytes) of weights llama.cpp may repack
+        names = {}
         has_output = False
         for i, fp in enumerate(self.files):
-            r = gguf_reader()(fp, "r")
+            kv, tensors = read_gguf(fp)
             if i == 0:
-                arch = _field(r, "general.architecture")
+                self.kv = kv
+                arch = kv.get("general.architecture")
                 self.meta = {
                     "arch": arch,
-                    "name": _field(r, "general.name"),
-                    "block_count": _field(r, f"{arch}.block_count"),
-                    "ctx_train": _field(r, f"{arch}.context_length"),
-                    "expert_count": _field(r, f"{arch}.expert_count"),
-                    "expert_used": _field(r, f"{arch}.expert_used_count"),
+                    "name": kv.get("general.name"),
+                    "block_count": kv.get(f"{arch}.block_count"),
+                    "ctx_train": kv.get(f"{arch}.context_length"),
+                    "expert_count": kv.get(f"{arch}.expert_count"),
+                    "expert_used": kv.get(f"{arch}.expert_used_count"),
                 }
-            for t in r.tensors:
-                n, size = t.name, int(t.n_bytes)
+            for n, size, kind, dims in tensors:
+                group, layer = None, -1
                 m = EXPERT.match(n)
                 if m:
-                    self.layers.setdefault(int(m.group(1)), {"dense": 0, "experts": 0})["experts"] += size
-                    continue
-                m = LAYER.match(n)
-                if m:
-                    self.layers.setdefault(int(m.group(1)), {"dense": 0, "experts": 0})["dense"] += size
+                    layer, group = int(m.group(1)), "experts"
+                    self.layers.setdefault(layer, {"dense": 0, "experts": 0})["experts"] += size
+                elif LAYER.match(n):
+                    m = LAYER.match(n)
+                    layer, group = int(m.group(1)), "dense"
+                    self.layers.setdefault(layer, {"dense": 0, "experts": 0})["dense"] += size
+                    names.setdefault(layer, set()).add(n[m.end():].split(".")[0])
                 elif n == "token_embd.weight":
                     self.token_embd += size
+                    group = "token_embd"
                 elif n.startswith("output"):
                     self.output += size
                     has_output |= n == "output.weight"
+                    group = "output" if n == "output.weight" else None
                 else:
                     self.other += size
-            del r
-        if not has_output:
+                if group and kind in REPACKABLE and len(dims) in (2, 3):
+                    self.quant.append((group, layer, kind, dims[1], size))
+        self.tied = not has_output
+        if self.tied:
             # tied embeddings: llama.cpp makes a copy of token_embd for the output layer
             self.output += self.token_embd
-        self.n_layer = max(self.layers) + 1 if self.layers else 0
+            self.quant += [("output", -1, k, r, b) for g, _, k, r, b in self.quant if g == "token_embd"]
+        blocks = self.meta["block_count"]
+        self.n_layer = max([max(self.layers) + 1 if self.layers else 0] + ([blocks] if type(blocks) is int and self.layers else []))
+        arch = self.meta["arch"]
+        nextn = self.kv.get(f"{arch}.nextn_predict_layers")
+        if type(nextn) is int and 0 < nextn < self.n_layer:
+            for i in range(self.n_layer - nextn, self.n_layer):
+                if i in self.layers:
+                    self.mtp[i] = self.layers[i]
+                    self.layers[i] = {"dense": 0, "experts": 0}
+            self.mtp_quant = [q for q in self.quant if q[1] in self.mtp]
+            self.quant = [q for q in self.quant if q[1] not in self.mtp]
+        self.kinds = {i: None if i in self.mtp else _kind(names.get(i, ()), self._swa(i)) for i in range(self.n_layer)}
+
+    def _swa(self, i):
+        """Is layer i a sliding-window layer: True, False, or None (the model has sliding windows, but the file
+        doesn't say which layers)."""
+        arch = self.meta["arch"]
+        if not self.kv.get(f"{arch}.attention.sliding_window"):
+            return False
+        pattern = self.kv.get(f"{arch}.attention.sliding_window_pattern")
+        if isinstance(pattern, list):
+            return bool(pattern[i]) if i < len(pattern) else None
+        if type(pattern) is int and pattern > 0:
+            return i % pattern < pattern - 1        # llama.cpp's set_swa_pattern: every n-th layer sees everything
+        return None
+
+    def with_mtp(self):
+        """This model as llama.cpp loads it for multi-token prediction drafting (--spec-type draft-mtp): its MTP
+        layers' weights are loaded too (mtp still says which layers they are)."""
+        m = copy.copy(self)
+        m.layers = {**self.layers, **self.mtp}
+        m.quant = list(self.quant) + list(self.mtp_quant)
+        return m
 
     @property
     def is_moe(self):
@@ -184,5 +344,31 @@ class Model:
         ids = self.layers if layers is None else layers
         return sum(self.layers[i]["experts"] for i in ids if i in self.layers)
 
+    def repacked(self, rows, dense_layers, expert_layers, output):
+        """(bytes, of which the output layer's) that llama.cpp copies into its own memory in a faster layout when
+        these pieces run on the processor; rows: {ggml type: rows it must be a multiple of} (plan.cpu_repacks)."""
+        total = out = 0
+        for group, i, kind, n, size in self.quant:
+            if kind not in rows or n % rows[kind]:
+                continue
+            if group == "output" and output:
+                total, out = total + size, out + size
+            elif (group == "dense" and i in dense_layers) or (group == "experts" and i in expert_layers):
+                total += size
+        return total, out
+
     def file_bytes(self):
         return sum(os.path.getsize(f) for f in self.files)
+
+
+RECURRENT = ("ssm_", "shortconv", "time_mix", "conv1d")
+ATTENTION = ("attn_q", "attn_k", "attn_v", "attn_kv", "wkv")
+
+
+def _kind(names, swa):
+    """What a layer with these tensors keeps for the context (see Model.kinds)."""
+    if any(n.startswith(RECURRENT) for n in names):
+        return "recr"
+    if any(n.startswith(ATTENTION) for n in names):
+        return "swa" if swa else "attn"     # swa None (unknown): counted like the others, as before
+    return None

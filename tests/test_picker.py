@@ -4,6 +4,8 @@ import hashlib
 import http.server
 import importlib.util
 import io
+import json
+import mmap
 import os
 import re
 import shutil
@@ -222,6 +224,20 @@ class DownloadTest(ServerBase):
         self.assertEqual(first[0], f"/org/Tiny-GGUF/resolve/{'a' * 40}/Tiny-Q4_K_M.gguf")
         self.assertEqual(first[2], "lodger-models")
 
+    def test_a_file_lodger_didnt_download_is_never_replaced(self):
+        with open(self.dest, "wb") as f:
+            f.write(b"my own model")
+        with self.assertRaises(SystemExit) as ex:
+            picker.download(self.p, self.models)
+        self.assertIn("didn't download it", str(ex.exception))
+        with open(self.dest, "rb") as f:
+            self.assertEqual(f.read(), b"my own model")
+        self.assertFalse([x for x in FakeHF.seen if "/resolve/" in x[0]])     # nothing fetched
+        # one lodger did download (an older revision, say) is replaced
+        with open(picker.marker(self.dest), "w") as f:
+            json.dump({"sha256": "0" * 64}, f)
+        self.assertEqual(picker.download(self.p, self.models), self.dest)
+
     def test_an_interrupted_download_continues_where_it_stopped(self):
         FakeHF.cut_after = MiB + 7
         with self.assertRaises(SystemExit) as ex:
@@ -338,6 +354,19 @@ class RegisterTest(Base):
         with open(cfg) as f:
             self.assertEqual(f.read(), "folders = [\n")
 
+    def test_register_keeps_a_linked_config_a_link_and_its_line_ends(self):
+        real = os.path.join(self.dir, "dotfiles-models.toml")
+        with open(real, "wb") as f:
+            f.write(b'# m\xc3\xafne\r\nfolders = ["/elsewhere"]\r\n')
+        cfg = os.path.join(self.dir, "linked.toml")
+        os.symlink(real, cfg)
+        self.assertIn("Added", picker.register(self.models, cfg))
+        self.assertTrue(os.path.islink(cfg))
+        with open(real, "rb") as f:
+            self.assertEqual(f.read(), b'# m\xc3\xafne\r\nfolders = ["/elsewhere", ' + json.dumps(self.models).encode()
+                             + b']\r\n')
+        self.assertFalse([n for n in os.listdir(self.dir) if "lodger-tmp" in n])
+
     def test_catalog_scans_the_download_folder_unless_folders_are_set(self):
         open(os.path.join(self.models, "tiny-1b.gguf"), "wb").close()
         open(os.path.join(self.models, "tiny-1b.gguf.part"), "wb").close()
@@ -390,6 +419,33 @@ class TrashTest(Base):
         for bad in ("nothing-here", "../models/" + self.p.name, ".lock"):
             with self.subTest(bad), self.assertRaises(SystemExit):
                 picker.rm(bad)
+
+
+class InUseTest(unittest.TestCase):
+    def test_a_mapped_or_open_file_is_in_use(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "m.gguf")
+            with open(path, "wb") as f:
+                f.write(b"\0" * 4096)
+            self.assertEqual(picker.in_use(path), [])
+            with open(path, "rb") as f:
+                self.assertEqual(picker.in_use(path), [os.getpid()])          # open
+                mapped = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            try:
+                self.assertEqual(picker.in_use(path), [os.getpid()])          # mapped, the file closed
+            finally:
+                mapped.close()
+            self.assertEqual(picker.in_use(path), [])
+            self.assertEqual(picker.in_use(os.path.join(d, "gone.gguf")), [])
+
+    def test_rm_says_when_the_model_is_in_use(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(picker, "folder", return_value=d), \
+                mock.patch.object(picker, "in_use", return_value=[4242]), \
+                mock.patch.object(picker, "trash", side_effect=os.remove), \
+                mock.patch("sys.stdout", new=io.StringIO()) as out:
+            open(os.path.join(d, "x.gguf"), "w").close()
+            picker.rm("x")
+        self.assertIn("in use right now (process 4242)", out.getvalue())
 
 
 class FitTest(Base):

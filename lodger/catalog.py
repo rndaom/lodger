@@ -28,24 +28,33 @@ ALIASES = {
     "nr": "no-repack", "cram": "cache-ram", "mm": "mmproj", "lm": "load-mode", "lzm": "lazy-mode", "kvu": "kv-unified",
     "no-kvu": "no-kv-unified", "rea": "reasoning", "ctkd": "cache-type-k-draft", "ctvd": "cache-type-v-draft",
     "otd": "override-tensor-draft", "cmoed": "cpu-moe-draft", "ncmoed": "n-cpu-moe-draft", "devd": "device-draft",
-    "ngld": "n-gpu-layers-draft", "td": "threads-draft", "tbd": "threads-batch-draft",
+    "ngld": "n-gpu-layers-draft", "td": "threads-draft", "tbd": "threads-batch-draft", "ncffn": "n-cpu-ffn",
+    "ctxcp": "ctx-checkpoints", "swa-checkpoints": "ctx-checkpoints", "draft-p-split": "spec-draft-p-split",
+    "draft-p-min": "spec-draft-p-min",
 }
 # set by lodger itself for every run (its plan, its card, its server); a model's settings can't change them
 OWNED = {"n-gpu-layers", "n-cpu-moe", "cpu-moe", "host", "port", "api-key", "api-key-file", "threads",
          "threads-batch", "model", "alias", "fit", "fit-target", "fit-ctx", "fit-print", "parallel", "device",
          "split-mode", "tensor-split", "main-gpu", "override-tensor", "rpc", "model-url", "hf-repo", "hf-file",
          "hf-token", "docker-repo", "webui", "no-webui", "models-dir", "models-preset", "mmproj-device", "mmproj-url",
-         "cache-ram"}
+         "cache-ram", "n-cpu-ffn"}
 # change memory in ways lodger can't plan yet: a second model, extra weights, or the context moved to RAM
 UNPLANNED = {"model-draft": "a draft model (speculative decoding)", "hf-repo-draft": "a draft model (speculative decoding)",
-             "spec-type": "speculative decoding", "lora": "LoRA adapters", "lora-scaled": "LoRA adapters",
+             "lora": "LoRA adapters", "lora-scaled": "LoRA adapters",
              "control-vector": "control vectors", "control-vector-scaled": "control vectors",
              "override-kv": "changed model settings (override-kv)", "no-kv-offload": "the context kept in RAM (no-kv-offload)"}
 # change memory, and llama.cpp's own estimate (llama-fit-params) sizes them: the planner passes them on
 PLANNED = {"cache-type-k", "cache-type-v", "flash-attn", "ubatch-size", "batch-size", "swa-full", "no-host", "repack",
            "no-repack", "op-offload", "no-op-offload", "kv-offload", "load-mode", "lazy-mode"}
 # change memory, but llama-fit-params can't size them: plan.own_costs counts them itself
-COUNTED = {"mmproj", "mmproj-offload", "no-mmproj-offload", "no-mmap", "mlock", "mmap"}
+COUNTED = {"mmproj", "mmproj-offload", "no-mmproj-offload", "no-mmap", "mlock", "mmap", "ctx-checkpoints",
+           "moe-cache-mib", "image-max-tokens", "spec-type"}
+# speculative decoding lodger can plan: multi-token prediction (the model's own MTP layers) and n-grams (no model)
+SPEC_TYPES = {"none", "draft-mtp", "ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod", "ngram-cache"}
+# settings of those that don't change memory (or only make it smaller)
+SPEC_OK = {"spec-draft-n-max", "spec-draft-n-min", "spec-draft-p-min", "spec-draft-p-split", "spec-draft-n-ubatch",
+           "spec-draft-backend-sampling", "no-spec-draft-backend-sampling"}
+WHOLE = {"ctx-checkpoints", "moe-cache-mib", "image-max-tokens"}     # need a whole number, 0 or more
 MEMORY_SETTINGS = PLANNED | COUNTED
 
 
@@ -66,12 +75,22 @@ def problem(settings, ctx):
             return "its settings set ctx-size; write ctx = N instead, so lodger plans with it"
         if k in OWNED:
             return f"its settings set {k}, which lodger sets itself for every run; remove it from models.toml"
-        if k in UNPLANNED or k.startswith("spec-draft-") or k.endswith("-draft"):
+        if isinstance(v, dict):
+            return f"its setting {k} is a table; give it a value, like {k} = 1"
+        if k == "spec-type" and v is not True:
+            other = [t for t in (v if isinstance(v, list) else str(v).split(",")) if str(t).strip() not in SPEC_TYPES]
+            if other:
+                return (f"its settings ask for speculative decoding with a draft model (spec-type {','.join(map(str, other))}), "
+                        "which lodger can't plan memory for yet; draft-mtp and the ngram types work")
+        if k in WHOLE and v is not True and (type(v) is not int or v < 0):
+            return f"its setting {k} must be a whole number, 0 or more (it is {v!r})"
+        if k in UNPLANNED or (k.startswith("spec-draft-") and k not in SPEC_OK) or k.endswith("-draft"):
             return (f"its settings ask for {UNPLANNED.get(k, 'a draft model (speculative decoding)')} ({k}), which "
                     "lodger can't plan memory for yet")
         if k == "mmproj" and not (isinstance(v, str) and os.path.isfile(v)):
             return f"its vision projector (mmproj) isn't there: {v}"
-        if v is True and k in ("cache-type-k", "cache-type-v", "ubatch-size", "batch-size", "load-mode", "lazy-mode", "mmproj"):
+        if v is True and k in ("cache-type-k", "cache-type-v", "ubatch-size", "batch-size", "load-mode", "lazy-mode", "mmproj",
+                               "spec-type", *WHOLE):
             return f"its setting {k} needs a value, not true"
     return None
 
@@ -129,12 +148,16 @@ def load(paths=None, config=CONFIG):
             cfg = tomllib.load(f)
     defaults = cfg.get("defaults", {})
     ignore = listed(cfg, "ignore")
-    named = {}
+    named, again = {}, []
     for name, sec in cfg.get("models", {}).items():
         if not isinstance(sec, dict) or not isinstance(sec.get("file"), str):
             raise ValueError(f'[models.{name}] in models.toml needs file = "path/to/model.gguf"')
         path = os.path.abspath(os.path.expanduser(sec["file"]))
-        named[path] = (name, {k: v for k, v in sec.items() if k not in ("file", "skip")}, sec.get("skip"))
+        own = (name, {k: v for k, v in sec.items() if k not in ("file", "skip")}, sec.get("skip"))
+        if path in named:                            # the first section of a file counts; the others are listed, not served
+            again.append((path, own, named[path][0]))
+            continue
+        named[path] = own
     files = [os.path.abspath(os.path.expanduser(p)) for p in paths] if paths else []
     if not paths:
         files = list(named)
@@ -163,4 +186,8 @@ def load(paths=None, config=CONFIG):
             name = f"{name}-{n}"
         first.setdefault(name, p)
         out[name] = Entry(name, p, {**defaults, **own}, skip)
+    for p, (name, own, _), used in again:
+        if (not paths or p in files) and name not in out:
+            out[name] = Entry(name, p, {**defaults, **own}, f"its file is already served as {used}; one [models.NAME] "
+                              "section per file")
     return out, cfg.get("default")
