@@ -42,11 +42,12 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-from . import catalog, config, engine, fence, ollama, plan as planner, reserve, sysmem
+from . import answers, catalog, config, engine, fence, gpu as gpus, host, ollama, plan as planner, reserve, sysmem
 from .launch import GAME_GUARD_FLAG, RUNS, Watchdog, card_fields, gpu_blockers, router_coming, unit_cgroup, unit_props
 from .neighbors import Neighbors
 
 MiB, GiB = sysmem.MiB, sysmem.GiB
+MOVING = 256 * MiB        # lodger memory that changed this much between two looks is on the move
 HOST = "127.0.0.1"          # only this PC; part of the approved exception (../CLAUDE.md)
 QUIET_SECONDS = 60          # the card must be quiet this long before the model grows back
 MOVE_WAIT = 600             # how long a request waits for its model (a switch may wait for an answer)
@@ -280,6 +281,9 @@ class Lodger:
         self.cur = models[default]            # the model loaded (or to load next)
         self.default = default
         self.switch_to = None                 # a request is waiting for this model
+        self.switch_ticket = 0                # ... and its place in line: requests that came before it go first
+        self.ticket = 0                       # requests take numbers as they come in
+        self.waiting = {}                     # requests waiting for an engine: token -> (model, ticket)
         self.busy = {}                        # engine -> answers being written on it now
         self.cv = threading.Condition()
         self.engine = None
@@ -303,8 +307,129 @@ class Lodger:
         self.failures = 0                     # the current model's starts that failed in a row
         self.retry_at, self.retry_delay = 0.0, 10
         self.ollama = None                    # where Ollama's API is answered, or why not
+        self.t_start = time.time()
+        self.last_power = 0.0                 # when the power source was last looked at
+        self.reload_wanted = None             # why the model list is to be read again (SIGHUP), or None
+        self.reloading = threading.Lock()
+        self.conf = {n: self.fingerprint(e) for n, e in models.items()}   # each model as models.toml had it
+        self.models_file = catalog.CONFIG
+        self.models_seen, self.models_changed_at = self.models_stat(), None
+        self.models_read, self.models_error = time.time(), None
+        self.monitor_error = None
+        self.clock_off = time.time() - time.monotonic()   # moves when the PC sleeps or the clock is set (clock())
+        self.grace_until = 0.0                # monotonic: until then a stale watchdog heartbeat may be the clock's doing
         self.out = os.path.join(RUNS, time.strftime("%Y-%m-%d-%H%M%S") + "-serve")
         os.makedirs(self.out)
+
+    def clock(self):
+        """Did the PC sleep, or the clock get set, since the last look? The monotonic clock stops while the PC is
+        suspended, the wall clock doesn't. After such a jump the watchdog's heartbeat (wall time) looks stale until
+        its next round, so it gets a short grace instead of its model being stopped; and the card wasn't watched
+        meanwhile, so its quiet time starts again."""
+        off = time.time() - time.monotonic()
+        jump, self.clock_off = off - self.clock_off, off
+        if abs(jump) > 5:
+            self.grace_until = time.monotonic() + 15
+            self.quiet_since = time.time()
+            self.note(f"the PC slept or its clock was set ({jump / 60:+.0f} min): carrying on")
+        return jump
+
+    def watched(self, e):
+        """Is engine `e`'s watchdog on duty (or, just after the clock jumped, not yet known to be off it)?"""
+        self.clock()
+        return e.watched() or time.monotonic() < self.grace_until
+
+    @staticmethod
+    def fingerprint(e):
+        """A model as the model list gives it (file, settings, context, skip) and its file's size and time: when
+        this changes, lodger plans the model afresh."""
+        try:
+            st = os.stat(e.path)
+            stamp = (st.st_mtime_ns, st.st_size)
+        except (OSError, TypeError):
+            stamp = None
+        return (e.path, json.dumps(getattr(e, "settings", None), sort_keys=True, default=str), e.ctx, e.skip, stamp)
+
+    def models_stat(self):
+        try:
+            st = os.stat(self.models_file)
+            return st.st_mtime_ns, st.st_size
+        except OSError:
+            return None
+
+    def watch_models(self, now):
+        """Read the model list again once models.toml changed and then stayed the same for 3 s (an editor may
+        still be writing it)."""
+        seen = self.models_stat()
+        if seen != self.models_seen:
+            self.models_seen, self.models_changed_at = seen, now
+        elif self.models_changed_at and now - self.models_changed_at >= 3:
+            self.models_changed_at = None
+            self.reload(f"{self.models_file} changed")
+
+    def reload(self, why):
+        """Read the model list again (models.toml, or the files lodger was started with): new models are served,
+        removed ones no longer (an answer being written finishes first), and a model whose settings or file changed
+        is planned afresh from its next start (the same object, so requests in flight keep it). A list that can't
+        be read leaves the models as they were. True if it was read."""
+        with self.reloading:
+            try:
+                models, default = catalog.load(self.a.files or None, self.models_file)
+                if not models:
+                    raise ValueError("it lists no models")
+            except (OSError, ValueError, SystemExit) as ex:   # tomllib's errors are ValueErrors
+                self.models_error = f"{self.models_file} couldn't be read again ({ex}); serving the models read before"
+                self.note(self.models_error)
+                return False
+            changes = []
+            with self.cv:
+                out = {}
+                for name, new in models.items():
+                    cur, fp = self.models.get(name), self.fingerprint(new)
+                    if cur is None:
+                        out[name] = new
+                        changes.append(f"added {name}")
+                    else:
+                        out[name] = cur
+                        if self.conf.get(name) != fp:
+                            loaded = self.engine and self.engine.entry is cur
+                            cur.__dict__.update(new.__dict__)
+                            changes.append(f"changed {name}" + (" (from its next start)" if loaded else ""))
+                    self.conf[name] = fp
+                for name, cur in self.models.items():
+                    if name not in out:
+                        cur.skip = "removed from the model list"
+                        self.conf.pop(name, None)
+                        changes.append(f"removed {name}")
+                self.models = out
+                self.default = (self.a.default if self.a.default in out else default if default in out
+                                else next(iter(out)))
+                if self.switch_to is not None and self.switch_to.skip:
+                    self.switch_to = None
+                if self.cur is not out.get(self.cur.name):        # the loaded model was removed
+                    if self.engine:
+                        self.switch_to = self.switch_to or out[self.default]   # once its answers are written
+                        self.switch_ticket = 0
+                    else:
+                        self.cur = out[self.default]
+                self.models_read, self.models_error = time.time(), None
+                self.cv.notify_all()
+            self.note(f"read the model list again ({why}): " + (", ".join(changes) or "nothing changed"))
+        threading.Thread(target=self.prepare, daemon=True).start()   # new models' contexts, pi's list
+        return True
+
+    def unplugged(self):
+        """Why the model should leave the graphics card now: the PC runs on battery and gpu_on_battery is off
+        (lodger doesn't start work on the card then, and work already there would drain the battery). None if not."""
+        if config.get().get("gpu_on_battery"):
+            return None
+        card = sysmem.dgpu()
+        if card is None or card.integrated:
+            return None
+        src, detail = gpus.power_source()
+        if src != "battery":
+            return None
+        return f"{detail}: the graphics card is used only when plugged in (gpu_on_battery in config.toml)"
 
     def note(self, text):
         log(text)
@@ -454,9 +579,9 @@ class Lodger:
         self.note(f"starting {self.cur.name} on the {e.where}"
                   + (f" ({self.why_off_card})" if self.why_off_card and not p["ngl"] else "")
                   + f", context {p['ctx']}" + (f", {p['ngl']} layers on the card" if p["ngl"] else ""))
-        if not e.wait_ready(abort=lambda: self.closing or not e.watched()) or self.closing or not e.watched():
+        if not e.wait_ready(abort=lambda: self.closing or not self.watched(e)) or self.closing or not self.watched(e):
             reason = e.wd.reason or ("lodger is stopping" if self.closing else "its watchdog stopped working"
-                                     if not e.watched() else "it exited while loading (see engine.log)")
+                                     if not self.watched(e) else "it exited while loading (see engine.log)")
             if e.alive():
                 e.stop()
             else:
@@ -511,32 +636,64 @@ class Lodger:
         self.note(self.why)
         return False
 
-    def wait_engine(self, entry, limit=MOVE_WAIT):
+    def wait_engine(self, entry, limit=MOVE_WAIT, ping=None):
         """The engine for `entry`, once it's loaded and ready (asks for a switch or a wake-up if needed), counted
-        as busy until release(); None if that doesn't happen within `limit` seconds or the model can't run."""
+        as busy until release(); None if that doesn't happen within `limit` seconds or the model can't run.
+        Requests are served in the order they came: when another model is asked for, the requests for this one
+        that came first still get it before the switch, and the request that asked for the switch gets the new
+        model before the next one (two apps using two models would otherwise keep switching, serving neither).
+        ping(): called every PING seconds while waiting, without the lock (it may raise OSError: the app left)."""
         end = time.time() + limit
+        token, next_ping = object(), time.monotonic() + PING
         with self.cv:
-            while True:
-                self.last_used = time.time()
-                if entry.skip or self.closing:
-                    return None
-                e = self.engine
-                if (self.cur is entry and self.ready and e and e.alive() and not e.stopping and not e.wd.reason
-                        and self.switch_to in (None, entry)):    # not one the watchdog is stopping
-                    self.busy[e] = self.busy.get(e, 0) + 1     # under the lock: no switch or sleep can slip in
-                    return e
-                if self.cooling(entry):
-                    return None
-                if self.cur is entry and not e and not self.asleep and self.failures >= 2:
-                    return None                       # it keeps failing to start: say so now, not in 10 minutes
-                if self.cur is not entry and self.switch_to is None:
-                    self.switch_to = entry            # first in line: the monitor switches once nothing is written
-                if self.asleep:
-                    self.wake = True
-                left = end - time.time()
-                if left <= 0:
-                    return None
-                self.cv.wait(min(1.0, left))
+            self.ticket += 1
+            ticket = self.ticket
+            self.waiting[token] = (entry, ticket)
+            try:
+                while True:
+                    self.last_used = time.time()
+                    if entry.skip or self.closing:
+                        return None
+                    e = self.engine
+                    if (self.cur is entry and self.ready and e and e.alive() and not e.stopping and not e.wd.reason
+                            and (self.switch_to in (None, entry) or ticket < self.switch_ticket)):
+                        self.busy[e] = self.busy.get(e, 0) + 1     # under the lock: no switch or sleep can slip in
+                        return e
+                    if self.cooling(entry):
+                        return None
+                    if self.cur is entry and not e and not self.asleep and self.failures >= 2:
+                        return None                       # it keeps failing to start: say so now, not in 10 minutes
+                    if self.cur is not entry and self.switch_to is None:
+                        # first in line: the monitor switches once nothing is written and the requests that came
+                        # before this one have their answers
+                        self.switch_to, self.switch_ticket = entry, ticket
+                    if self.asleep:
+                        self.wake = True
+                    left = end - time.time()
+                    if left <= 0:
+                        return None
+                    if ping and time.monotonic() >= next_ping:
+                        next_ping = time.monotonic() + PING
+                        self.cv.release()
+                        try:
+                            ping()
+                        finally:
+                            self.cv.acquire()
+                        continue
+                    self.cv.wait(max(0.01, min(1.0, left, next_ping - time.monotonic() if ping else 1.0)))
+            finally:
+                del self.waiting[token]
+                self.cv.notify_all()
+
+    def may_switch(self):
+        """(Under the lock.) May the monitor switch to the model asked for now? Not while an answer is being
+        written, nor while requests for the loaded model that came before the switch request wait for it."""
+        e = self.engine
+        if self.switch_to is None or self.switch_to is self.cur or (e and self.busy.get(e)):
+            return False
+        if e and self.ready and e.alive():
+            return not any(m is self.cur and t < self.switch_ticket for m, t in self.waiting.values())
+        return True
 
     def release(self, e):
         with self.cv:
@@ -574,7 +731,7 @@ class Lodger:
         """Unload the current model and load the one a request is waiting for."""
         with self.cv:
             target, old = self.switch_to, self.engine
-            if not target or (old and self.busy.get(old)):
+            if not self.may_switch():
                 return                                # an answer started meanwhile: switch after it
             self.ready, self.engine, self.cur = False, None, target
             self.switch_to, self.asleep, self.wake = None, False, False
@@ -613,12 +770,18 @@ class Lodger:
                     traceback.print_exc(file=f)
                 if repr(ex) != last_error:
                     self.note(f"lodger's monitor hit an error and carries on (see monitor-errors.log): {ex!r}")
+                self.monitor_error = f"{time.strftime('%H:%M:%S')} {ex!r}"
                 last_error = repr(ex)
                 time.sleep(5)
 
     def tick(self, nb):
         """One round of the monitor."""
+        self.clock()
         now = time.time()
+        if self.reload_wanted:
+            why, self.reload_wanted = self.reload_wanted, None
+            self.reload(why)
+        self.watch_models(now)
         if nb.update() or self.others_coming():
             self.quiet_since = now
         elif now - self.last_note >= 10:
@@ -627,14 +790,14 @@ class Lodger:
         e = self.engine
         # another model wanted: switch once nothing is being written with this one
         with self.cv:
-            switching = self.switch_to is not None and self.switch_to is not self.cur and not (e and self.busy.get(e))
+            switching = self.may_switch()
         if switching:
             return self.switch()
         if self.asleep:
             if self.wake:
                 self.wake_up()
             return
-        if e and e.alive() and not e.watched():
+        if e and e.alive() and not self.watched(e):
             # nothing would stop the model if memory ran out: stop it now (planned stops tell the watchdog first)
             e.wd.reason = "lodger's watchdog stopped working, so the model was stopped to be safe"
             self.note(e.wd.reason)
@@ -670,13 +833,18 @@ class Lodger:
             if not self.bring_up(want_card=False) and not self.closing:   # straight back up on the processor
                 self.retry_later()
             return
+        if e and e.where == "card" and not self.force_off_card and now - self.last_power >= 10:
+            self.last_power = now
+            self.force_off_card = self.unplugged() or False
         if self.force_off_card:
+            why = self.force_off_card if isinstance(self.force_off_card, str) else "asked to move off the card"
             self.force_off_card = False
             if e and e.where == "card":
-                # asked to (POST /lodger/move): not a sign the card is contested, so the quiet wait doesn't grow
+                # asked to (POST /lodger/move) or unplugged: not a sign the card is contested, so the quiet wait
+                # doesn't grow
                 self.last_aside, self.card_since = time.time(), None
-                self.note("moving off the card (asked to)")
-                self.why_off_card = "asked to move off the card"
+                self.note(f"moving off the card ({why})")
+                self.why_off_card = why
                 with self.cv:
                     self.ready = False
                 e.stop()
@@ -711,23 +879,44 @@ class Lodger:
                 # (a tool call cut by a move must be asked again), then the rest continues on the card
                 end = time.time() + GROW_WAIT
                 with self.cv:
-                    while (time.time() < end and self.busy.get(old) and not self.closing
-                           and new.watched() and old.watched()):        # the monitor is busy here: watch them
+                    while (time.time() < end and self.busy.get(old) and not self.closing and new.alive()
+                           and not new.wd.reason and self.watched(new) and self.watched(old)):   # watch them here
                         self.cv.wait(1)
+                if not new.alive() or new.wd.reason:
+                    # the card engine had to stop before the hand-over was done: the processor one carries on
+                    reason = new.wd.reason or "it stopped (see engine.log)"
+                    self.stepped_aside()
+                    self.why_off_card = "stepped aside: " + reason
+                    self.install(old)
+                    if new.alive():
+                        new.stop()
+                    else:
+                        new.finish()
+                    self.note(f"stepped aside from the card while growing back: {reason}")
+                    self.unpause()
+                    return
                 old.stop()
 
     def note_desktop(self):
-        """While no app needs the card: note how much of it everything but our model uses (reserve.py)."""
+        """While no app needs the card: note how much of it everything but lodger's models uses (reserve.py).
+        Any lodger's model is left out, ours and another's (lodger.service next to a test lodger), and nothing is
+        noted while lodger memory is on the move (an engine loading or stopping)."""
         card = sysmem.dgpu()
-        m = card.memory() if card and not card.asleep() else None
-        if not m:
+        if not card or card.asleep():
             return
         e = self.engine
-        if e and not (e.alive() and e.ready_at):
+        if e and (e.stopping or not (e.alive() and e.ready_at)):
             return                                # loading or stopping: its memory changes faster than it's logged
-        ours = e.wd.now["gtt" if card.integrated else "vram"] if e and e.where == "card" else 0
+        key = "gtt" if card.integrated else "vram"
+        pids = sorted(lodger_pids())
+        before = sum(u[key] for u in card.usage(pids).values())
+        m = card.memory()
+        after = sum(u[key] for u in card.usage(pids).values())
+        if not m or abs(after - before) > MOVING:
+            return                                # another lodger's model is loading or stopping
+        ours = e.wd.now[key] if e and e.where == "card" else 0
         used = (m["gtt_used"] or 0) if card.integrated else m["used"]
-        reserve.note(card.pci, max(0, used - ours))
+        reserve.note(card.pci, max(0, used - max(ours, before, after)))
 
     def status(self):
         e = self.engine
@@ -735,13 +924,29 @@ class Lodger:
         for n, m in self.models.items():
             why = m.skip or self.cooling(m)
             models[n] = ("not served: " if m.skip else "didn't start: ") + why if why else "ok"
+        now = time.time()
+        with self.cv:
+            waiting = {}
+            for m, _ in self.waiting.values():
+                waiting[m.name] = waiting.get(m.name, 0) + 1
+            writing = sum(self.busy.values())
+        started = getattr(e, "started", None)
         return {"model": self.cur.name, "default": self.default, "ready": self.ready,
                 "where": "asleep" if self.asleep else e.where if e else None, "why": self.why,
-                "context": self.cur.ctx, "answers_in_progress": self.active,
-                "switching_to": self.switch_to.name if self.switch_to else None,
-                "quiet_needed_s": self.quiet_needed, "card_quiet_for_s": round(time.time() - self.quiet_since),
+                "context": self.cur.ctx, "answers_in_progress": self.active, "answers_being_written": writing,
+                "waiting": waiting, "switching_to": self.switch_to.name if self.switch_to else None,
+                "off_card": self.why_off_card,
+                "quiet_needed_s": self.quiet_needed, "card_quiet_for_s": round(now - self.quiet_since),
+                "engine": {"model": e.entry.name, "where": e.where, "up_s": round(now - started) if started else None,
+                           "answering": bool(e.ready_at), "stopping": e.wd.reason or (e.stopping or None),
+                           "log": os.path.join(e.out, "engine.log")} if e else None,
+                "retry_in_s": round(self.retry_at - now) if not e and self.retry_at > now else None,
+                "last_fail": self.last_fail,
                 "plan": {k: e.plan[k] for k in ("ngl", "n_cpu_moe", "ctx", "gpu_est")} if e else None,
-                "models": models, "ollama": self.ollama, "events": self.events}
+                "models": models, "models_file": {"path": self.models_file, "read": time.strftime(
+                    "%F %T", time.localtime(self.models_read)), "error": self.models_error},
+                "monitor_error": self.monitor_error, "uptime_s": round(now - self.t_start),
+                "ollama": self.ollama, "events": self.events}
 
     def loaded(self):
         """(model, graphics memory it uses, when it unloads or None) for the model loaded now, or None."""
@@ -753,8 +958,17 @@ class Lodger:
 
 
 def model_info(e):
+    """One model in GET /v1/models: OpenAI's fields, and Anthropic's (type, display_name, created_at) for its clients."""
     return {"id": e.name, "object": "model", "owned_by": "lodger", "context_window": e.ctx,
-            "reasoning": e.reasoning, "meta": {"n_ctx": e.ctx}}
+            "reasoning": e.reasoning, "meta": {"n_ctx": e.ctx}, "type": "model", "display_name": e.name,
+            "created_at": ollama.now(mtime(getattr(e, "path", None)))}
+
+
+def mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except (OSError, TypeError):
+        return 0
 
 
 def local_host(value):
@@ -794,26 +1008,28 @@ def check(method, path, headers, key=None):
         return 403, f"lodger doesn't answer web pages from other sites (this request came from {origin!r})"
     if method == "OPTIONS":                     # a browser asking first; it never sends the key with that
         return None
-    if key and path.split("?")[0] != "/health":
+    if key and path.split("?")[0] not in ("/health", "/v1/health"):
         scheme, _, given = (headers.get("Authorization") or "").strip().partition(" ")
-        if scheme.lower() != "bearer" or not hmac.compare_digest(given.strip().encode(), key.encode()):
-            return 401, ("lodger wants its API key: send the header 'Authorization: Bearer KEY' "
+        if scheme.lower() != "bearer":
+            given = headers.get("X-Api-Key") or ""     # how Anthropic's clients send it (Claude Code's ANTHROPIC_API_KEY)
+        if not (given.strip() and hmac.compare_digest(given.strip().encode(), key.encode())):
+            return 401, ("lodger wants its API key: send the header 'Authorization: Bearer KEY' (or 'x-api-key: KEY') "
                          "(the key in lodger's --api-key-file or LODGER_API_KEY)")
     return None
 
 
 CHAT_PATHS = ("/v1/chat/completions", "/chat/completions")
-# llama-server's other answers, passed through as they are (an answer cut by a move ends with an error)
-PASS_PATHS = ("/v1/completions", "/completions", "/v1/embeddings", "/embeddings", "/infill", "/tokenize",
-              "/detokenize", "/apply-template")
-
-
-def positive_int(v):
-    try:
-        v = int(v)
-    except (TypeError, ValueError):
-        return None
-    return v if v > 0 else None
+MESSAGES_PATHS = ("/v1/messages",)            # Anthropic's API (Claude Code and other Anthropic clients)
+RESPONSES_PATHS = ("/v1/responses", "/responses")   # OpenAI's Responses API (Codex and other newer OpenAI clients)
+# llama-server's other answers, passed through as they are (a streamed one cut by a move ends with an error, a whole
+# one is asked again of the next engine)
+PASS_PATHS = ("/v1/completions", "/completions", "/completion", "/v1/embeddings", "/embeddings", "/embedding",
+              "/infill", "/tokenize", "/detokenize", "/apply-template", "/v1/rerank", "/rerank", "/v1/reranking",
+              "/reranking", "/v1/messages/count_tokens", "/v1/responses/input_tokens", "/responses/input_tokens",
+              "/v1/chat/completions/input_tokens", "/chat/completions/input_tokens")
+STREAM_PATHS = ("/v1/completions", "/completions", "/completion", "/infill")   # of those, the ones that can stream
+ANTHROPIC_PATHS = ("/v1/messages", "/v1/messages/count_tokens")   # errors in Anthropic's shape
+positive_int = answers.positive_int
 
 
 OLLAMA_PATHS = ("/api/chat", "/api/generate", "/api/embed", "/api/embeddings", "/api/show")
@@ -825,6 +1041,8 @@ def make_handler(lodger, key=None, ollama_api=False):
         protocol_version = "HTTP/1.1"
         timeout = 300                            # a connection that sends nothing for this long is closed
         cors = None                              # the local page's origin to allow in the answer, if any
+        api = "openai"                           # the shape of this request's answers: openai, anthropic or ollama
+        started = False                          # a streamed reply's headers went out
         head = False                             # HEAD: headers only
         client_gone = False
         oreq = False                             # this request is Ollama's kind: answered in its shape
@@ -833,6 +1051,12 @@ def make_handler(lodger, key=None, ollama_api=False):
 
         def log_message(self, *args):
             pass
+
+        def handle_expect_100(self):
+            """Say "go ahead" only to a request that may reach lodger; the others get their refusal at once."""
+            if check(self.command, self.path, self.headers, key):
+                return True                      # do_POST refuses it (and closes: the body is never sent)
+            return super().handle_expect_100()
 
         def send_json(self, code, obj, headers=()):
             body = json.dumps(obj).encode()
@@ -848,8 +1072,9 @@ def make_handler(lodger, key=None, ollama_api=False):
         def send_error_json(self, code, msg, close=False):
             if close:
                 self.close_connection = True
-            self.send_json(code, {"error": msg} if self.oreq else {"error": {"message": msg, "code": code}},
-                           [("Connection", "close")] if close else ())
+            body = ({"error": msg} if self.api == "ollama" else answers.anthropic_error(code, msg)
+                    if self.api == "anthropic" else answers.openai_error(code, msg))
+            self.send_json(code, body, [("Connection", "close")] if close else ())
 
         def send_text(self, code, text):
             body = text.encode()
@@ -870,7 +1095,9 @@ def make_handler(lodger, key=None, ollama_api=False):
             """Answer a request that may not reach lodger (see check()); True if it was refused."""
             origin = self.headers.get("Origin")
             self.cors = origin if origin and local_origin(origin) else None
-            self.oreq = ollama_api and self.route().startswith("/api/")
+            route = self.route()
+            self.oreq = ollama_api and route.startswith("/api/")
+            self.api = "ollama" if self.oreq else "anthropic" if route in ANTHROPIC_PATHS else "openai"
             why = check(self.command, self.path, self.headers, key)
             if not why:
                 return False
@@ -879,7 +1106,8 @@ def make_handler(lodger, key=None, ollama_api=False):
             self.close_connection = True
             if code == 401:
                 extra.append(("WWW-Authenticate", 'Bearer realm="lodger"'))
-            self.send_json(code, {"error": msg} if self.oreq else
+            self.send_json(code, {"error": msg} if self.oreq else answers.anthropic_error(code, msg)
+                           if self.api == "anthropic" else
                            {"error": {"message": msg, "type": "forbidden" if code == 403 else "unauthorized"}}, extra)
             return True
 
@@ -893,7 +1121,8 @@ def make_handler(lodger, key=None, ollama_api=False):
             self.send_header("Allow", "GET, HEAD, POST, OPTIONS")
             if self.cors:
                 self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
-                self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+                self.send_header("Access-Control-Allow-Headers",
+                                 "Authorization, Content-Type, X-Api-Key, Anthropic-Version, Anthropic-Beta")
                 self.send_header("Access-Control-Max-Age", "600")
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -909,12 +1138,15 @@ def make_handler(lodger, key=None, ollama_api=False):
             if self.refused():
                 return
             path = self.route()
-            if path == "/health":
+            if path in ("/health", "/v1/health"):
                 if lodger.asleep:                     # a request wakes it, so apps may go ahead
                     return self.send_json(200, {"status": "ok", "asleep": True})
                 return self.send_json(200 if lodger.ready else 503, {"status": "ok" if lodger.ready else "loading"})
             if path in ("/v1/models", "/models"):
-                return self.send_json(200, {"object": "list", "data": [model_info(e) for e in lodger.available()]})
+                data = [model_info(e) for e in lodger.available()]
+                return self.send_json(200, {"object": "list", "data": data, "has_more": False,   # Anthropic's too
+                                            "first_id": data[0]["id"] if data else None,
+                                            "last_id": data[-1]["id"] if data else None})
             if path == "/lodger/status":
                 return self.send_json(200, lodger.status())
             if ollama_api and path == "/":
@@ -985,17 +1217,22 @@ def make_handler(lodger, key=None, ollama_api=False):
             if self.refused():
                 return
             self.nd = self.conv = None
+            self.started = False
             raw = self.body()
             if raw is None:
                 return
             path = self.route()
+            if path == "/lodger/reload":
+                ok = lodger.reload("asked to")
+                return self.send_json(200 if ok else 422, {"reloaded": ok, "error": lodger.models_error,
+                                                           "models": [e.name for e in lodger.available()]})
             if path == "/lodger/move":
                 on_card = bool(lodger.engine and lodger.engine.where == "card" and lodger.ready)
                 lodger.force_off_card = on_card
                 return self.send_json(200, {"moving": on_card, "where": lodger.engine.where if lodger.engine else None})
             if self.oreq:
                 return self.ollama_post(raw, path)
-            if path not in CHAT_PATHS + PASS_PATHS:
+            if path not in CHAT_PATHS + MESSAGES_PATHS + RESPONSES_PATHS + PASS_PATHS:
                 return self.send_error_json(404, "not found")
             body = self.json_body(raw)
             if body is None:
@@ -1003,25 +1240,34 @@ def make_handler(lodger, key=None, ollama_api=False):
             name = body.get("model")
             if name is not None and not isinstance(name, str):
                 return self.send_error_json(400, "'model' must be a string")
-            if path in CHAT_PATHS and not isinstance(body.get("messages", []), list):
+            if path in CHAT_PATHS + MESSAGES_PATHS and not isinstance(body.get("messages", []), list):
                 return self.send_error_json(400, "'messages' must be a list")
+            if path in RESPONSES_PATHS and not isinstance(body.get("input", ""), (str, list)):
+                return self.send_error_json(400, "'input' must be text or a list")
+            if body.get("stream") is not None and not isinstance(body["stream"], bool):
+                return self.send_error_json(400, "'stream' must be true or false")
             entry = lodger.find(name)
             if not entry:
                 return self.no_model(name)
-            self.answer(body, entry, path if path in PASS_PATHS else "/v1/chat/completions")
+            self.answer(body, entry, "/v1/chat/completions" if path in CHAT_PATHS else
+                        "/v1/responses" if path in RESPONSES_PATHS else path)
 
         def answer(self, body, entry, path):
-            """Answer `body` with `entry`'s engine at llama-server's `path` (chat answers continue after a move)."""
+            """Answer `body` with `entry`'s engine at llama-server's `path`. Chat, Messages and Responses answers
+            continue after a move (converse), whole ones too; the others are passed through."""
             with lodger.cv:
                 lodger.active += 1
             try:
-                if not body.get("stream"):
+                stream = bool(body.get("stream"))
+                kind = (answers.Chat if path == "/v1/chat/completions" else answers.Messages if path == "/v1/messages"
+                        else answers.Responses if path == "/v1/responses" else None)
+                if kind and not (kind is answers.Chat and not stream and answers.Chat.wanted_plain(body)):
+                    self.converse(kind(body, stream), entry)
+                elif not stream or path not in STREAM_PATHS + ("/v1/chat/completions",):
                     self.whole(body, entry, path)
-                elif path == "/v1/chat/completions":
-                    self.stream(body, entry)
                 else:
                     self.relay(body, entry, path)
-                if self.nd and body.get("stream") and not self.client_gone:
+                if self.nd and stream and self.started and not self.client_gone:
                     self.send_lines(self.nd.close())   # llama-server's own kinds of stream end without [DONE]
             except OSError:                          # the app went away while lodger answered it
                 self.close_connection = True
@@ -1055,7 +1301,10 @@ def make_handler(lodger, key=None, ollama_api=False):
             if req is None:                          # nothing to write: load the model (or, keep_alive 0, nothing)
                 if body.get("keep_alive") in (0, "0", "0s", "0m"):
                     return self.send_json(200, ans.loaded(load=False))
-                e = lodger.wait_engine(entry)
+                try:
+                    e = lodger.wait_engine(entry, ping=self.check_gone)
+                except OSError:
+                    return
                 if not e:
                     return self.send_error_json(503, self.unavailable(entry))
                 lodger.release(e)
@@ -1074,11 +1323,12 @@ def make_handler(lodger, key=None, ollama_api=False):
                 self.client_gone = self.close_connection = True
             return gone
 
-        def upstream(self, e, body, path="/v1/chat/completions", ping=False):
+        def upstream(self, e, body, path, ping=None):
             """Send the request to the engine and wait until its answer starts, however long it takes to read the
-            conversation (on the processor, a long one can take many minutes). Meanwhile, a streaming app gets
-            a ping now and then; one that went away ends the wait (and closing the connection stops the engine
-            working on it). Raises OSError if the engine or the app goes away."""
+            conversation (on the processor, a long one can take many minutes). Meanwhile ping() is called every
+            PING seconds: it pings a streaming app, or checks that an app waiting for a whole answer is still there
+            (an app that went away ends the wait, and closing the connection stops the engine working on it).
+            Raises OSError if the engine or the app goes away."""
             c = http.client.HTTPConnection(HOST, e.port, timeout=10)
             try:
                 c.request("POST", path, json.dumps(body), {"Content-Type": "application/json", **e.auth()})
@@ -1086,9 +1336,7 @@ def make_handler(lodger, key=None, ollama_api=False):
                     if not e.alive():
                         raise OSError("the engine went away")
                     if ping:
-                        self.event(":")
-                    elif self.app_gone():
-                        raise OSError("the app went away")
+                        ping()
                 c.sock.settimeout(SILENCE)      # once it answers, llama-server sends something every 30 s
                 return c, c.getresponse()
             except BaseException:
@@ -1115,14 +1363,16 @@ def make_handler(lodger, key=None, ollama_api=False):
             return f"{entry.name} is not available right now: " + (entry.skip or lodger.cooling(entry) or lodger.why)
 
         def whole(self, body, entry, path):
+            """A whole answer passed through as llama-server gives it (asked again of the next engine after a
+            move: nothing of it was sent yet)."""
             for _ in range(4):
-                e = lodger.wait_engine(entry)
+                e = lodger.wait_engine(entry, ping=self.check_gone)
                 if not e:
                     return self.send_error_json(503, self.unavailable(entry))
                 c = None
                 try:
                     with lodger.using(e):
-                        c, r = self.upstream(e, body, path)
+                        c, r = self.upstream(e, body, path, ping=self.check_gone)
                         data = r.read()
                 except (OSError, http.client.HTTPException) as ex:
                     if self.client_gone:
@@ -1139,6 +1389,8 @@ def make_handler(lodger, key=None, ollama_api=False):
                     continue
                 if self.conv:
                     return self.send_json(*self.conv(r.status, data))
+                if r.status != 200 and self.api == "anthropic":
+                    return self.send_json(r.status, answers.anthropic_error(r.status, answers.error_message(data)))
                 self.send_response(r.status)
                 self.send_header("Content-Type", r.getheader("Content-Type") or "application/json")
                 self.send_header("Content-Length", str(len(data)))
@@ -1147,7 +1399,107 @@ def make_handler(lodger, key=None, ollama_api=False):
                 return
             self.send_error_json(503, "the model kept moving; try again")
 
+        def converse(self, ans, entry):
+            """An answer that continues after a move (answers.py: chat, Messages, Responses). The engine always
+            streams; a streaming app gets the events as they come (the reply's headers go out with the first one,
+            so an error before that keeps its HTTP status), a whole answer is sent once it's complete."""
+            ping = (lambda: self.event(":")) if ans.stream else self.check_gone
+            for attempt in range(6):
+                e = lodger.wait_engine(entry, ping=ping)
+                if not e:
+                    return self.fail(ans, 503, self.unavailable(entry))
+                c = None
+                try:
+                    with lodger.using(e):
+                        req = ans.request(attempt)
+                        if req is None:             # the length limit was reached just before the move
+                            return self.complete(ans, entry, "length")
+                        if attempt and ans.stream:
+                            self.event(ans.moved_note(e.where))
+                        c, r = self.upstream(e, req, ans.path, ping=ping)
+                        if r.status != 200:
+                            err = r.read()
+                            if self.running(e):
+                                return self.fail(ans, r.status, err)
+                            raise OSError("the engine went away")
+                        if not (r.getheader("Content-Type") or "").startswith("text/event-stream"):
+                            data = r.read()                 # not a stream after all: passed on whole, as it is
+                            if ans.stream:
+                                return self.fail(ans, 502, "the model's engine didn't stream its answer")
+                            return self.send_json(*self.conv(200, data)) if self.conv else self.send_raw(200, data)
+                        look = time.monotonic() + 1
+                        for ev in answers.events(r.readline):
+                            for s in ans.feed(ev):
+                                self.event(s)
+                            if ans.done:
+                                return self.complete(ans, entry)
+                            if not ans.stream and time.monotonic() > look:
+                                look = time.monotonic() + 1
+                                self.check_gone()
+                        raise OSError("stream ended early")
+                except (OSError, http.client.HTTPException):
+                    if self.client_gone:
+                        return
+                    if ans.finished:                # only the end was cut off
+                        return self.complete(ans, entry)
+                    if not self.moved(e):
+                        return self.fail(ans, 502, "the model's engine stopped answering; please retry")
+                    why = ans.cut()
+                    if why and ans.stream:
+                        return self.fail(ans, 503, why)
+                    if why:
+                        ans.reset()                 # the app has seen none of it: start over
+                finally:
+                    if c:
+                        c.close()                   # stops the engine writing if the app went away
+            return self.fail(ans, 503, "the model kept moving; answer cut short")
+
+        def complete(self, ans, entry, why=None):
+            """The answer is complete (or reached its length limit): end the stream, or send the whole answer."""
+            for s in ans.close(entry.name, why):
+                self.event(s)
+            if ans.stream:
+                return
+            status, obj = ans.failure or (200, ans.whole(entry.name))
+            if self.conv:
+                return self.send_json(*self.conv(status, json.dumps(obj).encode()))
+            self.send_json(status, obj)
+
+        def fail(self, ans, status, err):
+            """End the answer with an error: in the stream if one was started, else as the HTTP reply (an
+            engine's own error answer for OpenAI's shapes as it is). `err`: lodger's words, or the engine's reply."""
+            msg = answers.error_message(err) if isinstance(err, bytes) else err
+            if self.started:
+                with contextlib.suppress(OSError):
+                    for s in ans.stream_error(msg):
+                        self.event(s)
+                return
+            if self.oreq or self.api == "anthropic" or not isinstance(err, bytes):
+                return self.send_error_json(status, msg)
+            self.send_raw(status, err)
+
+        def send_raw(self, status, data):
+            """An engine's JSON reply, as it is."""
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            if not self.head:
+                self.wfile.write(data)
+
+        def plain_fail(self, status, err):
+            """fail() for a passed-through stream (llama-server's own kinds)."""
+            msg = answers.error_message(err) if isinstance(err, bytes) else err
+            if self.started:
+                with contextlib.suppress(OSError):
+                    self.event("data: " + answers.compact({"error": {"message": msg, "code": status}}))
+                return
+            if self.oreq or not isinstance(err, bytes):
+                return self.send_error_json(status, msg)
+            self.send_raw(status, err)
+
         def start_stream(self):
+            self.started = True
             self.send_response(200)
             self.send_header("Content-Type", "application/x-ndjson" if self.nd else "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -1155,161 +1507,41 @@ def make_handler(lodger, key=None, ollama_api=False):
             self.end_headers()
             self.close_connection = True
 
-        def wait_pinging(self, entry):
-            """wait_engine() for a streaming app, pinging it while a model loads or switches (minutes, sometimes):
-            it keeps the app's connection open, and an app that went away ends the wait (OSError)."""
-            end = time.time() + MOVE_WAIT
-            while True:
-                t0, step = time.time(), min(PING, max(0.0, end - time.time()))
-                e = lodger.wait_engine(entry, limit=step)
-                if e or time.time() >= end or time.time() - t0 < step - 0.5:   # ready, too long, or can't run
-                    return e
-                self.event(":")
-
-        def stream_error(self, msg):
-            self.event(f"data: {json.dumps({'error': {'message': msg}})}")
+        def check_gone(self):
+            """The ping for an app waiting for a whole answer: one that went away ends the wait (OSError)."""
+            if self.app_gone():
+                raise OSError("the app went away")
 
         def relay(self, body, entry, path):
             """A streaming answer of the other kinds (e.g. /v1/completions): passed through; a move ends it."""
-            self.start_stream()
-            e = self.wait_pinging(entry)
+            ping = lambda: self.event(":")  # noqa: E731
+            e = lodger.wait_engine(entry, ping=ping)
             if not e:
-                return self.stream_error(self.unavailable(entry))
+                return self.plain_fail(503, self.unavailable(entry))
             c = None
             try:
                 with lodger.using(e):
-                    c, r = self.upstream(e, body, path, ping=True)
+                    c, r = self.upstream(e, body, path, ping=ping)
                     if r.status != 200:
-                        return self.stream_error(r.read().decode(errors="replace")[:500])
-                    while True:
-                        line = r.readline()
-                        if not line and self.running(e):
-                            return                  # llama-server's own kinds of stream end by closing
-                        if not line.endswith(b"\n"):
-                            raise OSError("stream ended early")
-                        s = line.decode(errors="replace").rstrip("\r\n")
-                        if s:
-                            self.event(s)
-                        if s == "data: [DONE]":
+                        return self.plain_fail(r.status, r.read())
+                    for ev in answers.events(r.readline):
+                        self.event(ev.text())
+                        if ev.data == "[DONE]":
                             return
+                    if not self.running(e):
+                        raise OSError("the engine went away")
             except (OSError, http.client.HTTPException):
                 if not self.client_gone:
-                    with contextlib.suppress(OSError):
-                        self.stream_error("the model moved while writing; please retry")
+                    self.plain_fail(503, "the model moved while writing; please retry")
             finally:
                 if c:
                     c.close()
 
-        def stream(self, body, entry):
-            self.start_stream()
-            content, reasoning, pieces, tooling, finished = "", "", 0, False, False
-            first = {}                              # id, created and model of the answer's first piece
-            limit = next((positive_int(body[k]) for k in ("max_tokens", "max_completion_tokens", "n_predict")
-                          if k in body), None)
-            rf = body.get("response_format")
-            structured = bool(body.get("json_schema") or body.get("grammar")
-                              or isinstance(rf, dict) and rf.get("type", "text") != "text")
-            msgs = list(body.get("messages") or [])
-            last = msgs[-1] if msgs and isinstance(msgs[-1], dict) else {}
-            # the app's own start of the answer (a trailing assistant message) is continued, not repeated
-            prefill = msgs.pop() if (last.get("role") == "assistant" and isinstance(last.get("content"), str)
-                                     and not last.get("tool_calls")) else None
-            try:
-                for attempt in range(6):
-                    e = self.wait_pinging(entry)
-                    if not e:
-                        return self.stream_error(self.unavailable(entry))
-                    c = None
-                    try:
-                        with lodger.using(e):
-                            req = dict(body)
-                            if attempt:
-                                if content or reasoning:
-                                    # continue the answer where the last engine stopped (llama-server continues
-                                    # a trailing assistant message)
-                                    partial = {"role": "assistant", "content": (prefill or {}).get("content", "") + content}
-                                    if reasoning or (prefill or {}).get("reasoning_content"):
-                                        partial["reasoning_content"] = (prefill or {}).get("reasoning_content", "") + reasoning
-                                    req["messages"] = msgs + [partial]
-                                if limit:
-                                    if limit - pieces <= 0:
-                                        return self.end_answer(first, entry, "length")
-                                    for k in ("max_tokens", "max_completion_tokens", "n_predict"):
-                                        if k in req:
-                                            req[k] = limit - pieces
-                                self.event(f": lodger restarted the model on the {e.where}; continuing the answer")
-                            c, r = self.upstream(e, req, ping=True)
-                            if r.status != 200:
-                                err = r.read().decode(errors="replace")
-                                if self.running(e):
-                                    return self.stream_error(err[:500])
-                                raise OSError("engine went away")
-                            while True:
-                                line = r.readline()
-                                if not line.endswith(b"\n"):
-                                    raise OSError("stream ended early")
-                                s = line.decode(errors="replace").rstrip("\r\n")
-                                if not s:
-                                    continue
-                                if s == "data: [DONE]":
-                                    return self.event(s)
-                                if not s.startswith("data:"):
-                                    self.event(s)          # pings and other fields
-                                    continue
-                                try:
-                                    d = json.loads(s[5:])
-                                except ValueError:
-                                    raise OSError("broken line from the engine") from None
-                                if not isinstance(d, dict):
-                                    raise OSError("broken line from the engine")
-                                if "error" in d:
-                                    return self.event(s)
-                                choice = (d.get("choices") or [{}])[0]
-                                choice = choice if isinstance(choice, dict) else {}
-                                delta = choice.get("delta") or {}
-                                text = delta.get("content") or ""
-                                think = delta.get("reasoning_content") or ""
-                                if not first:
-                                    first = {"id": d.get("id"), "created": d.get("created"), "model": d.get("model")}
-                                elif attempt:
-                                    if set(delta) <= {"role"} and not choice.get("finish_reason") and not d.get("usage"):
-                                        continue           # the restarted engine's "assistant here" piece: said already
-                                    d.update({k: v for k, v in first.items() if v is not None})   # one answer to the app
-                                    s = "data: " + json.dumps(d, ensure_ascii=False)
-                                pieces += bool(text or think)
-                                tooling = tooling or bool(delta.get("tool_calls"))
-                                content += text
-                                reasoning += think
-                                finished = finished or bool(choice.get("finish_reason"))
-                                self.event(s)
-                    except (OSError, http.client.HTTPException):
-                        if self.client_gone:
-                            return
-                        if finished:                # only the end was cut off
-                            return self.event("data: [DONE]")
-                        if not self.moved(e):
-                            return self.stream_error("the model's engine stopped answering; please retry")
-                        if tooling:                 # half a tool call can't be continued; the app asks again
-                            return self.stream_error("the model moved while writing a tool call; please retry")
-                        if structured and (content or reasoning):
-                            return self.stream_error("the model moved while writing a structured answer; please retry")
-                    finally:
-                        if c:
-                            c.close()               # stops the engine writing if the app went away
-                self.stream_error("the model kept moving; answer cut short")
-            except OSError:                         # the app went away while lodger was telling it something
-                return
-
-        def end_answer(self, first, entry, why):
-            """End a continued answer that has reached the app's length limit."""
-            self.event("data: " + json.dumps({"id": first.get("id") or "chatcmpl-lodger", "object": "chat.completion.chunk",
-                                              "created": first.get("created") or int(time.time()),
-                                              "model": first.get("model") or entry.name,
-                                              "choices": [{"index": 0, "delta": {}, "finish_reason": why}]}))
-            self.event("data: [DONE]")
-
         def event(self, s):
-            """One server-sent event to the app (an Ollama app gets what it turns into instead)."""
+            """One server-sent event to the app (an Ollama app gets what it turns into instead); the first one
+            sends the reply's headers."""
+            if not self.started:
+                self.start_stream()
             if self.nd:
                 return self.send_lines(self.nd.feed(s))
             self.write((s + "\n\n").encode())
@@ -1379,6 +1611,7 @@ def serve(argv):
     ohttpd = ollama_listener(lodger, a) if a.ollama or config.get().get("ollama") else None
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
     signal.signal(signal.SIGINT, signal.default_int_handler)   # also when started in the background of a script
+    signal.signal(signal.SIGHUP, on_hangup(lodger))
     log(f"lodger serving {len(models)} models at http://{HOST}:{a.port}/v1 (only this PC"
         + (", API key required" if a.api_key else "") + f"); default {default}; logs in {lodger.out}")
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -1413,6 +1646,27 @@ def serve(argv):
             stop_all()
         lodger.unpause()
     return 0
+
+
+def lodger_pids():
+    """Every process of any lodger's model on this PC: in a lodger-* unit or cgroup, started in one of fence.py's
+    process fences (LODGER_FENCE_NAME), or in a fence of this lodger."""
+    out = set(fence.our_pids())
+    for pid in sysmem.pids():
+        if sysmem.app_name(pid) == sysmem.OURS:
+            out.add(pid)
+            continue
+        env = host.read(f"/proc/{pid}/environ") or ""
+        if env.startswith("LODGER_FENCE_NAME=") or "\0LODGER_FENCE_NAME=" in env:
+            out.add(pid)
+    return out
+
+
+def on_hangup(lodger):
+    """SIGHUP (`systemctl --user reload lodger`, `kill -HUP`): read the model list again (the monitor does it)."""
+    def handler(sig, frame):
+        lodger.reload_wanted = "SIGHUP"
+    return handler
 
 
 def port_taken(port):

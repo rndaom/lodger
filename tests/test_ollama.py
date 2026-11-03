@@ -112,7 +112,7 @@ class Front:
     def loaded(self):
         return (self.entry, 0, None) if self.engine else None
 
-    def wait_engine(self, entry, limit=None):
+    def wait_engine(self, entry, limit=None, ping=None):
         self.waits += 1
         self.engine = self.engines.pop(0) if self.engines else None
         return self.engine

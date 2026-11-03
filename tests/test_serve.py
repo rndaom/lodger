@@ -96,7 +96,7 @@ class Front:
     def cooling(self, entry):
         return None
 
-    def wait_engine(self, entry, limit=None):
+    def wait_engine(self, entry, limit=None, ping=None):
         self.engine = self.engines.pop(0) if self.engines else None
         return self.engine
 
@@ -258,12 +258,15 @@ class FramingTest(unittest.TestCase):
 
 def lodger(**kw):
     a = SimpleNamespace(allow_gpu=False, idle=0, pause=[], threads=None, leave_gpu=0, min_ctx=4096, port=9999,
-                        api_key=None, api_key_file=None)
+                        api_key=None, api_key_file=None, files=[], default=None)
     vars(a).update(kw)
     models = {n: SimpleNamespace(name=n, skip=None, ctx=4096, path=f"/{n}.gguf", reasoning=False,
                                  planning_args=lambda: [], args=lambda: []) for n in ("a", "b")}
     with mock.patch.object(serve, "RUNS", tempfile.mkdtemp()):
-        return serve.Lodger(a, models, "a")
+        l = serve.Lodger(a, models, "a")
+    l.models_file = l.models_file + ".not-in-tests"      # the monitor's look at models.toml finds nothing to read
+    l.models_seen = None
+    return l
 
 
 class FakeEng:
