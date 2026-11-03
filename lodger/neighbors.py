@@ -5,7 +5,8 @@ An app "needs the card" when, on the card the model uses, it either
 - keeps the card's 3D or compute engine busy BUSY_FRAC of the time for BUSY_SECONDS in a row, or
 - takes GROWTH more graphics memory within GROWTH_SECONDS (something is loading; on built-in graphics,
   which keep apps' memory in shared RAM, that counts too).
-The model's own processes (systemd unit lodger-*) never count. Times are monotonic: the wall clock can jump.
+Lodger's models never count: its own, and any other lodger's (a lodger-* unit or cgroup, or a 'none' fence's
+program, told by its LODGER_FENCE_NAME). Times are monotonic: the wall clock can jump.
 
 Apps lodger can't look into: the kernel shows /proc/<pid>/fdinfo only to the app's own user, so another
 user's game, a compositor or Xorg running as root, or a system container using the card show no per-app
@@ -19,7 +20,7 @@ import collections
 import os
 import time
 
-from . import sysmem
+from . import fence, sysmem
 from .gpu import fdinfo
 
 MiB = sysmem.MiB
@@ -71,19 +72,28 @@ class Neighbors:
         # same one, and never looks like one app suddenly taking another's memory
         pids = sysmem.pids() if full else sorted(self.gpu_pids, key=int)
         use = self.card.usage(pids)
-        ours = set(self.ours())
-        seen = {}                            # every app on the card, lodger's own model too (as OURS)
+        ours = set(self.ours())              # then every lodger's model (another's too) on the card joins them
+        seen = {}                            # every app on the card, lodger's models too (as OURS)
         for pid in pids:
             if pid not in use:
                 self.gpu_pids.pop(pid, None)
                 continue
-            name = self.gpu_pids.get(pid) or sysmem.app_name(pid)
+            name = self.gpu_pids.get(pid) or self._name(pid)
             self.gpu_pids[pid] = name
+            if name == OURS:
+                ours.add(pid)
             fdinfo.add(seen.setdefault(OURS if pid in ours else name, fdinfo.empty()), use[pid])
         self.whole = self._whole(full, use, ours, seen)
         # built-in graphics keep apps' memory in shared RAM (GTT): a game loading there shows up in that
         return {app: (r["busy_ns"], r["vram"] + (r["gtt"] if self.shared else 0), r["cycles"])
                 for app, r in seen.items() if app != OURS}
+
+    @staticmethod
+    def _name(pid):
+        """The app a process belongs to; any lodger's model (a lodger-* unit or cgroup, or a 'none' fence's
+        program, told by its LODGER_FENCE_NAME) is OURS."""
+        name = sysmem.app_name(pid)
+        return OURS if name == OURS or fence.fence_name(pid) else name
 
     def _whole(self, full, use, ours, seen):
         """The whole card's numbers next to the sum of what lodger sees: {full, busy (0..1), used (bytes),
@@ -92,11 +102,11 @@ class Neighbors:
         w = whole() if whole else None
         if not w or (w["busy"] is None and w["used"] is None):
             return None
-        # lodger's model holds the card yet its fdinfo shows nothing (a kernel without DRM usage stats): the
+        # a lodger model holds the card yet its fdinfo shows nothing (a kernel without DRM usage stats): the
         # card's numbers would count lodger's own work as a stranger's
         if any(pid not in use and fdinfo.drm_fds(pid, self.pci) for pid in ours):
             return None
-        # ROCm's compute queues bypass the per-app counters: lodger's own ROCm model's work would look like a stranger's
+        # ROCm's compute queues bypass the per-app counters: a lodger ROCm model's work would look like a stranger's
         busy = None if any(fdinfo.holds(pid, "/dev/kfd") for pid in ours) else w["busy"]
         return {"full": full, "busy": busy, "used": w["used"],
                 "seen": {app: (r["busy_ns"], r["vram"]) for app, r in seen.items()}}

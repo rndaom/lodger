@@ -466,11 +466,22 @@ def named():
     procs = {}
     for p in host.listdir("/proc"):
         if p.isdigit():
-            env = host.read(f"/proc/{p}/environ") or ""
-            i = env.find("LODGER_FENCE_NAME=")
-            if i >= 0 and (i == 0 or env[i - 1] == "\0"):
-                procs.setdefault(env[i + len("LODGER_FENCE_NAME="):].split("\0", 1)[0], []).append(int(p))
-    return {name: pids for name, pids in procs.items() if NAME.match(name)}
+            name = fence_name(p)
+            if name:
+                procs.setdefault(name, []).append(int(p))
+    return procs
+
+
+def fence_name(pid):
+    """The lodger fence a process was started in, from the LODGER_FENCE_NAME it carries, or None."""
+    env = host.read(f"/proc/{pid}/environ") or ""
+    if "LODGER_FENCE_NAME=" not in env:
+        return None
+    for var in env.split("\0"):
+        if var.startswith("LODGER_FENCE_NAME="):
+            name = var[len("LODGER_FENCE_NAME="):]
+            return name if NAME.match(name) else None
+    return None
 
 
 def find_orphans():
