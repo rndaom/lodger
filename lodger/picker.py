@@ -629,11 +629,10 @@ def suggest(picks, verdicts):
 def planner(base):
     """(plan_one for judge(), or None and why not, the card, /proc/meminfo). plan_one is lodger's planner on the
     downloaded file, else on a header stub, with the [defaults] of models.toml (q8_0 context and so on)."""
-    from . import engine, model, plan, sysmem
+    from . import engine, plan, sysmem
     card, mem = sysmem.dgpu(), sysmem.meminfo()
     try:
         engine.tool("llama-fit-params")
-        model.gguf_reader()
     except SystemExit as ex:
         return None, str(ex), card, mem
     cfg = {}
