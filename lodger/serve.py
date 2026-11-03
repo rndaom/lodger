@@ -648,18 +648,24 @@ class Lodger:
         self.note(self.why)
         return False
 
-    def wait_engine(self, entry, limit=MOVE_WAIT, ping=None):
+    def wait_engine(self, entry, limit=MOVE_WAIT, ping=None, turn=None):
         """The engine for `entry`, once it's loaded and ready (asks for a switch or a wake-up if needed), counted
         as busy until release(); None if that doesn't happen within `limit` seconds or the model can't run.
         Requests are served in the order they came: when another model is asked for, the requests for this one
         that came first still get it before the switch, and the request that asked for the switch gets the new
         model before the next one (two apps using two models would otherwise keep switching, serving neither).
-        ping(): called every PING seconds while waiting, without the lock (it may raise OSError: the app left)."""
+        ping(): called every PING seconds while waiting, without the lock (it may raise OSError: the app left).
+        turn: a dict the request keeps over its tries: an answer continued after a move keeps its place in line."""
         end = time.time() + limit
         token, next_ping = object(), time.monotonic() + PING
         with self.cv:
-            self.ticket += 1
-            ticket = self.ticket
+            if turn is not None and "ticket" in turn:
+                ticket = turn["ticket"]
+            else:
+                self.ticket += 1
+                ticket = self.ticket
+                if turn is not None:
+                    turn["ticket"] = ticket
             self.waiting[token] = (entry, ticket)
             try:
                 while True:
@@ -703,8 +709,11 @@ class Lodger:
         e = self.engine
         if self.switch_to is None or self.switch_to is self.cur or (e and self.busy.get(e)):
             return False
+        earlier = any(m is self.cur and t < self.switch_ticket for m, t in self.waiting.values())
         if e and self.ready and e.alive():
-            return not any(m is self.cur and t < self.switch_ticket for m, t in self.waiting.values())
+            return not earlier
+        if earlier and not self.asleep and self.failures < 2 and not self.cooling(self.cur):
+            return False                          # the model is coming back after a move: its earlier requests first
         return True
 
     def release(self, e):
@@ -1406,8 +1415,9 @@ def make_handler(lodger, key=None, ollama_api=False):
         def whole(self, body, entry, path):
             """A whole answer passed through as llama-server gives it (asked again of the next engine after a
             move: nothing of it was sent yet)."""
+            turn = {}
             for _ in range(4):
-                e = lodger.wait_engine(entry, ping=self.check_gone)
+                e = lodger.wait_engine(entry, ping=self.check_gone, turn=turn)
                 if not e:
                     return self.send_error_json(503, self.unavailable(entry))
                 c = None
@@ -1445,8 +1455,9 @@ def make_handler(lodger, key=None, ollama_api=False):
             streams; a streaming app gets the events as they come (the reply's headers go out with the first one,
             so an error before that keeps its HTTP status), a whole answer is sent once it's complete."""
             ping = (lambda: self.event(":")) if ans.stream else self.check_gone
+            turn = {}
             for attempt in range(6):
-                e = lodger.wait_engine(entry, ping=ping)
+                e = lodger.wait_engine(entry, ping=ping, turn=turn)
                 if not e:
                     return self.fail(ans, 503, self.unavailable(entry))
                 c = None

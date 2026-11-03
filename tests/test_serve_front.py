@@ -107,7 +107,7 @@ class Front:
     def loaded(self):
         return None
 
-    def wait_engine(self, entry, limit=None, ping=None):
+    def wait_engine(self, entry, limit=None, ping=None, turn=None):
         self.waits.append(ping)
         self.engine = self.engines.pop(0) if self.engines else None
         return self.engine
@@ -244,6 +244,28 @@ class FairnessTest(unittest.TestCase):
         with mock.patch.object(l, "start_or_give_up") as start:
             l.switch()
             start.assert_not_called()
+
+    def test_an_answer_continued_after_a_move_keeps_its_place(self):
+        l = self.l
+        a = l.models["a"]
+        e = FakeEng(a)
+        l.install(e)
+        turn = {}
+        got = l.wait_engine(a, limit=1, turn=turn)          # an answer starts on a
+        self.assertIs(got, e)
+        wb = Waiter(l, "b", limit=0.5)                      # then b is asked for
+        time.sleep(0.1)
+        self.assertIs(l.switch_to, l.models["b"])
+        l.release(e)
+        l.drop(e)                                           # a moves (stepped aside) mid-answer
+        wa = Waiter(l, "a", limit=2, turn=turn)             # the rest of the answer waits for a again
+        time.sleep(0.1)
+        with l.cv:
+            self.assertFalse(l.may_switch())                # it came before b: no switch away from a
+        l.install(FakeEng(a))
+        wa.join(2)
+        self.assertIs(wa.got and wa.got.entry, a)
+        wb.join(2)
 
     def test_pings_keep_the_place_in_line(self):
         l = self.l

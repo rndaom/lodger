@@ -96,7 +96,7 @@ class Front:
     def cooling(self, entry):
         return None
 
-    def wait_engine(self, entry, limit=None, ping=None):
+    def wait_engine(self, entry, limit=None, ping=None, turn=None):
         self.engine = self.engines.pop(0) if self.engines else None
         return self.engine
 
