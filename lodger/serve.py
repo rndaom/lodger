@@ -822,8 +822,17 @@ class Lodger:
 
 
 def model_info(e):
+    """One model in GET /v1/models: OpenAI's fields, and Anthropic's (type, display_name, created_at) for its clients."""
     return {"id": e.name, "object": "model", "owned_by": "lodger", "context_window": e.ctx,
-            "reasoning": e.reasoning, "meta": {"n_ctx": e.ctx}}
+            "reasoning": e.reasoning, "meta": {"n_ctx": e.ctx}, "type": "model", "display_name": e.name,
+            "created_at": ollama.now(mtime(getattr(e, "path", None)))}
+
+
+def mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except (OSError, TypeError):
+        return 0
 
 
 def local_host(value):
@@ -863,10 +872,12 @@ def check(method, path, headers, key=None):
         return 403, f"lodger doesn't answer web pages from other sites (this request came from {origin!r})"
     if method == "OPTIONS":                     # a browser asking first; it never sends the key with that
         return None
-    if key and path.split("?")[0] != "/health":
+    if key and path.split("?")[0] not in ("/health", "/v1/health"):
         scheme, _, given = (headers.get("Authorization") or "").strip().partition(" ")
-        if scheme.lower() != "bearer" or not hmac.compare_digest(given.strip().encode(), key.encode()):
-            return 401, ("lodger wants its API key: send the header 'Authorization: Bearer KEY' "
+        if scheme.lower() != "bearer":
+            given = headers.get("X-Api-Key") or ""     # how Anthropic's clients send it (Claude Code's ANTHROPIC_API_KEY)
+        if not (given.strip() and hmac.compare_digest(given.strip().encode(), key.encode())):
+            return 401, ("lodger wants its API key: send the header 'Authorization: Bearer KEY' (or 'x-api-key: KEY') "
                          "(the key in lodger's --api-key-file or LODGER_API_KEY)")
     return None
 
@@ -991,12 +1002,15 @@ def make_handler(lodger, key=None, ollama_api=False):
             if self.refused():
                 return
             path = self.route()
-            if path == "/health":
+            if path in ("/health", "/v1/health"):
                 if lodger.asleep:                     # a request wakes it, so apps may go ahead
                     return self.send_json(200, {"status": "ok", "asleep": True})
                 return self.send_json(200 if lodger.ready else 503, {"status": "ok" if lodger.ready else "loading"})
             if path in ("/v1/models", "/models"):
-                return self.send_json(200, {"object": "list", "data": [model_info(e) for e in lodger.available()]})
+                data = [model_info(e) for e in lodger.available()]
+                return self.send_json(200, {"object": "list", "data": data, "has_more": False,   # Anthropic's too
+                                            "first_id": data[0]["id"] if data else None,
+                                            "last_id": data[-1]["id"] if data else None})
             if path == "/lodger/status":
                 return self.send_json(200, lodger.status())
             if ollama_api and path == "/":

@@ -74,6 +74,13 @@ class CheckTest(unittest.TestCase):
             for auth in (f"Bearer {KEY}", f"bearer {KEY}", f"  Bearer  {KEY} "):
                 self.assertIsNone(serve.check("POST", path, {**host, "Authorization": auth}, KEY), auth)
 
+    def test_anthropic_clients_key_header(self):
+        host = {"Host": "127.0.0.1:8181"}
+        self.assertIsNone(serve.check("POST", "/v1/messages", {**host, "X-Api-Key": KEY}, KEY))
+        self.assertIsNone(serve.check("POST", "/v1/messages", {**host, "X-Api-Key": f" {KEY} "}, KEY))
+        for given in ("wrong", "", f"Bearer {KEY}"):
+            self.assertEqual(serve.check("POST", "/v1/messages", {**host, "X-Api-Key": given}, KEY)[0], 401, given)
+
     def test_health_and_preflight_need_no_key(self):
         host = {"Host": "127.0.0.1:8181"}
         self.assertIsNone(serve.check("GET", "/health", host, KEY))
