@@ -569,6 +569,14 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
     def own_at(c):
         return (PROC_OVERHEAD + (proj_need if gpu is None or not proj_card else 0) + copied
                 + n_ckpt * costs.fixed(c))
+
+    def less(c):
+        """What a setting in models.toml would take off the model's own memory, in words."""
+        ways = ([f"no-repack = true leaves out the {copied / GiB:.1f} GiB of repacked weights (the processor gets "
+                 "slower)"] if copied and not held else [])
+        ways += ([f"a smaller ctx-checkpoints (now {n_ckpt}) saves {costs.fixed(c) / GiB:.2f} GiB per checkpoint"]
+                 if n_ckpt and costs.fixed(c) else [])
+        return (" In models.toml, " + "; ".join(ways) + ".") if ways else ""
     if held:
         why.append(f"The weights kept in RAM ({cpu_weights / GiB:.1f} GiB) are held there (no-mmap or mlock), "
                    "so they count as the model's own memory.")
@@ -580,9 +588,9 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
             return costs.context(c) + costs.compute + own_at(c)
         ctx = next((c for c in fair(ram_budget) if need(c) <= ram_budget), None)
         if ctx is None:
-            plan["refuse"] = (f"Not enough RAM even on the processor: context + scratch need "
-                              f"{need(ctxs[-1]) / GiB:.1f} GiB, "
-                              f"{max(0, ram_budget) / GiB:.1f} GiB can be spared.")
+            plan["refuse"] = (f"Not enough RAM even on the processor: context, scratch and the model's own copies "
+                              f"need {need(ctxs[-1]) / GiB:.1f} GiB, "
+                              f"{max(0, ram_budget) / GiB:.1f} GiB can be spared." + less(ctxs[-1]))
             return plan
         plan["ctx"] = ctx
         anon = need(ctx)
@@ -609,7 +617,7 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
 
     if with_margin(anon) > ram_budget:
         plan["refuse"] = (f"Not enough RAM: the model needs {with_margin(anon) / GiB:.1f} GiB of its own memory "
-                          f"(with margin) and only {max(0, ram_budget) / GiB:.1f} GiB can be spared.")
+                          f"(with margin) and only {max(0, ram_budget) / GiB:.1f} GiB can be spared." + less(plan["ctx"]))
         return plan
     room_for_weights = ram_budget - with_margin(anon)
     if cached > room_for_weights:

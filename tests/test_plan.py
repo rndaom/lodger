@@ -533,6 +533,9 @@ class PlacementTest(PlanBase):
         self.assertEqual(c["ram_anon_est"], a["ram_anon_est"])
         self.assertEqual(d["ram_copied"], (40 - d["ngl_layers"]) * 100 * MiB)     # only what stays on the processor
         self.assertTrue(any("repack" in w for w in b["why"]), b["why"])
+        with mock.patch("lodger.plan.cpu_repacks", return_value={2: 8}):
+            tight = self.make(m, card=None, target_ctx=8192, ram_avail=a["ram_anon_est"] + 6 * GiB)
+        self.assertIn("no-repack = true leaves out the 4.4 GiB", tight["refuse"] or "")
 
     def test_cpu_features_decide_what_is_repacked(self):
         cases = {"flags\t\t: fpu sse2 avx avx2 fma\n": {2: 8, 12: 8, 20: 8, 39: 8},
@@ -565,6 +568,9 @@ class PlacementTest(PlanBase):
         self.assertEqual(c["ram_anon_est"] - a["ram_anon_est"], 4 * 150 * MiB)
         self.assertEqual(a["checkpoint_bytes"], 0)
         self.assertEqual(b["checkpoint_bytes"], 32 * 150 * MiB)
+        with mock.patch("lodger.plan.probe", side_effect=probe):
+            tight = self.make(hybrid, card=None, target_ctx=8192, ram_avail=b["ram_anon_est"] + 2 * GiB)
+        self.assertIn("a smaller ctx-checkpoints (now 32)", tight["refuse"] or "")      # says what would help
 
 
 def projector_file(d, **vision):
