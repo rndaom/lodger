@@ -1,5 +1,11 @@
 """The `lodger` command: picks the right part of lodger for what you typed."""
+import difflib
 import sys
+
+from lodger import __version__
+
+COMMANDS = ("plan", "run", "measure", "stress", "serve", "ask", "pi", "unpause", "stress-serve", "doctor", "setup",
+            "models", "service", "version")
 
 HELP = """lodger: local AI that lives on your PC as a guest. Your apps come first.
 
@@ -15,6 +21,8 @@ HELP = """lodger: local AI that lives on your PC as a guest. Your apps come firs
   lodger doctor             what lodger sees on this PC (reads only)
   lodger setup              download llama.cpp (Vulkan by default) into ~/.local/share/lodger
   lodger models             models to start with: what fits this PC; `lodger models get NAME` downloads one
+  lodger service install    start `lodger serve` with your desktop session (systemd user unit)
+  lodger --version          which lodger this is
 
 `lodger <command> --help` for the options."""
 
@@ -43,11 +51,22 @@ def main(argv=None):
     if cmd == "models":
         from lodger import picker
         return picker.main(args[1:])
+    if cmd == "service":
+        from lodger import service
+        return service.main(args[1:])
+    if cmd in ("--version", "-V", "version"):
+        print(f"lodger {__version__}")
+        return 0
     if cmd in ("serve", "ask", "pi", "unpause"):
         from lodger import serve
         return getattr(serve, {"unpause": "unpause_all"}.get(cmd, cmd))(args[1:])
+    if cmd in ("", "-h", "--help", "help"):
+        print(HELP)
+        return 0
+    near = difflib.get_close_matches(cmd, COMMANDS, n=1)
+    print(f"lodger: no command {cmd!r}" + (f"; did you mean `lodger {near[0]}`?" if near else ""), file=sys.stderr)
     print(HELP)
-    return 0 if cmd in ("", "-h", "--help", "help") else 2
+    return 2
 
 
 if __name__ == "__main__":

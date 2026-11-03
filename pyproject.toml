@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lodger"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Local AI that lives on your PC as a guest: it steps aside when your apps need the graphics card, then grows back."
 readme = "README.md"
 license = "MIT"
@@ -22,6 +22,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
@@ -35,6 +36,9 @@ lodger = "lodger.cli:main"
 
 [tool.setuptools]
 packages = ["lodger", "lodger.gpu"]
+
+[tool.setuptools.dynamic]
+version = { attr = "lodger.__version__" }
 
 [tool.ruff]
 target-version = "py311"

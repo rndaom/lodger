@@ -25,6 +25,25 @@ class CliTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("lodger serve", text)
 
+    def test_a_typo_gets_a_suggestion(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, _ = run("serv")
+        self.assertEqual(code, 2)
+        self.assertIn("did you mean `lodger serve`", err.getvalue())
+
+    def test_version(self):
+        from lodger import __version__
+        for flag in ("--version", "-V", "version"):
+            code, text = run(flag)
+            self.assertEqual((code, text.strip()), (0, f"lodger {__version__}"))
+
+    def test_every_command_in_the_help_is_known(self):
+        _, text = run("--help")
+        for line in text.splitlines():
+            if line.startswith("  lodger ") and not line.startswith("  lodger --"):
+                self.assertIn(line.split()[1], cli.COMMANDS)
+
 
 if __name__ == "__main__":
     unittest.main()
