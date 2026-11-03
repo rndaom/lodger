@@ -80,5 +80,29 @@ class MeminfoTest(unittest.TestCase):
             self.assertLessEqual(card.free(), 2 * GiB)
 
 
+
+class LodgerUseTest(unittest.TestCase):
+    """What every lodger model holds on a card (any lodger's, a test's too): the desktop notes leave it out."""
+
+    def test_models_in_any_lodger_fence_count(self):
+        from lodger import gpu
+        with machine("desktop-amd", writable=True) as root:
+            card = gpu.choose()
+            self.assertEqual(sysmem.lodger_use(card, ours=()), {"vram": 0, "gtt": 0})
+            # pids 100 and 200 share one client on the card: as if another lodger's engine held it
+            write(root, "/proc/100/cgroup", "0::" + SLICE + "/user@1000.service/app.slice/lodger-4242-3.service\n")
+            use = sysmem.lodger_use(card, ours=())
+            self.assertEqual(use, sysmem.gpu_use(card, [100]))
+            self.assertGreater(use["vram"], 300 * (1 << 20))       # ~361 MiB on the card
+
+    def test_this_lodgers_own_unfenced_model_counts(self):
+        from lodger import gpu
+        with machine("desktop-amd"):
+            card = gpu.choose()
+            self.assertEqual(sysmem.lodger_use(card, ours=[100]), sysmem.gpu_use(card, [100]))
+
+    def test_no_card(self):
+        self.assertEqual(sysmem.lodger_use(None, ours=()), {"vram": 0, "gtt": 0})
+
 if __name__ == "__main__":
     unittest.main()

@@ -116,6 +116,24 @@ def reserve(pci, total):
                   f"{WINDOW} minutes lately, so lodger keeps more than its usual {f / GiB:.1f} GiB")
 
 
+def report(pci, total):
+    """For lodger doctor: {floor, measured (bytes the notes ask for, or None), keep, notes (minutes noted), capped,
+    warning (plain words when the notes ask for far more than the floor, else None)}."""
+    f = floor(total)
+    notes = _load(pci) if pci else {}
+    r = rise(notes)
+    keep, _ = reserve(pci, total)
+    measured = None if r is None else int(r + HEADROOM)
+    warning = None
+    if measured is not None and measured > 2 * f:
+        warning = (f"lodger learned that your desktop needs {measured / GiB:.1f} GiB of graphics memory, far above the "
+                   f"usual {f / GiB:.1f} GiB: an app holding memory while idle (a game in its menu), or lodger's own "
+                   f"model, may have been noted as desktop use. The notes are in {_path(pci)}; removing that file "
+                   "starts them over")
+    return {"floor": f, "measured": measured, "keep": keep, "notes": len(notes),
+            "capped": measured is not None and keep < measured, "warning": warning}
+
+
 def kill_line(keep):
     """Stop the model at once below this much free graphics memory: 3/4 of the reserve (1.5 GiB for 2 GiB),
     so a plan that leaves the reserve free never trips it. LODGER_KILL_VRAM_FREE_MIB can only raise it."""

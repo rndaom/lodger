@@ -49,6 +49,19 @@ def gpu_use(dev, pids):
     return tot
 
 
+def lodger_use(dev, ours=None):
+    """Graphics memory every lodger model holds on `dev` together, {vram, gtt} bytes: processes in any lodger-*
+    fence (this lodger's, another lodger's, a test's), plus `ours` (default: this lodger's own fences, which
+    finds its unfenced 'none' programs too). What the desktop notes (reserve.py) must leave out."""
+    if not dev:
+        return {"vram": 0, "gtt": 0}
+    if ours is None:
+        from . import fence
+        ours = fence.our_pids()
+    found = set(ours) | {pid for pid in pids() if app_name(pid) == OURS}
+    return gpu_use(dev, sorted(found, key=int))
+
+
 # ---------- RAM ----------
 
 def meminfo():

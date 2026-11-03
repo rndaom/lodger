@@ -51,5 +51,17 @@ class ReserveNotesTest(unittest.TestCase):
             notes[m] = [GiB, GiB] if m % 20 < 10 else [GiB, 3 * GiB]
         self.assertEqual(reserve.reserve("0000:09:00.0", 16 * GiB)[0], 2 * GiB + reserve.HEADROOM)
 
+    def test_report_for_doctor(self):
+        notes = reserve._load("0000:09:00.0")
+        for m in range(120):
+            notes[m] = [GiB, GiB] if m % 20 < 10 else [GiB, 12 * GiB]
+        r = reserve.report("0000:09:00.0", 16 * GiB)
+        self.assertEqual((r["floor"], r["keep"], r["notes"]), (2 * GiB, 4 * GiB, 120))
+        self.assertEqual(r["measured"], 11 * GiB + reserve.HEADROOM)
+        self.assertTrue(r["capped"])
+        self.assertIn("lodger's own model", r["warning"])
+        quiet = reserve.report("0000:08:00.0", 16 * GiB)
+        self.assertEqual((quiet["keep"], quiet["measured"], quiet["warning"]), (2 * GiB, None, None))
+
 if __name__ == "__main__":
     unittest.main()
