@@ -16,6 +16,7 @@ All notable changes to lodger are written here. The format follows
 - `lodger service install|status|remove`: a systemd user unit for the lodger you run it with, so pip, pipx and uv
   installs start at login too; a unit it didn't write is left alone.
 - `lodger --version`; a mistyped command gets a suggestion.
+- No dependencies beyond Python: lodger reads model files itself (the `gguf` package is no longer needed).
 - `lodger doctor` also shows lodger's version, whether `lodger serve` is up, libraries llama.cpp can't load, which
   apps lodger can see on the card, a learned desktop reserve that looks wrong, a recent card reset, a card at its
   critical temperature and cgroup memory caps; your home folder is written as `~`.
@@ -75,8 +76,10 @@ All notable changes to lodger are written here. The format follows
 
 ### Fixed
 - Plans count the output layer on partial card placements (up to ~1 GiB more on the card than planned), the
-  weights llama.cpp repacks for the processor, llama-server's context checkpoints for hybrid and sliding-window
-  models (2-8 GiB of RAM), and where those models keep their context.
+  weights llama.cpp repacks when it runs on the processor only, llama-server's context checkpoints for hybrid and
+  sliding-window models (2-8 GiB of RAM; llama.cpp's own sliding-window layouts for files that give only the
+  window), MTP's extra copies of a hybrid model's state, and where those models keep their context. A damaged or
+  hostile model file is a plain error, read with bounded memory.
 - The learned desktop reserve could take lodger's own or another lodger's model, or an idle game, for desktop use
   (5.8 GiB on a 16 GiB card): no lodger model is noted any more, and the learned part is capped at a quarter of the
   card.
@@ -90,6 +93,14 @@ All notable changes to lodger are written here. The format follows
 - `lodger models get` never replaces a file it didn't download, and a symlinked models.toml stays a link; a file
   named in two `[models.X]` sections is listed with why.
 - `llama_cpp` and `runs_dir` must be full paths; `lodger setup --keep 0` is refused.
+- Closing the terminal of `lodger serve` stops it (as a service, SIGHUP reloads models.toml); a closed terminal can't
+  stop the monitor or the watchdog. The watchdog kills first and logs after, and never waits on `systemctl`.
+- Structured answers (JSON schema, JSON mode, grammar) end with an error after a move instead of continuing into
+  broken JSON; a Responses stream that moves before its first event still opens with `response.created`.
+- A process whose `/proc` text isn't UTF-8 no longer breaks orphan reaping, doctor or the desktop notes; another
+  lodger's model is never taken for a stranger's app; NVIDIA busy time stays sane after the clock is set back.
+- `lodger plan` and `lodger run` take a model's name from models.toml (with its memory settings), and an unknown
+  name is a plain error instead of a traceback.
 - `lodger stress-serve` takes a model's name from `models.toml` as well as a file (a name used to end in "no models
   found"), and `lodger serve` says which file it was given doesn't exist. A request cut off because lodger is
   stopping is told so, instead of where the model was.

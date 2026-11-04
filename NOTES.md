@@ -487,3 +487,20 @@ on a PC with two cards of the same vendor:device id; the cgroup/none fences on o
   Noted, not changed: the first answer waits ~18 s before loading starts (settle >= 4.5 s, more while card memory
   moves, plus ~4 s planning); a killed lodger's leftover model holds the card for RestartSec (30 s) until the new
   lodger stops it. The Steam-game phase (5) wasn't run: it starts a game on the user's screen.
+- 2026-11-03 **audit round with three parallel sessions** (user: "make it better, fix what's broken, fill gaps"),
+  each on its own files, then three independent reviews, fixes, and one merge (296 -> 500 tests):
+  - serve front: Anthropic's `/v1/messages` and OpenAI's `/v1/responses` (both continue after a move), whole
+    answers continue too, usage over the whole answer, fair turns between two models, models.toml reloads (file
+    change, SIGHUP as a service, `POST /lodger/reload`), monotonic timers, richer `/lodger/status`.
+  - sharing and safety: monotonic clocks; kills by cgroup.kill / signals, never through systemctl; OOMScoreAdjust;
+    one card for plan, command and watchdog (serve too); RAM under cgroup limits; card reset, unplugged laptop and
+    critical temperature step aside; other users' and root's apps seen on amdgpu through whole-card numbers.
+  - planner: output layer on partial placements, repacking (processor-only plans), context checkpoints, sliding
+    windows from llama.cpp's per-design layouts, MTP and the expert cache planned; lodger's own GGUF reader (no
+    `gguf` dependency, plans before a first answer 12.9 s -> 0.2 s). This PC's plans: same or more on the card.
+  - shipping: `lodger service`, `--version`, doctor additions, AUR `lodger-git` (built, tested and installed in an
+    Arch container in CI), release workflow for PyPI (needs the user's trusted-publisher setup; the name is free).
+  - Found live: the learned desktop reserve here was 5.8 GiB (a stress-serve lodger noted the service's model and
+    idle games as desktop use); now no lodger model is noted and the learned part is capped at a quarter of the card.
+  - Not tested on the card yet: the new sizing (MTP, expert cache, projectors), the whole-card "unseen app" rule
+    with a ROCm model generating, the heat/reset/battery step-asides. Not run integrated live: the user was gaming.
