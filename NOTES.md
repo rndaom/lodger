@@ -193,15 +193,14 @@ this PC loads models onto the card and lodger uses it freely.
 
 ## Later (promise 2 and 3)
 - Shrink in place without a restart (grow-back is done, but every move restarts the engine).
-- `lodger serve --think`: continuing a half-written *reasoning* part after a move is untested.
 - Save the stress test's answers, to check the seam of a moved answer by eye on the card too (checked on
   the processor: counting 1-60 across a kill came out clean).
 - Shrink the RAM fence while another app is busy (with the model on the processor next to Deadlock,
   Linux compressed ~2 GB of other apps' idle memory).
 - Lower graphics-card priority for the model's work, so other apps' frames come first.
 - Keep the user's most-used experts on the card: b11936 has `--moe-cache-mib N` ("GPU cache for the MoE
-  experts kept in the CPU"). Sized in the plan since 2026-11-03 (`moe_cache_room_mib`); needs a card test, and
-  serve to pass it.
+  experts kept in the CPU"). Sized in the plan since 2026-11-03 (`moe_cache_room_mib`); card-tested with
+  moe-cache-mib in models.toml (planned 11% above measured); serve doesn't pass it on its own yet.
 - First answer: `launch.settle()` costs >= 4.5 s before every card start, though serve already watches the card
   all the time (`quiet_since`); serve could skip settle when its own watch has seen that long a quiet card.
 - Two-drive striping for any model too big for RAM (from ds41-local).
@@ -502,5 +501,15 @@ on a PC with two cards of the same vendor:device id; the cgroup/none fences on o
     Arch container in CI), release workflow for PyPI (needs the user's trusted-publisher setup; the name is free).
   - Found live: the learned desktop reserve here was 5.8 GiB (a stress-serve lodger noted the service's model and
     idle games as desktop use); now no lodger model is noted and the learned part is capped at a quarter of the card.
-  - Not tested on the card yet: the new sizing (MTP, expert cache, projectors), the whole-card "unseen app" rule
-    with a ROCm model generating, the heat/reset/battery step-asides. Not run integrated live: the user was gaming.
+  - Card tests the same night (in a 40-minute window shared with a Deadlock benchmark and a Blender render run by
+    other sessions; lodger.service stopped): planned card memory vs measured peak, all on the card and none
+    stepping aside for its own use (ROCm, whole-card rule): Qwen3.5-9B 131072 ctx 8593/8347 MiB, with its
+    projector and a 768x512 picture 10196/9459, Swift 27B with MTP (32768 ctx, 40% of drafts accepted)
+    11998/11398, Qwen3.6 35B with moe-cache-mib 1024 11986/10777. Before the fix in plan.Costs, serve's card
+    plans (one context length) saw no growth: the 9B hybrid was refused for "77 GiB" of checkpoints.
+  - Heat, card reset and unplugging injected live (scratch inject.py patching gpu.Device.heat / crash_report /
+    gpu.power_source, base 9B writing 1..400): off the card in 11 / 3 / 4 s, the answer finished in order, it
+    stayed off while the condition lasted and grew back after. Live kill mid-thinking on Chat, Messages and
+    Responses: the thinking goes on as thinking (Messages and Responses sent an empty text part before).
+  - Bonsai 27B (PQ2_0) aborted llama-fit-params at every start and plan (a desktop crash notice each time):
+    unreadable files are now remembered per file and build.
