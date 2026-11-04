@@ -499,7 +499,7 @@ class PlacementTest(PlanBase):
             p = self.make(m, vram_free=8 * GiB, target_ctx=16384, min_ctx=16384)
         self.assertAlmostEqual(share[3], 16384 * 64 * 1024 / 10)
         self.assertAlmostEqual(share[0], 400 * MiB / 30)
-        self.assertAlmostEqual(sum(share.values()), c.context(16384))
+        self.assertAlmostEqual(sum(share.values()), c.context(16384), delta=1)   # bytes; 3.11 sums floats less exactly
         self.assertEqual(p["ctx"], 16384)
         n = p["ngl_layers"]
         self.assertLess(n, 40)

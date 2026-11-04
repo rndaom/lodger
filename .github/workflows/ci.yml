@@ -41,6 +41,8 @@ jobs:
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:
+      - name: git, so the checkout is a repository (check.sh clones it)
+        run: pacman -Syu --noconfirm --needed git
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
