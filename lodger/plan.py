@@ -208,8 +208,13 @@ class Costs:
 
     def __init__(self, model, lo, hi, extra=(), points=()):
         self.lo, self.hi = lo, hi
-        got = {c: probe(model, c, extra=extra) for c in sorted({lo, hi} | {p for p in points if lo < p < hi})}
-        a, b = got[lo], got[hi]
+        # one length (serve plans the card for the context it chose) can't tell what grows from what's fixed:
+        # half of it (or twice the shortest) is asked too
+        a_lo = lo if lo < hi else hi // 2 if hi // 2 >= SMALLEST_CTX else lo
+        b_hi = hi if a_lo < hi else hi * 2
+        got = {c: probe(model, c, extra=extra) for c in sorted({a_lo, b_hi} | {p for p in points if a_lo < p < b_hi})}
+        a, b = got[a_lo], got[b_hi]
+        lo, hi = a_lo, b_hi
         grow = b["context"] - a["context"]
         self.per_tok = grow / (hi - lo) if hi > lo and grow > 0 else 0.0
         # no growth measured: the larger of the two, so neither length is planned below llama.cpp's own number

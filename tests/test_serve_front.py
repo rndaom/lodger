@@ -443,6 +443,23 @@ class PowerTest(MonitorCase):
         self.assertIn("battery", l.why_off_card)
         self.assertEqual(l.quiet_needed, serve.QUIET_SECONDS)       # not a sign the card is contested
 
+    def test_unplugged_seen_first_by_the_watchdog_is_not_contention(self):
+        # the watchdog checks the power every second, serve every 10 s: whichever sees it first, the wait for
+        # growing back mustn't grow (it did when the watchdog stopped the model)
+        l = self.l
+        e = FakeEng(l.models["a"], where="card")
+        l.install(e)
+        l.card_since = time.monotonic() - 60                       # on the card for a minute: "came back too soon"
+        e.wd.reason = "the PC went on battery (gpu_on_battery in config.toml); giving the graphics card back"
+        e._alive = False
+        with mock.patch.object(serve.sysmem, "dgpu", return_value=SimpleNamespace(integrated=False)), \
+                mock.patch.object(serve.gpus, "power_source", return_value=("battery", "on battery")), \
+                mock.patch.object(serve.config, "get", return_value={"gpu_on_battery": False}), \
+                mock.patch.object(l, "bring_up", return_value=True):
+            l.tick(QUIET)
+        self.assertEqual(l.quiet_needed, serve.QUIET_SECONDS)
+        self.assertIn("battery", l.why_off_card)
+
     def test_asked_move_is_not_lost_to_the_power_check(self):
         l = self.l
         e = FakeEng(l.models["a"], where="card")

@@ -75,6 +75,12 @@ All notable changes to lodger are written here. The format follows
   is none); when it lists its own, `lodger models get` adds the download folder to them.
 
 ### Fixed
+- `lodger serve` planned the card for one context length, so it couldn't tell what grows with the context
+  from what doesn't: a hybrid model (Qwen3.5) was refused the card for "77 GiB" of checkpoints (each counted as
+  its whole cache), MTP drafting's context was left out and the context's split between card and RAM was off.
+  Card test after the fix: planned within +3% to +11% above measured (9B, 9B with its projector, 27B with MTP,
+  35B with the expert cache).
+- Unplugging a laptop no longer makes the model wait longer to grow back when the watchdog notices it first.
 - A model file this llama.cpp build can't read is remembered, so llama-fit-params isn't run (and doesn't crash,
   with a crash report and a desktop notice each time) on it at every start, reload and plan; lodger asks again
   when the file or the build changes. The reason it isn't served is llama.cpp's own error line.

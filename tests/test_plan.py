@@ -461,6 +461,23 @@ class PlanSafetyTest(PlanBase):
             c = plan.Costs(fake_model(), 4096, 65536)
         self.assertGreaterEqual(c.context(65536), 900 * MiB)
 
+    def test_one_length_still_tells_what_grows_from_what_is_fixed(self):
+        # serve plans the card for exactly the context it chose: with one probe, all of the context looked
+        # fixed, and a hybrid model's 32 checkpoints were planned as 32 copies of its whole cache
+        asked = []
+
+        def probe(model, ctx, gpu=None, extra=(), dev=None):
+            asked.append(ctx)
+            return fake_probe(model, ctx)
+        with mock.patch("lodger.plan.probe", side_effect=probe):
+            c = plan.Costs(fake_model(), 131072, 131072)
+        self.assertEqual(c.per_tok, 64 * 1024)
+        self.assertEqual(c.fixed(131072), 100 * MiB)
+        self.assertEqual(c.context(131072), 100 * MiB + 131072 * 64 * 1024)
+        self.assertEqual(sorted(set(asked)), [65536, 131072])
+        with mock.patch("lodger.plan.probe", side_effect=probe):
+            self.assertEqual(plan.Costs(fake_model(), 256, 256).per_tok, 64 * 1024)    # the shortest: one longer
+
     def projector(self, size):
         path = os.path.join(self.runs, "mmproj.gguf")
         with open(path, "wb") as f:

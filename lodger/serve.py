@@ -892,7 +892,10 @@ class Lodger:
             e.finish()
             self.drop(e)
             if reason and e.where == "card":
-                self.stepped_aside()
+                if self.unplugged():                  # the watchdog saw it first: not a contested card either
+                    self.last_aside, self.card_since = time.monotonic(), None
+                else:
+                    self.stepped_aside()
                 self.why_off_card = "stepped aside: " + reason
                 self.note(f"stepped aside from the card: {reason}")
             else:
