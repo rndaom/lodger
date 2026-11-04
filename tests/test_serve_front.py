@@ -349,6 +349,58 @@ class SleepTest(MonitorCase):
         self.assertFalse(e.alive())
 
 
+class ContextTest(MonitorCase):
+    """An automatic context decided while something else held memory (a game) may grow at the model's next start
+    from unloaded, never shrink: apps were told the longer one. A context from models.toml is never changed."""
+
+    def unload_and_wake(self, entry):
+        l = self.l
+        l.install(FakeEng(entry))
+        l.a.idle, l.last_used = 1, 0
+        l.tick(QUIET)                                           # unloaded when unused
+        self.assertIsNone(l.engine)
+        with mock.patch.object(l, "bring_up", return_value=True):
+            l.wake_up()
+
+    def test_automatic_context_grows_at_the_next_start_and_never_shrinks(self):
+        l, a = self.l, self.l.models["a"]
+        a.ctx = None
+        ctxs = iter([8192, 32768, 4096])
+        with mock.patch.object(serve.planner, "make", side_effect=lambda *x, **k: {"refuse": None, "ctx": next(ctxs)}):
+            l.decide_ctx(a)                                     # while a game held the memory
+            self.assertEqual(a.ctx, 8192)
+            self.unload_and_wake(a)                             # the game has ended
+            self.assertEqual(a.ctx, 32768)
+            self.unload_and_wake(a)                             # a game again: the longer context stays
+            self.assertEqual(a.ctx, 32768)
+
+    def test_a_context_from_the_model_list_is_kept(self):
+        l, a = self.l, self.l.models["a"]
+        with mock.patch.object(serve.planner, "make") as make:
+            l.decide_ctx(a)
+            self.unload_and_wake(a)
+        make.assert_not_called()
+        self.assertEqual(a.ctx, 4096)
+
+    def test_an_unreadable_model_says_why_in_one_line(self):
+        l, b = self.l, self.l.models["b"]
+        b.ctx = None
+        err = SystemExit("llama-fit-params failed (exit 1) for b.gguf:\n0.00.032.853 E gguf_init_from_reader: tensor "
+                         "'output.weight' has invalid ggml type 142\nwhat():  failed to load model")
+        with mock.patch.object(serve.planner, "make", side_effect=err):
+            l.decide_ctx(b)
+        self.assertEqual(b.skip, "can't be read by this llama.cpp build (gguf_init_from_reader: tensor 'output.weight' "
+                                 "has invalid ggml type 142)")
+
+    def test_a_failed_plan_later_keeps_the_model(self):
+        l, a = self.l, self.l.models["a"]
+        a.ctx = None
+        with mock.patch.object(serve.planner, "make", return_value={"refuse": None, "ctx": 8192}):
+            l.decide_ctx(a)
+        with mock.patch.object(serve.planner, "make", side_effect=SystemExit("llama-fit-params crashed")):
+            self.unload_and_wake(a)
+        self.assertEqual((a.ctx, a.skip), (8192, None))
+
 class GrowBackTest(MonitorCase):
     def test_card_engine_stopped_during_the_hand_over_keeps_the_processor(self):
         l = self.l
@@ -539,6 +591,21 @@ class ReloadTest(MonitorCase):
         self.assertEqual(a.ctx, 8192)                          # until it starts again
         l.a.idle, l.last_used = 1, 0
         l.tick(QUIET)                                           # unloaded when unused
+        self.assertEqual(a.ctx, 2048)
+
+    def test_a_context_set_after_an_automatic_one_is_kept(self):
+        l, a = self.l, self.l.models["a"]
+        a.ctx = None
+        with mock.patch.object(serve.planner, "make", return_value={"refuse": None, "ctx": 8192}):
+            l.decide_ctx(a)
+        self.write(a_extra="ctx = 2048")
+        with mock.patch.object(l, "prepare"):
+            l.reload("test")
+        self.assertEqual(a.ctx, 2048)
+        with mock.patch.object(serve.planner, "make", return_value={"refuse": None, "ctx": 65536}) as make, \
+                mock.patch.object(l, "bring_up", return_value=True):
+            l.wake_up()
+        make.assert_not_called()
         self.assertEqual(a.ctx, 2048)
 
     def test_wrong_types_in_the_file_keep_the_models(self):

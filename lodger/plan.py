@@ -48,6 +48,10 @@ def cache_dir():
     return os.path.join(config.runs_dir(), "probe-cache")
 
 
+# llama.cpp's words for a model file it can't read (a type, an architecture or a layout this build doesn't know)
+UNREADABLE = re.compile(r"gguf_init_from_\w+:|invalid ggml type|unknown model architecture|error loading model")
+
+
 def llama_errors(text, most=8, no_card=False):
     """llama.cpp's own error lines in its output (log level E, an exception's what()), the last few; "" if none.
     no_card: leave out the backends finding no card (expected when the card is hidden)."""
@@ -78,6 +82,17 @@ def probe(model, ctx, gpu=None, extra=(), dev=None):
     hit = read_cached(cf)
     if hit:
         return hit
+    # a model file this build can't read is remembered (per file and build): llama-fit-params aborts on it, and
+    # each abort is a crash report and a desktop notice, so it isn't run on that file again until either changes
+    bad = os.path.join(cache, hashlib.sha1(f"{model.path}:{stamp(model.files)}:{fit}:{stamp([fit] + build_libs(fit))}"
+                                           .encode()).hexdigest()[:16] + ".unreadable")
+    try:
+        with open(bad) as f:
+            known = f.read()
+    except OSError:
+        known = None
+    if known:
+        raise SystemExit(known)
     props = {"MemoryMax": "4G", "MemorySwapMax": "0", "LimitCORE": "0"}
     args = [fit, "-m", model.files[0], "-c", str(ctx), "--fit-print", "on"] + list(extra)
     if gpu is None:
@@ -104,7 +119,12 @@ def probe(model, ctx, gpu=None, extra=(), dev=None):
             why = f"gave no estimate for {prefix.strip()} (its --fit-print output isn't what lodger reads)"
         tail = llama_errors(r.stderr, no_card=gpu is None) or (r.stderr.strip()[-2000:] + ("\n" + r.stdout.strip()[-500:] if not found
                                                                          else "")).strip()
-        raise SystemExit(f"llama-fit-params {why} for {os.path.basename(model.files[0])}" + (f":\n{tail}" if tail else "."))
+        msg = f"llama-fit-params {why} for {os.path.basename(model.files[0])}" + (f":\n{tail}" if tail else ".")
+        if r.returncode and UNREADABLE.search(r.stderr):
+            with contextlib.suppress(OSError):
+                with open(bad, "w") as f:
+                    f.write(msg + "\n(remembered: lodger asks again when the file or the llama.cpp build changes)")
+        raise SystemExit(msg)
     out = {k: int(v) * MiB for k, v in zip(PROBE_KEYS, found.groups())}
     tmp = f"{cf}.{os.getpid()}-{threading.get_ident()}.tmp"     # two plans may probe at once
     try:

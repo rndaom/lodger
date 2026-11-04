@@ -264,6 +264,44 @@ class ProbeTest(unittest.TestCase):
         _, (cmd, env, props) = self.run_probe([], None, "Host 1 2 3\n")
         self.assertEqual(env.get("GGML_NO_BACKTRACE"), "1")            # no debugger attached to a crash
 
+    def test_a_file_this_build_cant_read_is_not_probed_again(self):
+        # llama-fit-params aborts on it: each abort is a crash report and a desktop notice
+        build = fake_build()
+        self.addCleanup(subprocess.run, ["rm", "-rf", build])
+        cfg = config.load("/nonexistent")
+        cfg.update(runs_dir=self.runs, llama_cpp=build)
+        config.use(cfg)
+        m = fake_model()
+        m.files = [os.path.join(build, "build", "bin", "llama-cli")]
+        calls = []
+        results = {"bad": (-6, "0.00.03 E gguf_init_from_reader: tensor 'output.weight' has invalid ggml type 142\n"),
+                   "slow": (-9, "")}
+
+        def probe(kind, ctx):
+            def run(cmd, env, props, timeout=300):
+                calls.append(kind)
+                code, err = results[kind]
+                return subprocess.CompletedProcess(cmd, code, stdout="", stderr=err)
+            with machine("desktop-amd"), mock.patch("lodger.fence.run", side_effect=run), \
+                    mock.patch("lodger.plan.time.monotonic", side_effect=[0, plan.PROBE_TIMEOUT if kind == "slow" else 0]):
+                with self.assertRaises(SystemExit) as e:
+                    plan.probe(m, ctx)
+            return str(e.exception)
+
+        self.assertIn("invalid ggml type", probe("bad", 4096))
+        again = probe("bad", 8192)                                  # any context, any card: the file is the problem
+        self.assertEqual(calls, ["bad"])
+        self.assertIn("invalid ggml type", again)
+        self.assertIn("remembered", again)
+        os.utime(m.files[0], (1, 1))                               # the file changed: asked again
+        probe("bad", 4096)
+        self.assertEqual(calls, ["bad", "bad"])
+        for f in os.listdir(plan.cache_dir()):
+            os.remove(os.path.join(plan.cache_dir(), f))
+        probe("slow", 4096)
+        probe("slow", 4096)                                         # a timeout isn't the file's fault
+        self.assertEqual(calls[2:], ["slow", "slow"])
+
 class EngineTest(unittest.TestCase):
     def tearDown(self):
         config.use(None)

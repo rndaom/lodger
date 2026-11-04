@@ -75,6 +75,11 @@ All notable changes to lodger are written here. The format follows
   is none); when it lists its own, `lodger models get` adds the download folder to them.
 
 ### Fixed
+- A model file this llama.cpp build can't read is remembered, so llama-fit-params isn't run (and doesn't crash,
+  with a crash report and a desktop notice each time) on it at every start, reload and plan; lodger asks again
+  when the file or the build changes. The reason it isn't served is llama.cpp's own error line.
+- A context lodger decided while something else held memory (a game) grows at the model's next start from
+  unloaded, when there is room; it never shrinks, since apps were told the longer one.
 - When llama.cpp can't read a model, lodger shows llama.cpp's own error (e.g. a tensor type this build doesn't
   know) instead of the end of a debugger's backtrace.
 - An answer cut while the model was thinking goes on thinking after a move in the Anthropic Messages and OpenAI

@@ -24,6 +24,7 @@ Ollama's API find lodger at http://127.0.0.1:11434 too."""
 import argparse
 import http.client
 import json
+import re
 import os
 import contextlib
 import hmac
@@ -122,6 +123,13 @@ def log(msg):
     """A line on lodger's output. Never raises: a closed terminal (EIO) must not stop the monitor halfway."""
     with contextlib.suppress(OSError, ValueError):
         print(time.strftime("%H:%M:%S ") + msg, flush=True)
+
+
+def short_error(ex, most=160):
+    """An error's cause in one line: llama.cpp's first error line after lodger's own heading, without its time."""
+    lines = [l.strip() for l in str(ex).splitlines() if l.strip()]
+    line = re.sub(r"^[\d.]+ E ", "", lines[1] if len(lines) > 1 else lines[0] if lines else "unknown error")
+    return line if len(line) <= most else line[:most - 3] + "..."
 
 
 def free_port():
@@ -315,6 +323,7 @@ class Lodger:
         self.last_power = 0.0                 # when the power source was last looked at
         self.unload_wanted = None             # why the loaded model is to be unloaded (removed from the list), or None
         self.next_ctx = {}                    # model -> its context from its next start (it changed while loaded)
+        self.auto_ctx = set()                 # models whose context lodger decided (none in models.toml)
         self.reload_wanted = None             # why the model list is to be read again (SIGHUP), or None
         self.reloading = threading.Lock()
         self.conf = {n: self.fingerprint(e) for n, e in models.items()}   # each model as models.toml had it
@@ -398,6 +407,7 @@ class Lodger:
                     else:
                         out[name] = cur
                         if self.conf.get(name) != fp:
+                            self.auto_ctx.discard(name)       # decided again from its new settings
                             loaded = self.engine and self.engine.entry is cur
                             running = cur.ctx
                             cur.__dict__.update(new.__dict__)
@@ -461,18 +471,22 @@ class Lodger:
         until, why = self.failed.get(entry.name, (0, None))
         return why if time.monotonic() < until else None
 
-    def decide_ctx(self, entry):
+    def decide_ctx(self, entry, again=False):
         """A model's context for this session: automatic (see plan.CTX_CAP/CTX_SHARE) for where it may run,
         the shorter of card and processor, so a conversation that fits on the card still fits after a move
-        to the processor. Planning only, nothing loads."""
-        if entry.ctx or entry.skip:
+        to the processor. Planning only, nothing loads.
+        again: the model starts from unloaded; a context lodger decided may grow now (it was decided while
+        something else held memory), never shrink: apps were told the longer one."""
+        if entry.skip or (entry.ctx and not (again and entry.name in self.auto_ctx)):
             return
         ctxs = []
         try:
             p = planner.make(entry.path, cpu_only=True, threads=self.a.threads, why_gpu_off="deciding the context",
                              extra=entry.planning_args())
         except (Exception, SystemExit) as ex:   # e.g. a file type this llama.cpp can't read
-            entry.skip = f"can't be read by this llama.cpp build ({str(ex)[:120]})"
+            if again:
+                return                            # it was read before: keep the context it has
+            entry.skip = f"can't be read by this llama.cpp build ({short_error(ex)})"
             log(f"{entry.name}: {entry.skip}")
             return
         if not p["refuse"]:
@@ -489,7 +503,14 @@ class Lodger:
                     ctxs.append(p["ctx"])
             except (Exception, SystemExit) as ex:   # the processor plan worked: the model runs there at least
                 log(f"{entry.name}: planning for the graphics card failed, context from the processor's plan ({str(ex)[:120]})")
-        entry.ctx = min(ctxs) if ctxs else planner.MIN_CTX
+        ctx = min(ctxs) if ctxs else planner.MIN_CTX
+        if again:
+            if ctx > entry.ctx:
+                self.note(f"{entry.name}: context {entry.ctx} -> {ctx} (more memory free than when it was decided)")
+                entry.ctx = ctx
+            return
+        entry.ctx = ctx
+        self.auto_ctx.add(entry.name)
 
     def prepare(self):
         """At start: work out every model's context (cached after the first time), then tell pi about them."""
@@ -635,6 +656,7 @@ class Lodger:
         """Load the model a request asked for (switch, wake-up): card if allowed, else (or if that fails) the
         processor. If neither starts, it waits FAIL_COOLDOWN before a request may try again."""
         target = self.cur
+        self.decide_ctx(target, again=True)
         if self.bring_up(want_card=self.a.allow_gpu) or (self.a.allow_gpu and not self.closing and self.bring_up(False)):
             return True
         with self.cv:
