@@ -108,6 +108,7 @@ def llama_cmd(p, a, card=None):
     cmd += dargs
     if not a.think:
         cmd += ["--reasoning", "off"]
+    cmd += list(getattr(a, "extra", ()))       # a models.toml entry's settings that change memory, as planned
     if a.prompt is not None:
         cmd += ["-st", "-n", str(a.n), "-p", a.prompt]
     return cmd, env
@@ -408,8 +409,27 @@ def build_plan(a, for_run, card=None):
         a.model, target_ctx=a.ctx, min_ctx=a.min_ctx, cpu_only=a.cpu_only, leave_gpu=a.leave_gpu * MiB,
         vram_free=None if a.pretend_vram_free is None else a.pretend_vram_free * MiB,
         ram_avail=None if a.pretend_ram_avail is None else a.pretend_ram_avail * MiB,
-        threads=a.threads, why_gpu_off=why_off, card=card,
+        threads=a.threads, why_gpu_off=why_off, card=card, extra=getattr(a, "extra", ()),
         device_check=bool(allowed and not why_off and not pretend and not a.cpu_only))   # a "y" at the question counts too
+
+
+def model_arg(model):
+    """(file, settings that change memory) for MODEL: a file, or a model's name in models.toml (its memory
+    settings there, such as a q8_0 context cache, are planned and used)."""
+    from . import catalog
+    if os.path.isfile(model):
+        return model, []
+    try:
+        models, _ = catalog.load()
+    except (OSError, ValueError) as ex:
+        sys.exit(f"{model}: no such file, and {catalog.CONFIG} can't be read ({ex})")
+    if model not in models:
+        sys.exit(f"{model}: no such file, and no model by that name in {catalog.CONFIG} "
+                 f"(names there: {', '.join(sorted(models)) or 'none'})")
+    e = models[model]
+    if e.skip:
+        sys.exit(f"{model} is not served: {e.skip}")
+    return e.path, e.planning_args()
 
 
 def do_run(a):
@@ -506,7 +526,7 @@ def do_run(a):
 def main(argv):
     ap = argparse.ArgumentParser(prog="lodger", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("action", choices=["plan", "run"])
-    ap.add_argument("model")
+    ap.add_argument("model", help="a .gguf file, or a model's name in models.toml")
     ap.add_argument("--ctx", type=int, help="context length to aim for (words/tokens; default: automatic)")
     ap.add_argument("--min-ctx", type=int, default=planner.MIN_CTX)
     ap.add_argument("--cpu-only", action="store_true")
@@ -520,6 +540,7 @@ def main(argv):
     ap.add_argument("--think", action="store_true", help="let the model reason before answering")
     ap.add_argument("--runtime", type=int, help="stop after this many seconds")
     a = ap.parse_args(argv)
+    a.model, a.extra = model_arg(a.model)
     for opt, v in (("--ctx", a.ctx), ("--min-ctx", a.min_ctx)):
         if v is not None and v < planner.SMALLEST_CTX:
             ap.error(f"{opt} must be at least {planner.SMALLEST_CTX} words")
