@@ -411,12 +411,14 @@ class Messages(Answer):
         thinking, text = self.text_of("thinking"), self.text_of("text")
         if not (thinking or text):
             return
-        content = []
-        if thinking or self.pre_thinking:
-            content.append({"type": "thinking", "thinking": self.pre_thinking + thinking, "signature": ""})
-        content.append({"type": "text", "text": self.pre_text + text})
-        req["messages"] = self.msgs + [{"role": "assistant", "content": content if len(content) > 1 else
-                                        content[0]["text"]}]
+        # llama-server goes on with the thinking only when the message has no text part, not even an empty one
+        if not (thinking or self.pre_thinking):
+            content = self.pre_text + text
+        else:
+            content = [{"type": "thinking", "thinking": self.pre_thinking + thinking, "signature": ""}]
+            if text or self.pre_text:
+                content.append({"type": "text", "text": self.pre_text + text})
+        req["messages"] = self.msgs + [{"role": "assistant", "content": content}]
 
     def cut(self):
         if self.pre_other and self.blocks:
@@ -624,8 +626,9 @@ class Responses(Answer):
         extra = []
         if reasoning:
             extra.append({"type": "reasoning", "summary": [], "content": [{"type": "reasoning_text", "text": reasoning}]})
-        extra.append({"type": "message", "role": "assistant",
-                      "content": [{"type": "output_text", "text": self.pre_text + text}]})
+        if text or self.pre_text:               # an empty one would make llama-server end the reasoning
+            extra.append({"type": "message", "role": "assistant",
+                          "content": [{"type": "output_text", "text": self.pre_text + text}]})
         req["input"] = self.items + extra
 
     def moved_note(self, where):

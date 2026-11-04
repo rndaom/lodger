@@ -75,6 +75,8 @@ All notable changes to lodger are written here. The format follows
   is none); when it lists its own, `lodger models get` adds the download folder to them.
 
 ### Fixed
+- An answer cut while the model was thinking goes on thinking after a move in the Anthropic Messages and OpenAI
+  Responses APIs; before, the rest of the thinking came out as the answer's text, with a literal `</think>` in it.
 - Plans count the output layer on partial card placements (up to ~1 GiB more on the card than planned), the
   weights llama.cpp repacks when it runs on the processor only, llama-server's context checkpoints for hybrid and
   sliding-window models (2-8 GiB of RAM; llama.cpp's own sliding-window layouts for files that give only the

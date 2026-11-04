@@ -197,6 +197,20 @@ class MessagesTest(FrontCase):
         self.assertEqual(b.calls[0][1]["messages"][-1], {"role": "assistant", "content": "Say: Hel"})
         self.assertEqual(len(b.calls[0][1]["messages"]), 2)                 # the app's own start, continued
 
+    def test_cut_while_thinking_continues_the_thinking(self):
+        """llama-server continues the thinking only when the assistant message it is given has no text part, even an
+        empty one; with one it writes the rest of the thinking as text, with a literal </think> in it."""
+        a = Engine(events=[msg_start(), block_start(0, "thinking"), block_delta(0, "thinking_delta", "hmm")], cut=True)
+        b = Engine(events=[msg_start("msg_2"), block_start(0, "thinking"), block_delta(0, "thinking_delta", " more"),
+                           block_stop(0), block_start(1, "text"), block_delta(1, "text_delta", "ok"), block_stop(1),
+                           *msg_end(2)], done=False)
+        status, _, data = self.front(a, b).post("/v1/messages", MSG)
+        self.assertEqual(status, 200)
+        self.assertEqual(b.calls[0][1]["messages"][-1], {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "hmm", "signature": ""}]})
+        self.assertEqual(json.loads(data)["content"], [{"type": "thinking", "thinking": "hmm more", "signature": ""},
+                                                       {"type": "text", "text": "ok"}])
+
     def after_thinking(self):
         """A cut in the answer after its thinking; llama-server numbers the next engine's closing events counting the
         thinking it was given (thinking 0, text 1), not the text block it streamed as 0."""
@@ -347,6 +361,17 @@ class ResponsesTest(FrontCase):
         events = [*resp_start(), *msg_added(0, "msg_a"), text_delta(0, "msg_a", "hi"), *resp_end(0, "msg_a", "hi", "resp_1", 1)]
         status, _, data = self.front(Engine(events=events, done=False)).post("/v1/responses", dict(RESP, stream=True))
         self.assertEqual(data.decode(), "".join(events))
+
+    def test_cut_while_reasoning_continues_the_reasoning(self):
+        r_item = {"id": "rs_a", "type": "reasoning", "summary": [], "content": [], "status": "in_progress"}
+        a = Engine(events=[*resp_start(), rev("response.output_item.added", output_index=0, item=r_item),
+                           rev("response.reasoning_text.delta", item_id="rs_a", output_index=0, content_index=0,
+                               delta="hmm")], cut=True)
+        b = Engine(events=[*resp_start("resp_2"), *msg_added(0, "msg_b"), text_delta(0, "msg_b", "ok"),
+                           *resp_end(0, "msg_b", "ok", "resp_2", 1)], done=False)
+        self.front(a, b).post("/v1/responses", RESP)
+        self.assertEqual(b.calls[0][1]["input"][-1], {"type": "reasoning", "summary": [], "content": [
+            {"type": "reasoning_text", "text": "hmm"}]})                    # no empty message after it
 
     def after_reasoning(self):
         """A cut in the answer after its reasoning; the next engine's closing events number the reasoning it was
