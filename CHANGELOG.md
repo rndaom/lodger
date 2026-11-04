@@ -75,6 +75,8 @@ All notable changes to lodger are written here. The format follows
   is none); when it lists its own, `lodger models get` adds the download folder to them.
 
 ### Fixed
+- When llama.cpp can't read a model, lodger shows llama.cpp's own error (e.g. a tensor type this build doesn't
+  know) instead of the end of a debugger's backtrace.
 - An answer cut while the model was thinking goes on thinking after a move in the Anthropic Messages and OpenAI
   Responses APIs; before, the rest of the thinking came out as the answer's text, with a literal `</think>` in it.
 - Plans count the output layer on partial card placements (up to ~1 GiB more on the card than planned), the

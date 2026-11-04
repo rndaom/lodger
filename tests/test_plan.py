@@ -213,14 +213,14 @@ class ProbeTest(unittest.TestCase):
     def test_rocm_build(self):
         r, (cmd, env, props) = self.run_probe(["libggml-hip.so"], (41, 3), "ROCm0 900 100 200 \nHost 10 0 5 \n")
         self.assertEqual(r["compute"], 200 * MiB)
-        self.assertEqual(env, {"HIP_VISIBLE_DEVICES": "0"})
+        self.assertEqual(env, {"HIP_VISIBLE_DEVICES": "0", "GGML_NO_BACKTRACE": "1"})
         self.assertEqual(cmd[cmd.index("-ncmoe") + 1], "3")
 
     def test_processor_only_hides_the_cards(self):
         r, (cmd, env, props) = self.run_probe(["libggml-vulkan.so"], None, "Host 10 20 30 \n")
         self.assertEqual(r["context"], 20 * MiB)
         self.assertEqual(props["PrivateDevices"], "yes")
-        self.assertEqual(env, {"GGML_VK_VISIBLE_DEVICES": ""})
+        self.assertEqual(env, {"GGML_VK_VISIBLE_DEVICES": "", "GGML_NO_BACKTRACE": "1"})
         self.assertEqual(cmd[cmd.index("--device") + 1], "none")
 
     def test_output_with_more_columns_or_on_stderr_is_still_read(self):
@@ -247,6 +247,22 @@ class ProbeTest(unittest.TestCase):
         self.assertIn("unknown argument", str(e.exception))
         self.assertEqual(os.listdir(os.path.join(self.runs, "probe-cache")), [])          # nothing cached
 
+
+    def test_a_failure_shows_llama_cpps_own_error_not_a_backtrace(self):
+        err = ("0.00.000.670 E ggml_cuda_init: failed to initialize ROCm: no ROCm-capable device is detected\n"
+               "0.00.001.751 I llama_fit_params: printing estimated memory\n"
+               "0.00.033.678 E gguf_init_from_reader: tensor 'output.weight' has invalid ggml type 142. should be in [0, 43)\n"
+               "0.00.037.853 E llama_model_load_from_file_impl: failed to load model\n"
+               "terminate called after throwing an instance of 'std::runtime_error'\n  what():  failed to load model\n"
+               + "".join(f"#{i} 0x00007fb0958 in frame{i} () from /x/libllama-common.so.0\n" for i in range(60)))
+        with self.assertRaises(SystemExit) as e:
+            self.run_probe([], None, "", -6, err, 0)
+        msg = str(e.exception)
+        self.assertIn("invalid ggml type 142", msg)
+        self.assertNotIn("frame59", msg)
+        self.assertNotIn("ROCm", msg)                                   # the card is hidden from it on purpose
+        _, (cmd, env, props) = self.run_probe([], None, "Host 1 2 3\n")
+        self.assertEqual(env.get("GGML_NO_BACKTRACE"), "1")            # no debugger attached to a crash
 
 class EngineTest(unittest.TestCase):
     def tearDown(self):

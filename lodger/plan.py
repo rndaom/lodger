@@ -48,6 +48,15 @@ def cache_dir():
     return os.path.join(config.runs_dir(), "probe-cache")
 
 
+def llama_errors(text, most=8, no_card=False):
+    """llama.cpp's own error lines in its output (log level E, an exception's what()), the last few; "" if none.
+    no_card: leave out the backends finding no card (expected when the card is hidden)."""
+    errs = [l.strip() for l in text.splitlines()
+            if (re.match(r"\s*[\d.]+ E ", l) or l.lstrip().startswith(("what():", "error:")))
+            and not (no_card and re.search(r"ggml_\w+_init:", l))]
+    return "\n".join(dict.fromkeys(errs[-most:]))
+
+
 def probe(model, ctx, gpu=None, extra=(), dev=None):
     """Ask llama.cpp what this model needs, without loading it (llama-fit-params --fit-print).
     gpu=None: processor only, in a unit with no device files, so the graphics card is never touched.
@@ -80,7 +89,7 @@ def probe(model, ctx, gpu=None, extra=(), dev=None):
         args += dargs
         prefix = name + " "                     # --fit-print lines start with the device's name
     started = time.monotonic()
-    r = fence.run(args, denv, props, timeout=PROBE_TIMEOUT)
+    r = fence.run(args, dict(denv, GGML_NO_BACKTRACE="1"), props, timeout=PROBE_TIMEOUT)  # no debugger on a crash
     # the device's line: model, context and compute in MiB (llama.cpp's common_fit_print)
     row = re.compile(re.escape(prefix) + r"\s*(\d+)\s+(\d+)\s+(\d+)(?:\s|$)")
     found = next((m for l in (r.stdout + "\n" + r.stderr).splitlines() if (m := row.match(l))), None)
@@ -93,7 +102,8 @@ def probe(model, ctx, gpu=None, extra=(), dev=None):
             why = f"failed (exit {r.returncode})"
         else:
             why = f"gave no estimate for {prefix.strip()} (its --fit-print output isn't what lodger reads)"
-        tail = (r.stderr.strip()[-2000:] + ("\n" + r.stdout.strip()[-500:] if not found else "")).strip()
+        tail = llama_errors(r.stderr, no_card=gpu is None) or (r.stderr.strip()[-2000:] + ("\n" + r.stdout.strip()[-500:] if not found
+                                                                         else "")).strip()
         raise SystemExit(f"llama-fit-params {why} for {os.path.basename(model.files[0])}" + (f":\n{tail}" if tail else "."))
     out = {k: int(v) * MiB for k, v in zip(PROBE_KEYS, found.groups())}
     tmp = f"{cf}.{os.getpid()}-{threading.get_ident()}.tmp"     # two plans may probe at once
