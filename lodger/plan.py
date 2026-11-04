@@ -32,9 +32,11 @@ SMALLEST_CTX = 256               # shorter than this isn't a usable context (and
 CTX_CAP = 131072
 CTX_SHARE = 0.25
 MMPROJ_SCRATCH = GiB             # a vision projector's working space for pictures, when its file doesn't say
-PICTURE_TOKENS = 4096            # the most words a picture becomes in llama.cpp's projectors that take any size
+PICTURE_TOKENS = 4096            # the most words a picture becomes in llama.cpp's projectors that take any size,
+PICTURE_TOKENS_BY_TYPE = {"youtuvl": 62500, "hunyuanvl": 16384, "deepseek4v": 384, "deepseek41v": 1024}  # or these
 CHECKPOINTS = 32                 # llama-server's --ctx-checkpoints: copies of the state a model can't roll back
 UBATCH = 512                     # llama.cpp's default --ubatch-size
+DRAFT_MAX = 3                    # llama.cpp's default --spec-draft-n-max
 # --load-mode values that keep the weights in the program's own memory instead of the page cache (older builds:
 # --no-mmap, --mlock): then Linux can't drop them again, so they must fit in RAM
 HELD = {"none", "mlock", "mmap+mlock", "dio"}
@@ -175,6 +177,7 @@ class Costs:
     straight pieces."""
 
     def __init__(self, model, lo, hi, extra=(), points=()):
+        self.lo, self.hi = lo, hi
         got = {c: probe(model, c, extra=extra) for c in sorted({lo, hi} | {p for p in points if lo < p < hi})}
         a, b = got[lo], got[hi]
         grow = b["context"] - a["context"]
@@ -188,10 +191,16 @@ class Costs:
             (c1, v1), (c2, v2) = self.points[-2:]
             self.per_tok = max(0.0, (v2 - v1) / (c2 - c1))
 
-    draft_tok = 0.0                 # what a multi-token prediction draft context adds per word (add_draft)
+    draft_tok = 0.0                 # what a multi-token prediction draft context adds per word (add_draft) ...
+    draft_compute = 0               # ... its scratch ...
+    snapshots = 0                   # ... and the recurrent state's copies for rolling back a draft
 
     def context(self, ctx):
-        return self._trunk(ctx) + int(self.draft_tok * ctx)
+        return self._trunk(ctx) + self.draft(ctx)
+
+    def draft(self, ctx):
+        """The part of context(ctx) that drafting adds."""
+        return int(self.draft_tok * ctx) + self.snapshots
 
     def _trunk(self, ctx):
         if not self.points:
@@ -205,21 +214,25 @@ class Costs:
         """The part of context(ctx) that doesn't grow with more words (recurrent state, full sliding windows)."""
         return max(0, self._trunk(ctx) - int(self.per_tok * ctx))
 
-    def add_draft(self, m):
+    def add_draft(self, m, n_max=DRAFT_MAX):
         """Multi-token prediction drafting (--spec-type draft-mtp): llama-server makes a second context as long as
         the main one, with a plain attention cache for the MTP layers only and its own scratch (llama.cpp's
-        common/speculative.cpp). llama-fit-params doesn't size it."""
+        common/speculative.cpp), and a model with recurrent layers keeps n_max more copies of their state to roll
+        a draft back (common.cpp: n_rs_seq = the draft length; llama-memory-recurrent.cpp). llama-fit-params
+        sizes none of it."""
         kinds = list(m.kinds.values())
         attn = kinds.count("attn") or sum(1 for k in kinds if k) or max(1, m.n_layer - len(m.mtp))
         self.draft_tok = len(m.mtp) * self.per_tok / attn
+        self.draft_compute = self.compute
         self.compute *= 2
+        self.snapshots = n_max * self.fixed(self.hi) if "recr" in kinds else 0
 
 
 def window_bend(m, extra):
     """The context length where a model's sliding windows stop growing (llama.cpp: window + ubatch, in steps
     of 256), or None."""
-    w = m.kv.get(f"{m.meta.get('arch')}.attention.sliding_window")
-    if type(w) is not int or w <= 0 or "--swa-full" in extra:
+    w = m.window
+    if not w or "--swa-full" in extra:
         return None
     ub = UBATCH
     args = list(extra)
@@ -235,8 +248,7 @@ def layer_ctx(m, costs, ctx):
     layers that keep it. Where the file doesn't say which layers those are, each layer that keeps anything gets
     the same (layers that keep nothing, e.g. multi-token prediction, none)."""
     L = m.n_layer
-    draft = int(costs.draft_tok * ctx)
-    total = costs.context(ctx) - draft
+    total = costs.context(ctx) - costs.draft(ctx)
     kinds = m.kinds or {}
     grows = [i for i in range(L) if kinds.get(i) == "attn"]
     keeps = [i for i in range(L) if kinds.get(i) in ("swa", "recr")]
@@ -252,8 +264,20 @@ def layer_ctx(m, costs, ctx):
             out[i] = tok / len(grows)
         for i in keeps:
             out[i] = (total - tok) / len(keeps)
-    for i in m.mtp if draft else ():
-        out[i] += draft / len(m.mtp)
+    for i, part in draft_ctx(m, costs, ctx).items():
+        out[i] += part
+    return out
+
+
+def draft_ctx(m, costs, ctx):
+    """Each layer's part of what drafting adds to the context (costs.draft): the draft cache with the MTP layers,
+    the state's copies with the recurrent layers."""
+    out = {}
+    for i in m.mtp if costs.draft_tok else ():
+        out[i] = out.get(i, 0) + costs.draft_tok * ctx / len(m.mtp)
+    recr = [i for i, k in (m.kinds or {}).items() if k == "recr"]
+    for i in recr if costs.snapshots else ():
+        out[i] = out.get(i, 0) + costs.snapshots / len(recr)
     return out
 
 
@@ -307,7 +331,7 @@ def own_costs(extra):
     memory, proj_card: projector on the card, held: weights held in RAM, repack: weights may be repacked,
     checkpoints: --ctx-checkpoints, mtp: multi-token prediction drafting, moe_cache: --moe-cache-mib in bytes}."""
     out = {"fit": [], "proj": 0, "proj_work": 0, "proj_card": True, "held": False, "repack": True,
-           "checkpoints": CHECKPOINTS, "mtp": False, "moe_cache": 0}
+           "checkpoints": CHECKPOINTS, "mtp": False, "draft_max": DRAFT_MAX, "moe_cache": 0, "no_host": False}
     proj, tokens, fa = None, None, True
     args = iter(extra)
     for a in args:
@@ -318,6 +342,8 @@ def own_costs(extra):
             tokens = int(next(args))
         elif a == "--spec-type":
             out["mtp"] = "draft-mtp" in str(next(args)).split(",")
+        elif a == "--spec-draft-n-max":
+            out["draft_max"] = max(0, int(next(args)))
         elif a == "--moe-cache-mib":
             out["moe_cache"] = max(0, int(next(args))) * MiB
         elif a in ("--mmproj-offload", "--no-mmproj-offload"):
@@ -335,6 +361,7 @@ def own_costs(extra):
         else:
             if a in ("--repack", "--no-repack"):
                 out["repack"] = a == "--repack"
+            out["no_host"] |= a == "--no-host"
             if a == "--flash-attn":
                 v = next(args)
                 fa = str(v).lower() not in ("off", "0", "false", "disabled")
@@ -364,9 +391,12 @@ def projector_work(path, tokens=None, flash_attn=True):
                                                       "attention.head_count", "image_size", "patch_size"))
     if not kv.get("clip.has_vision_encoder") or not all((width, ffn, heads, size, patch)) or kv.get("clip.has_audio_encoder"):
         return MMPROJ_SCRATCH
-    merge = num("spatial_merge_size") or 1
+    merge = num("spatial_merge_size") or num("projector.scale_factor") or 1
+    kind = kv.get("clip.projector_type")
     if tokens and tokens > 0:
         patches = tokens * merge * merge
+    elif kind in PICTURE_TOKENS_BY_TYPE:                # clip.cpp's own limit for these, whatever the file says
+        patches = PICTURE_TOKENS_BY_TYPE[kind] * merge * merge
     elif num("image_max_pixels"):
         patches = num("image_max_pixels") // (patch * patch)
     elif merge > 1:
@@ -451,7 +481,16 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
     bend = window_bend(m, extra)
     costs = Costs(m, ctxs[-1], ctxs[0], extra, [bend] if bend else ())
     if own_extra["mtp"]:
-        costs.add_draft(m)
+        costs.add_draft(m, own_extra["draft_max"])
+
+    def unseen(g):
+        """What llama-fit-params doesn't know about on the card with placement g: MTP drafting's layers, cache,
+        state copies and scratch (it isn't told --spec-type)."""
+        if not own_extra["mtp"]:
+            return 0
+        on = range(L - g["ngl_layers"], L)
+        weights = sum(m.mtp[i]["dense"] + (m.mtp[i]["experts"] if i >= g["n_cpu_moe"] else 0) for i in m.mtp if i in on)
+        return weights + int(sum(v for i, v in draft_ctx(m, costs, g["ctx"]).items() if i in on)) + costs.draft_compute
 
     def fair(budget):
         """Automatic context: the lengths that cost at most CTX_SHARE of `budget` (at least the shortest)."""
@@ -509,7 +548,7 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
             d = probe(m, gpu["ctx"], (gpu["ngl"], gpu["n_cpu_moe"]), extra, dev=card)
             llama = d["model"] + d["context"] + d["compute"]
             plan["llama_gpu_est"] = llama
-            beside = more + (moe_cache if gpu["n_cpu_moe"] else 0)
+            beside = more + (moe_cache if gpu["n_cpu_moe"] else 0) + unseen(gpu)
             if llama + beside <= gpu["gpu_est"]:
                 break                                   # our own estimate is the higher one: keep it
             short = with_margin(llama + beside) - gpu["gpu_bytes"]
@@ -559,23 +598,40 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
     if held:
         copied, cached = cpu_weights, 0
     else:
-        copied, copied_out = m.repacked(cpu_repacks() if own_extra["repack"] else {}, on_cpu_layers, experts_on_cpu, out_cpu)
+        # with a card, the weights left in RAM go to its host buffer first, which mmap swaps for the file's pages
+        # (llama-model.cpp make_cpu_buft_list, llama-model-loader.cpp): only a processor-only run, or one with
+        # --no-host, repacks them
+        repacks = cpu_repacks() if own_extra["repack"] and (gpu is None or own_extra["no_host"]) else {}
+        copied, copied_out = m.repacked(repacks, on_cpu_layers, experts_on_cpu, out_cpu)
         # a tied output layer reads token_embd's own pages (unless it is copied): counted once
         cached = cpu_weights - copied - (m.token_embd - copied_out if m.tied and out_cpu else 0)
     # llama-server's context checkpoints (one per answer, up to --ctx-checkpoints) copy what a model can't roll
     # back, its recurrent state or sliding windows, into RAM
-    n_ckpt = own_extra["checkpoints"] if any(k in ("swa", "recr") for k in m.kinds.values()) else 0
+    # (llama-server makes them for any model with a sliding window, whichever layers use it, and keeps one more
+    # for a draft when it can't roll a draft back otherwise)
+    keeps = m.window or any(k in ("swa", "recr") for k in m.kinds.values())
+    n_ckpt = own_extra["checkpoints"] + (1 if own_extra["mtp"] and m.window else 0) if keeps else 0
+
+    def ckpt(c):
+        """One checkpoint at context c: the recurrent state and the sliding windows. A window longer than the
+        context holds all of it, which the probes (all shorter than the window) can't tell from growth."""
+        f = costs.fixed(c)
+        if bend and bend > ctxs[0]:
+            kinds = list(m.kinds.values())
+            swa, attn = kinds.count("swa"), kinds.count("attn")
+            f += int(costs.per_tok * c * (swa / (swa + attn) if swa else 1))
+        return f
 
     def own_at(c):
         return (PROC_OVERHEAD + (proj_need if gpu is None or not proj_card else 0) + copied
-                + n_ckpt * costs.fixed(c))
+                + n_ckpt * ckpt(c))
 
     def less(c):
         """What a setting in models.toml would take off the model's own memory, in words."""
         ways = ([f"no-repack = true leaves out the {copied / GiB:.1f} GiB of repacked weights (the processor gets "
                  "slower)"] if copied and not held else [])
-        ways += ([f"a smaller ctx-checkpoints (now {n_ckpt}) saves {costs.fixed(c) / GiB:.2f} GiB per checkpoint"]
-                 if n_ckpt and costs.fixed(c) else [])
+        ways += ([f"a smaller ctx-checkpoints (now {n_ckpt}) saves {ckpt(c) / GiB:.2f} GiB per checkpoint"]
+                 if n_ckpt and ckpt(c) else [])
         return (" In models.toml, " + "; ".join(ways) + ".") if ways else ""
     if held:
         why.append(f"The weights kept in RAM ({cpu_weights / GiB:.1f} GiB) are held there (no-mmap or mlock), "
@@ -599,9 +655,9 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
         share = layer_ctx(m, costs, plan["ctx"])
         cpu_ctx_share = sum(share[i] for i in on_cpu_layers) if plan["ngl_layers"] < L else 0
         anon = int(cpu_ctx_share) + (costs.compute if plan["n_cpu_moe"] or plan["ngl_layers"] < L else 0) + own_at(plan["ctx"])
-    if n_ckpt and costs.fixed(plan["ctx"]):
+    if n_ckpt and ckpt(plan["ctx"]):
         why.append(f"Context checkpoints: llama-server keeps up to {n_ckpt} copies of the state this model can't roll "
-                   f"back ({costs.fixed(plan['ctx']) / MiB:.0f} MiB each) in RAM, counted as the model's own.")
+                   f"back ({ckpt(plan['ctx']) / MiB:.0f} MiB each) in RAM, counted as the model's own.")
     if auto:
         why.append(f"Context chosen automatically: {plan['ctx']} words (this model can take up to "
                    f"{m.meta.get('ctx_train') or '?'}; lodger aims for at most {CTX_CAP} and lets the context use "
@@ -609,7 +665,7 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
     plan["ram_anon_est"] = anon
     plan["ram_weights"] = cpu_weights
     plan["ram_copied"] = copied
-    plan["checkpoint_bytes"] = n_ckpt * costs.fixed(plan["ctx"])
+    plan["checkpoint_bytes"] = n_ckpt * ckpt(plan["ctx"])
     if gpu and plan["n_cpu_moe"] and not moe_cache:
         # what llama.cpp's expert cache (--moe-cache-mib) could use on the card here; not passed on (yet)
         room = int((vram_budget - gpu["gpu_bytes"]) / (1 + EST_MARGIN)) // MiB

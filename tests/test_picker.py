@@ -233,9 +233,14 @@ class DownloadTest(ServerBase):
         with open(self.dest, "rb") as f:
             self.assertEqual(f.read(), b"my own model")
         self.assertFalse([x for x in FakeHF.seen if "/resolve/" in x[0]])     # nothing fetched
+        # a note left from an earlier download, next to the user's own file: still not lodger's
+        with open(picker.marker(self.dest), "w") as f:
+            json.dump({"sha256": "0" * 64, "size": 123}, f)
+        with self.assertRaises(SystemExit):
+            picker.download(self.p, self.models)
         # one lodger did download (an older revision, say) is replaced
         with open(picker.marker(self.dest), "w") as f:
-            json.dump({"sha256": "0" * 64}, f)
+            json.dump({"sha256": "0" * 64, "size": len(b"my own model")}, f)
         self.assertEqual(picker.download(self.p, self.models), self.dest)
 
     def test_an_interrupted_download_continues_where_it_stopped(self):
@@ -366,6 +371,22 @@ class RegisterTest(Base):
             self.assertEqual(f.read(), b'# m\xc3\xafne\r\nfolders = ["/elsewhere", ' + json.dumps(self.models).encode()
                              + b']\r\n')
         self.assertFalse([n for n in os.listdir(self.dir) if "lodger-tmp" in n])
+
+    def test_register_into_a_folder_it_cant_write_says_so(self):
+        d = os.path.join(self.dir, "ro")
+        os.mkdir(d)
+        real = os.path.join(d, "models.toml")
+        with open(real, "w") as f:
+            f.write('folders = ["/elsewhere"]\n')
+        cfg = os.path.join(self.dir, "linked-ro.toml")
+        os.symlink(real, cfg)
+        os.chmod(d, 0o555)
+        self.addCleanup(os.chmod, d, 0o755)
+        if os.access(d, os.W_OK):
+            self.skipTest("running as root")
+        msg = picker.register(self.models, cfg)                 # after a download: a note, not a traceback
+        self.assertIn("NOTE: lodger couldn't write", msg)
+        self.assertIn(self.models, msg)
 
     def test_catalog_scans_the_download_folder_unless_folders_are_set(self):
         open(os.path.join(self.models, "tiny-1b.gguf"), "wb").close()

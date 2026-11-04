@@ -528,10 +528,15 @@ class PlacementTest(PlanBase):
             c = self.make(m, card=None, target_ctx=8192, extra=["--no-repack"])
             with machine("desktop-amd"):
                 d = self.make(m, vram_free=6 * GiB, target_ctx=8192)
+                e = self.make(m, vram_free=6 * GiB, target_ctx=8192, extra=["--no-host"])
         self.assertEqual(b["ram_copied"], 40 * 100 * MiB + 500 * MiB)
         self.assertEqual(b["ram_anon_est"] - a["ram_anon_est"], b["ram_copied"])
         self.assertEqual(c["ram_anon_est"], a["ram_anon_est"])
-        self.assertEqual(d["ram_copied"], (40 - d["ngl_layers"]) * 100 * MiB)     # only what stays on the processor
+        # with a card, the layers left in RAM go to its host buffer, which mmap swaps for the file's own pages
+        # (llama-model.cpp make_cpu_buft_list): nothing is repacked, unless --no-host leaves the host buffer out
+        self.assertLess(d["ngl_layers"], 40)
+        self.assertEqual(d["ram_copied"], 0)
+        self.assertEqual(e["ram_copied"], (40 - e["ngl_layers"]) * 100 * MiB)     # only what stays on the processor
         self.assertTrue(any("repack" in w for w in b["why"]), b["why"])
         with mock.patch("lodger.plan.cpu_repacks", return_value={2: 8}):
             tight = self.make(m, card=None, target_ctx=8192, ram_avail=a["ram_anon_est"] + 6 * GiB)
@@ -684,6 +689,91 @@ class GapTest(PlanBase):
         a = self.make(fake_model(), card=None, target_ctx=8192)
         b = self.make(fake_model(), card=None, target_ctx=8192, extra=["--mmproj", projector_file(d)])
         self.assertEqual(b["ram_anon_est"] - a["ram_anon_est"], os.path.getsize(projector_file(d)) + plan.projector_work(projector_file(d)))
+
+
+class LlamaCppDetailTest(PlanBase):
+    """Memory llama.cpp takes in ways its own estimate doesn't show (each checked in its source)."""
+
+    def test_any_sliding_window_makes_checkpoints(self):
+        # llama-server checkpoints any model with n_swa > 0, whichever layers slide (server-context.cpp)
+        m = fake_model(kinds=["attn"] * 40, kv={"fake.attention.sliding_window": 128})
+        with mock.patch("lodger.plan.cpu_repacks", return_value={}):
+            p = self.make(m, card=None, target_ctx=8192)
+        self.assertGreater(p["checkpoint_bytes"], 0)
+
+    def test_a_window_longer_than_the_context_is_copied_whole(self):
+        # the probes are all shorter than the window: growth they see is partly the windows', which a checkpoint
+        # copies too
+        m = fake_model(kinds=["swa", "swa", "swa", "attn"] * 10, kv={"fake.attention.sliding_window": 1 << 20})
+        with mock.patch("lodger.plan.cpu_repacks", return_value={}):
+            p = self.make(m, card=None, target_ctx=8192, extra=["--ctx-checkpoints", "1"])
+        self.assertEqual(p["checkpoint_bytes"], 100 * MiB + int(8192 * 64 * 1024 * 0.75))
+
+    def test_a_card_plan_doesnt_repack(self):
+        # an ordinary Q4_K MoE: experts in RAM are the file's pages with a card, so a 16 GB PC can run it
+        quant = [("experts", i, 12, 768, 300 * MiB) for i in range(40)]
+        m = fake_model(dense=60 * MiB, experts=300 * MiB, quant=quant)
+        mem = {"MemTotal": 16 * GiB, "MemAvailable": 10 * GiB}
+        with machine("desktop-amd"), mock.patch("lodger.plan.cpu_repacks", return_value={12: 8}):
+            b = self.make(m, vram_free=10 * GiB, target_ctx=8192, mem=mem)
+        self.assertIsNone(b["refuse"], b["refuse"])
+        self.assertEqual(b["ram_copied"], 0)
+
+    def test_mtp_on_a_hybrid_model_keeps_copies_of_its_state(self):
+        # common.cpp: n_rs_seq = the draft length (3) for draft-mtp; the recurrent cache gets 1 + n_rs_seq rows
+        def probe(model, ctx, gpu=None, extra=(), dev=None):
+            return {"model": 0, "context": 150 * MiB + ctx * 64 * 1024, "compute": 300 * MiB}
+        m = fake_model(kinds=["recr", "recr", "recr", "attn"] * 9 + ["recr", "recr", "recr", None])
+        m.mtp = {39: {"dense": 200 * MiB, "experts": 0}}
+        m.layers[39] = {"dense": 0, "experts": 0}
+        base = ["--ctx-checkpoints", "0"]
+        with mock.patch("lodger.plan.probe", side_effect=probe), mock.patch("lodger.plan.cpu_repacks", return_value={}):
+            a = self.make(m, card=None, target_ctx=8192, extra=base)
+            b = self.make(m, card=None, target_ctx=8192, extra=base + ["--spec-type", "draft-mtp"])
+            c = self.make(m, card=None, target_ctx=8192, extra=base + ["--spec-type", "draft-mtp", "--spec-draft-n-max", "6"])
+        draft = int(8192 * 64 * 1024 / 9)
+        self.assertEqual(b["ram_anon_est"] - a["ram_anon_est"], draft + 3 * 150 * MiB + 300 * MiB)
+        self.assertEqual(c["ram_anon_est"] - b["ram_anon_est"], 3 * 150 * MiB)
+
+    def test_mtp_on_a_sliding_window_model_keeps_one_more_checkpoint(self):
+        m = mtp_model(kv={"fake.attention.sliding_window": 128})
+        with mock.patch("lodger.plan.cpu_repacks", return_value={}):
+            a = self.make(m, card=None, target_ctx=8192, extra=["--ctx-checkpoints", "2"])
+            b = self.make(m, card=None, target_ctx=8192, extra=["--ctx-checkpoints", "2", "--spec-type", "draft-mtp"])
+        self.assertGreater(a["checkpoint_bytes"], 0)
+        self.assertEqual(b["checkpoint_bytes"] * 2, a["checkpoint_bytes"] * 3)
+
+    def test_llamas_card_estimate_doesnt_drop_what_it_isnt_told(self):
+        # llama-fit-params isn't told --spec-type: when its card estimate is higher than lodger's, the MTP layer,
+        # its cache and scratch still count on top
+        def probe(model, ctx, gpu=None, extra=(), dev=None):
+            if gpu is None:
+                return fake_probe(model, ctx)
+            return {"model": 4500 * MiB, "context": 100 * MiB + ctx * 64 * 1024, "compute": 900 * MiB}
+        with machine("desktop-amd"), mock.patch("lodger.plan.probe", side_effect=probe), \
+                mock.patch("lodger.plan.cpu_repacks", return_value={}):
+            a = self.make(mtp_model(), vram_free=15 * GiB, target_ctx=8192, device_check=True)
+            b = self.make(mtp_model(), vram_free=15 * GiB, target_ctx=8192, extra=["--spec-type", "draft-mtp"],
+                          device_check=True)
+        self.assertEqual((a["ngl"], b["ngl"]), (41, 41))
+        self.assertEqual(a["llama_gpu_est"], b["llama_gpu_est"])
+        self.assertEqual(b["gpu_est"] - a["gpu_est"], 200 * MiB + int(8192 * 64 * 1024 / 39) + 300 * MiB)
+
+    def test_projectors_with_their_own_picture_limit(self):
+        d = tempfile.mkdtemp(prefix="lodger-proj-")
+        self.addCleanup(subprocess.run, ["rm", "-rf", d])
+        per_patch = (3 * 1152 + 4304) * 4
+        kv = {"general.architecture": "clip", "clip.has_vision_encoder": True, "clip.projector_type": "youtuvl"}
+        kv.update({f"clip.vision.{k}": v for k, v in {"embedding_length": 1152, "feed_forward_length": 4304,
+                   "attention.head_count": 16, "image_size": 768, "patch_size": 16, "spatial_merge_size": 2}.items()})
+        p = write_gguf(os.path.join(d, "youtu.gguf"), kv, [("v.blk.0.attn_q.weight", 0, [4, 4], 64)])
+        self.assertEqual(plan.projector_work(p), int(1.5 * 62500 * 4 * per_patch))     # 8000 x 8000 pictures
+        kv["clip.projector_type"] = "deepseek4v"
+        del kv["clip.vision.spatial_merge_size"]
+        kv["clip.vision.projector.scale_factor"] = 2
+        p = write_gguf(os.path.join(d, "ds4.gguf"), kv, [("v.blk.0.attn_q.weight", 0, [4, 4], 64)])
+        self.assertEqual(plan.projector_work(p), 256 * MiB)                            # 384 words: small
+        self.assertEqual(plan.projector_work(p, tokens=4096), int(1.5 * 4096 * 4 * per_patch))
 
 
 class ProbeCacheTest(unittest.TestCase):
