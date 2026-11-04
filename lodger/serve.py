@@ -44,7 +44,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 from . import answers, catalog, config, engine, fence, gpu as gpus, ollama, plan as planner, reserve, sysmem
-from .launch import GAME_GUARD_FLAG, RUNS, Watchdog, card_fields, gpu_blockers, router_coming, unit_cgroup, unit_props
+from .launch import (GAME_GUARD_FLAG, RUNS, SETTLE_GROWTH, SETTLE_SECONDS, Watchdog, card_fields, gpu_blockers,
+                     router_coming, unit_cgroup, unit_props)
 from .neighbors import Neighbors
 
 MiB, GiB = sysmem.MiB, sysmem.GiB
@@ -189,7 +190,7 @@ class Engine:
                    "-t", str(p["threads"]), "--fit", "off", "-np", "1", "--host", HOST, "--port", str(self.port),
                    "--api-key-file", self.keyfile, "--no-webui", "-a", entry.name,
                    "--cache-ram", str(p.get("cache_ram_mib", 0))] + entry.args()
-            dargs, env = engine.device_args(p["ngl"], card, p["n_cpu_moe"])
+            dargs, env = engine.device_args(p["ngl"], card, p["n_cpu_moe"], p.get("moe_cache_mib", 0))
             cmd += dargs
             with open(os.path.join(out, "plan.json"), "w") as f:
                 json.dump({**p, "cmd": cmd, "env": env, "fence": fence.mode()[0]}, f, indent=1)
@@ -306,6 +307,7 @@ class Lodger:
         self.last_aside = 0.0
         self.quiet_since = time.monotonic()
         self.quiet_needed = QUIET_SECONDS     # doubles each time the model has to step aside soon after growing back
+        self.nb = self.nb_thread = None       # the monitor's watch on the card, and its thread (see card_settled)
         self.card_since = None
         self.events = []                      # (time, text) shown in /lodger/status
         self.force_off_card = False
@@ -588,7 +590,7 @@ class Lodger:
             if not self.why_off_card:
                 if self.a.allow_gpu:
                     self.pause_others()
-                self.why_off_card = gpu_blockers(self.a.allow_gpu, card)
+                self.why_off_card = gpu_blockers(self.a.allow_gpu, card, settled=self.card_settled(card))
         if card_only and self.why_off_card:
             self.last_fail = self.why_off_card
             return None
@@ -765,6 +767,25 @@ class Lodger:
         now = now or time.monotonic()
         return now - self.quiet_since >= self.quiet_needed and now - self.last_aside >= self.quiet_needed
 
+    def card_settled(self, card):
+        """Has the monitor's own watch just seen the card as calm as launch.settle() wants it after its wait? No
+        app busy on it or taking memory for SETTLE_SECONDS, looked at every 2 s or more often up to now, and the
+        memory in use not grown by SETTLE_GROWTH meanwhile. Then a start on the card skips that wait (4.5 s)."""
+        nb = self.nb
+        if nb is None or threading.current_thread() is not self.nb_thread or card is None or nb.pci != card.pci:
+            return False
+        now = time.monotonic()
+        if nb.update() or self.others_coming():
+            self.quiet_since = now
+            return False
+        used = [(t, w["used"]) for t, _, w in nb.hist if w and w["used"] is not None]
+        if now - self.quiet_since < SETTLE_SECONDS or not used or now - used[0][0] < SETTLE_SECONDS:
+            return False
+        times = [t for t, _ in used]
+        if max(b - a for a, b in zip(times, times[1:] + [now])) > 2.0:
+            return False                      # not looked at for a while (the monitor was starting or stopping)
+        return used[-1][1] - min(u for _, u in used) < SETTLE_GROWTH
+
     def drop(self, e):
         with self.cv:
             if self.engine is e:
@@ -812,7 +833,8 @@ class Lodger:
     def monitor(self):
         """Switches models, steps aside / grows back, sleeps. Runs for the life of `lodger serve`; an error in
         one round is written down and the next round goes on (a dead monitor would strand every request)."""
-        nb = Neighbors(ours=fence.our_pids)
+        nb = self.nb = Neighbors(ours=fence.our_pids)
+        self.nb_thread = threading.current_thread()
         last_error = None
         while not self.closing:
             time.sleep(1)

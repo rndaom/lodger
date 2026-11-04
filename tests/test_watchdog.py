@@ -397,6 +397,7 @@ class CardTroubleTest(unittest.TestCase):
         with mock.patch.object(launch, "settle", side_effect=AssertionError("not needed")):
             self.assertIn("reset or hung", launch.gpu_blockers(True, FakeCard(10 << 30, crashed=True)))
             self.assertIn("too hot", launch.gpu_blockers(True, FakeCard(10 << 30, hot="edge 101 C (critical 100 C)")))
+            self.assertIsNone(launch.gpu_blockers(True, FakeCard(10 << 30), settled=True))   # serve watched it already
 
 
 if __name__ == "__main__":

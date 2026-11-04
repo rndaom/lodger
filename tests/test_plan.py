@@ -708,7 +708,7 @@ class GapTest(PlanBase):
     def test_expert_cache_is_counted_on_the_card_when_experts_stay_in_ram(self):
         m = fake_model(dense=60 * MiB, experts=400 * MiB)
         with machine("desktop-amd"):
-            a = self.make(m, vram_free=12 * GiB, target_ctx=8192)
+            a = self.make(m, vram_free=12 * GiB, target_ctx=8192, extra=["--moe-cache-mib", "0"])
             b = self.make(m, vram_free=12 * GiB, target_ctx=8192, extra=["--moe-cache-mib", "1024"])
             whole = self.make(fake_model(dense=60 * MiB, experts=10 * MiB), vram_free=12 * GiB, target_ctx=8192)
             whole_c = self.make(fake_model(dense=60 * MiB, experts=10 * MiB), vram_free=12 * GiB, target_ctx=8192,
@@ -722,6 +722,43 @@ class GapTest(PlanBase):
         self.assertGreaterEqual(a["moe_cache_room_mib"], 0)
         self.assertLess(a["moe_cache_room_mib"] * MiB, 400 * MiB * 1.2)
         self.assertNotIn("moe_cache_room_mib", b)
+        self.assertNotIn("moe_cache_mib", a)                                 # 0 in models.toml: no cache of lodger's
+        self.assertNotIn("moe_cache_mib", b)                                 # set in models.toml: passed on as it is
+
+    def test_lodger_makes_an_expert_cache_when_experts_stay_in_ram(self):
+        m = fake_model(dense=60 * MiB, experts=400 * MiB)
+        with machine("desktop-amd"):
+            off = self.make(m, vram_free=12 * GiB, target_ctx=8192, extra=["--moe-cache-mib", "0"])
+            auto = self.make(m, vram_free=12 * GiB, target_ctx=8192)
+            small = self.make(m, vram_free=8 * GiB, target_ctx=8192)
+            small_off = self.make(m, vram_free=8 * GiB, target_ctx=8192, extra=["--moe-cache-mib", "0"])
+            whole = self.make(fake_model(dense=60 * MiB, experts=10 * MiB), vram_free=12 * GiB, target_ctx=8192)
+            cpu = self.make(m, vram_free=12 * GiB, target_ctx=8192, cpu_only=True)
+        # in place of some experts on the card, never at the cost of context or whole layers
+        self.assertEqual(auto["moe_cache_mib"], plan.AUTO_MOE_CACHE // MiB)
+        self.assertEqual((auto["ctx"], auto["ngl"]), (off["ctx"], off["ngl"]))
+        self.assertGreater(auto["n_cpu_moe"], off["n_cpu_moe"])
+        self.assertLessEqual(auto["gpu_bytes"], auto["vram_budget"])
+        self.assertTrue(any("chosen by lodger" in w for w in auto["why"]), auto["why"])
+        # a smaller card: half the experts' room there (2 of 40 layers' 400 MiB)
+        self.assertEqual(small_off["n_cpu_moe"], 38)
+        self.assertEqual(small["moe_cache_mib"], 400)
+        for p in (whole, cpu):                                              # nothing in RAM, or no card
+            self.assertNotIn("moe_cache_mib", p)
+            self.assertIsNone(p["refuse"])
+        self.assertEqual(plan.auto_moe_cache(m, {"n_cpu_moe": 40}), 0)     # no experts on the card: no room
+        self.assertEqual(plan.auto_moe_cache(m, {"n_cpu_moe": 39}), 200 * MiB)
+        many = fake_model(dense=60 * MiB, experts=400 * MiB)
+        many.meta["expert_used"] = 100                                     # half a layer is less than llama.cpp takes
+        self.assertEqual(plan.auto_moe_cache(many, {"n_cpu_moe": 39}), 0)
+
+    def test_the_cache_lodger_chose_goes_on_the_command_line(self):
+        dev = mock.Mock()
+        with mock.patch.object(engine, "for_device", return_value={"name": "ROCm0", "env": {}}):
+            self.assertEqual(engine.device_args(41, dev, 30, 2048)[0],
+                             ["--device", "ROCm0", "-ngl", "41", "-ncmoe", "30", "--moe-cache-mib", "2048"])
+            self.assertEqual(engine.device_args(41, dev, 0, 2048)[0], ["--device", "ROCm0", "-ngl", "41"])
+        self.assertEqual(engine.device_args(0, None, 0, 2048)[0], ["--device", "none", "-ngl", "0"])
 
     def test_expert_cache_that_cant_work_is_refused(self):
         moe = fake_model(dense=60 * MiB, experts=400 * MiB)

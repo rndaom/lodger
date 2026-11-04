@@ -73,6 +73,12 @@ All notable changes to lodger are written here. The format follows
   where it comes from, and `lodger models rm NAME` moves it to the Trash.
 - `lodger serve` serves the models `lodger models get` downloaded when `models.toml` lists no `folders` (or there
   is none); when it lists its own, `lodger models get` adds the download folder to them.
+- An expert cache on the card for mixture-of-experts models whose experts don't all fit there (llama.cpp's
+  `--moe-cache-mib`): up to 2 GiB, half the experts' room on the card at most, and only where it costs no context
+  and no whole layers. The experts used most stay on the card: Qwen3.6-35B-A3B on an RX 7800 XT writes 53-60 words/s
+  with it instead of 41-45 (reading a long prompt about 12% slower). `moe-cache-mib = 0` in models.toml turns it off.
+- `lodger serve` starts a model on the card about 4.5 s sooner: its monitor watches the card all the time, so when it
+  has just seen the card calm for that long it skips the separate check before the start.
 
 ### Fixed
 - `lodger serve` planned the card for one context length, so it couldn't tell what grows with the context

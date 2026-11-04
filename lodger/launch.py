@@ -58,11 +58,15 @@ def router_coming():
     return None
 
 
+SETTLE_SECONDS = neighbors.BUSY_SECONDS + 1.5    # long enough to see an app busy for BUSY_SECONDS in a row
+SETTLE_GROWTH = 256 * MiB                         # memory in use growing more than this: an app is still loading
+
+
 def settle(card, seconds=None, limit=30.0):
     """Before taking memory on the card: is another app busy on it, or still loading (free memory
-    falling)? Returns a reason the card is taken, or None once it has been calm for `seconds` (default: long
-    enough to see an app that is busy for BUSY_SECONDS in a row, measured over 1-second windows)."""
-    seconds = max(seconds or 0, neighbors.BUSY_SECONDS + 1.5)
+    falling)? Returns a reason the card is taken, or None once it has been calm for `seconds` (default
+    SETTLE_SECONDS, measured over 1-second windows)."""
+    seconds = max(seconds or 0, SETTLE_SECONDS)
     nb = Neighbors(card, ours=fence.our_pids)
     t0 = time.monotonic()
     while time.monotonic() - t0 < limit:
@@ -70,7 +74,7 @@ def settle(card, seconds=None, limit=30.0):
         busy = nb.watch(seconds)
         if busy:
             return busy
-        if start - sysmem.vram_free(card) < 256 * MiB:
+        if start - sysmem.vram_free(card) < SETTLE_GROWTH:
             return None
         print("(memory on the graphics card is still changing: waiting for it to settle)", flush=True)
     return "memory on the graphics card kept changing for 30 s (another app is loading)"
@@ -88,11 +92,12 @@ def card_trouble(card):
     return f"the graphics card is too hot: {hot}" if hot else None
 
 
-def gpu_blockers(allowed, card):
-    """Reasons the graphics card must not be used right now (None = fine)."""
+def gpu_blockers(allowed, card, settled=False):
+    """Reasons the graphics card must not be used right now (None = fine). settled: the caller has just watched
+    the card as long as settle() would (lodger serve's monitor does all the time), so its wait is skipped."""
     if not allowed:
         return "the graphics card is only used when you allow it (pass --allow-gpu)"
-    return card_trouble(card) or router_coming() or settle(card)
+    return card_trouble(card) or router_coming() or (None if settled else settle(card))
 
 
 def fmt_cmd(cmd, env):
@@ -104,7 +109,7 @@ def llama_cmd(p, a, card=None):
     cmd = [engine.tool("llama-cli"), "-m", p["model"], "-c", str(p["ctx"]), "-t", str(p["threads"]),
            "--fit", "off"]
     # only the chosen card is visible to llama.cpp, so it's always device 0 (see engine.py)
-    dargs, env = engine.device_args(p["ngl"], card or sysmem.dgpu(), p["n_cpu_moe"])
+    dargs, env = engine.device_args(p["ngl"], card or sysmem.dgpu(), p["n_cpu_moe"], p.get("moe_cache_mib", 0))
     cmd += dargs
     if not a.think:
         cmd += ["--reasoning", "off"]

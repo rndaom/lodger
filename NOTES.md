@@ -198,11 +198,6 @@ this PC loads models onto the card and lodger uses it freely.
 - Shrink the RAM fence while another app is busy (with the model on the processor next to Deadlock,
   Linux compressed ~2 GB of other apps' idle memory).
 - Lower graphics-card priority for the model's work, so other apps' frames come first.
-- Keep the user's most-used experts on the card: b11936 has `--moe-cache-mib N` ("GPU cache for the MoE
-  experts kept in the CPU"). Sized in the plan since 2026-11-03 (`moe_cache_room_mib`); card-tested with
-  moe-cache-mib in models.toml (planned 11% above measured); serve doesn't pass it on its own yet.
-- First answer: `launch.settle()` costs >= 4.5 s before every card start, though serve already watches the card
-  all the time (`quiet_since`); serve could skip settle when its own watch has seen that long a quiet card.
 - Two-drive striping for any model too big for RAM (from ds41-local).
 - Auto-setup: a one-time benchmark that writes the PC's profile.
 
@@ -513,3 +508,11 @@ on a PC with two cards of the same vendor:device id; the cgroup/none fences on o
     Responses: the thinking goes on as thinking (Messages and Responses sent an empty text part before).
   - Bonsai 27B (PQ2_0) aborted llama-fit-params at every start and plan (a desktop crash notice each time):
     unreadable files are now remembered per file and build.
+  - 2026-11-04, expert cache (`--moe-cache-mib`) on the card, Qwen3.6-35B-A3B IQ4_XS, 131072 ctx, 41 layers,
+    600 words written / a 10,900-word prompt read: no cache 41-45 words/s, read 1021/s; 512 MiB 50; 1024 MiB 49-55;
+    2048 MiB 53-60, read 899/s; 4096 MiB 57-65, read 816/s; 8192 MiB pushed layers off the card (23 of 41, 65536
+    ctx): 23 words/s. Card memory about the same at every size (the cache takes the room of experts moved to RAM).
+    Now lodger makes one itself (`plan.AUTO_MOE_CACHE`: up to 2 GiB, half the experts' room on the card, never at
+    the cost of context or layers); live through serve: 2048 MiB chosen, 58.7 words/s.
+  - Same day: serve skips `launch.settle()` (>= 4.5 s) when its monitor has just watched the card calm that long
+    (`Lodger.card_settled`); live: the engine started in the second the waking request came.

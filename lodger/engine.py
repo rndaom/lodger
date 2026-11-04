@@ -251,13 +251,15 @@ def cpu_env(have=None):
     return env
 
 
-def device_args(plan_ngl, dev, n_cpu_moe=0):
-    """llama.cpp options and environment for a plan: on the card (`dev`) or processor only."""
+def device_args(plan_ngl, dev, n_cpu_moe=0, moe_cache_mib=0):
+    """llama.cpp options and environment for a plan: on the card (`dev`) or processor only. moe_cache_mib: the
+    expert cache lodger chose itself (one set in models.toml is among the model's own options)."""
     if plan_ngl and dev is not None:
         t = for_device(dev)
         if "why" in t:
             raise SystemExit(f"can't put the model on the graphics card: {t['why']}")
-        return ["--device", t["name"], "-ngl", str(plan_ngl)] + (["-ncmoe", str(n_cpu_moe)] if n_cpu_moe else []), t["env"]
+        return (["--device", t["name"], "-ngl", str(plan_ngl)] + (["-ncmoe", str(n_cpu_moe)] if n_cpu_moe else [])
+                + (["--moe-cache-mib", str(moe_cache_mib)] if n_cpu_moe and moe_cache_mib else [])), t["env"]
     return ["--device", "none", "-ngl", "0"], cpu_env()
 
 

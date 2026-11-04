@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from lodger import serve
+from lodger.sysmem import GiB, MiB
 from tests.test_serve import FakeEng, lodger
 
 
@@ -424,6 +425,57 @@ class GrowBackTest(MonitorCase):
         self.assertIs(l.engine, old)
         self.assertFalse(old.stopped)
         self.assertEqual(l.why_off_card, "stepped aside: an app needs the graphics card")
+
+
+class SettleTest(MonitorCase):
+    class Watch:
+        """The monitor's Neighbors: samples (age in seconds, card memory in use), newest last."""
+        pci = "0000:03:00.0"
+
+        def __init__(self, samples, reason=None):
+            now = time.monotonic()
+            self.hist = [(now - age, {}, {"used": used}) for age, used in samples]
+            self.reason = reason
+
+        def update(self):
+            return self.reason
+
+    def settled(self, samples, quiet_for=60, reason=None):
+        l = self.l
+        l.nb, l.nb_thread = self.Watch(samples, reason), threading.current_thread()
+        l.quiet_since = time.monotonic() - quiet_for
+        return l.card_settled(SimpleNamespace(pci="0000:03:00.0"))
+
+    def test_a_card_watched_calm_long_enough_skips_the_wait(self):
+        self.assertTrue(self.settled([(a, 900 * MiB) for a in (5, 4, 3, 2, 1, 0)]))
+
+    def test_too_short_a_watch_waits(self):
+        self.assertFalse(self.settled([(a, 900 * MiB) for a in (2, 1, 0)]))
+        self.assertFalse(self.settled([(a, 900 * MiB) for a in (5, 4, 3, 2, 1, 0)], quiet_for=2))
+
+    def test_a_gap_in_the_watch_waits(self):
+        self.assertFalse(self.settled([(a, 900 * MiB) for a in (6, 5, 1, 0)]))   # the monitor was busy starting
+
+    def test_memory_still_growing_waits(self):
+        self.assertFalse(self.settled([(a, (900 + 60 * (5 - a)) * MiB) for a in (5, 4, 3, 2, 1, 0)]))
+        self.assertTrue(self.settled([(a, (900 - 300 * (5 - a)) * MiB + 2 * GiB) for a in (5, 4, 3, 2, 1, 0)]))
+
+    def test_an_app_seen_now_waits_and_restarts_the_quiet_time(self):
+        before = time.monotonic()
+        self.assertFalse(self.settled([(a, 900 * MiB) for a in (5, 4, 3, 2, 1, 0)], reason="game is keeping it busy"))
+        self.assertGreaterEqual(self.l.quiet_since, before)
+
+    def test_only_the_monitors_own_thread_or_card_counts(self):
+        calm = [(a, 900 * MiB) for a in (5, 4, 3, 2, 1, 0)]
+        l = self.l
+        self.assertFalse(l.card_settled(SimpleNamespace(pci="0000:03:00.0")))       # no monitor yet
+        self.settled(calm)
+        self.assertFalse(l.card_settled(SimpleNamespace(pci="0000:0a:00.0")))
+        got = []
+        t = threading.Thread(target=lambda: got.append(l.card_settled(SimpleNamespace(pci="0000:03:00.0"))))
+        t.start()
+        t.join()
+        self.assertEqual(got, [False])
 
 
 class PowerTest(MonitorCase):

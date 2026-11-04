@@ -37,6 +37,11 @@ PICTURE_TOKENS_BY_TYPE = {"youtuvl": 62500, "hunyuanvl": 16384, "deepseek4v": 38
 CHECKPOINTS = 32                 # llama-server's --ctx-checkpoints: copies of the state a model can't roll back
 UBATCH = 512                     # llama.cpp's default --ubatch-size
 DRAFT_MAX = 3                    # llama.cpp's default --spec-draft-n-max
+# llama.cpp's expert cache (--moe-cache-mib), made by lodger when experts stay in RAM and none is set: at most this, and
+# at most half the experts' room on the card. Qwen3.6-35B-A3B on the RX 7800 XT (2026-11-04): words written per second
+# 41-45 without, 50 / 49-55 / 53-60 / 57-65 with 512 / 1024 / 2048 / 4096 MiB in place of experts kept on the card;
+# reading a long prompt 1021 / 899 / 816 words/s with none / 2048 / 4096 MiB
+AUTO_MOE_CACHE = 2 * GiB
 # --load-mode values that keep the weights in the program's own memory instead of the page cache (older builds:
 # --no-mmap, --mlock): then Linux can't drop them again, so they must fit in RAM
 HELD = {"none", "mlock", "mmap+mlock", "dio"}
@@ -364,9 +369,11 @@ def own_costs(extra):
     """llama-server options that change memory but that llama-fit-params can't size (see catalog.py) are
     counted here. Returns {fit: options for llama-fit-params, proj: vision projector bytes, proj_work: its working
     memory, proj_card: projector on the card, held: weights held in RAM, repack: weights may be repacked,
-    checkpoints: --ctx-checkpoints, mtp: multi-token prediction drafting, moe_cache: --moe-cache-mib in bytes}."""
+    checkpoints: --ctx-checkpoints, mtp: multi-token prediction drafting, moe_cache: --moe-cache-mib in bytes,
+    moe_cache_set: moe-cache-mib was given (0 too: then lodger makes no expert cache of its own)}."""
     out = {"fit": [], "proj": 0, "proj_work": 0, "proj_card": True, "held": False, "repack": True,
-           "checkpoints": CHECKPOINTS, "mtp": False, "draft_max": DRAFT_MAX, "moe_cache": 0, "no_host": False}
+           "checkpoints": CHECKPOINTS, "mtp": False, "draft_max": DRAFT_MAX, "moe_cache": 0, "moe_cache_set": False,
+           "no_host": False}
     proj, tokens, fa = None, None, True
     args = iter(extra)
     for a in args:
@@ -381,6 +388,7 @@ def own_costs(extra):
             out["draft_max"] = max(0, int(next(args)))
         elif a == "--moe-cache-mib":
             out["moe_cache"] = max(0, int(next(args))) * MiB
+            out["moe_cache_set"] = True
         elif a in ("--mmproj-offload", "--no-mmproj-offload"):
             out["proj_card"] = a == "--mmproj-offload"
         elif a in ("--no-mmap", "--mlock"):
@@ -577,6 +585,14 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
         more = overhead + (proj_need if proj_card else 0)      # on the card besides llama.cpp's own estimate
         budget, w = vram_budget, []
         gpu = place_on_gpu(m, costs, fair(budget), budget, w, more, moe_cache)
+        if gpu and gpu["n_cpu_moe"] and not own_extra["moe_cache_set"]:
+            size = auto_moe_cache(m, gpu)
+            w2 = []
+            cached = place_on_gpu(m, costs, fair(budget), budget, w2, more, size) if size else None
+            # only where it costs neither context nor whole layers: then it beats keeping those experts on the card
+            if cached and cached["n_cpu_moe"] and cached["ctx"] == gpu["ctx"] and cached["ngl"] == gpu["ngl"]:
+                gpu, w, moe_cache = cached, w2, size
+                plan["moe_cache_mib"] = size // MiB
         for _ in range(3):
             if not (gpu and device_check):
                 break
@@ -599,7 +615,10 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
                 gpu = None
         why.extend(w)
         if gpu and moe_cache and gpu["n_cpu_moe"]:
-            why.append(f"Expert cache (moe-cache-mib): {moe_cache // MiB} MiB on the card for experts kept in RAM, counted.")
+            why.append(f"Expert cache (moe-cache-mib): {moe_cache // MiB} MiB on the card for experts kept in RAM, counted"
+                       + (" (chosen by lodger: the experts used most stay on the card, which writes faster than keeping "
+                          "fixed layers' experts there; moe-cache-mib = 0 in models.toml turns it off)."
+                          if "moe_cache_mib" in plan else "."))
         if gpu:
             why.append(f"Card estimate: " + (f"llama.cpp says {plan['llama_gpu_est'] / GiB:.1f} GiB" if "llama_gpu_est" in plan
                        else "our own (llama.cpp asked only for real runs)")
@@ -608,7 +627,8 @@ def make(model_path, target_ctx=None, min_ctx=MIN_CTX, cpu_only=False, leave_gpu
 
     if gpu is None:
         plan.update(ngl=0, ngl_layers=0, n_cpu_moe=0, ctx=None, output_on_gpu=False, gpu_bytes=0, gpu_est=0)
-        if moe_cache:
+        plan.pop("moe_cache_mib", None)
+        if own_extra["moe_cache"]:
             plan["refuse"] = ("Its settings ask for an expert cache on the graphics card (moe-cache-mib), but the card "
                               "isn't used for this model; llama.cpp would stop ('MoE cache requires a GPU backend').")
             return plan
@@ -784,6 +804,14 @@ def place_on_gpu(m, costs, ctxs, budget, why, overhead, moe_cache=0):
             return gpu_plan(L, n, L if m.is_moe else 0, c, int(need), True)
     why.append(f"Nothing useful fits on the graphics card ({budget / GiB:.1f} GiB usable after margins).")
     return None
+
+
+def auto_moe_cache(m, gpu):
+    """The expert cache lodger makes for a placement that keeps experts in RAM (0: none): AUTO_MOE_CACHE, or half
+    the experts' room on the card if that is less, whole MiB, and never less than llama.cpp takes."""
+    on_card = sum(m.layers.get(i, {"experts": 0})["experts"] for i in range(gpu["n_cpu_moe"], m.n_layer))
+    size = min(AUTO_MOE_CACHE, on_card // 2) // MiB * MiB
+    return size if size and size >= min_moe_cache(m) else 0
 
 
 def min_moe_cache(m):
