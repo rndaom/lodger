@@ -233,14 +233,7 @@ def report():
             if ok is False:
                 problems.append(f"NVIDIA driver too old for this llama.cpp's CUDA {e['cuda']} build")
 
-    from . import model
-    try:
-        model.gguf_reader()
-        print(f"\nModel files: read with {model.GGUF_FROM}")
-    except SystemExit as ex:
-        print(f"\nModel files: can't read them: {ex}")
-        problems.append("no gguf package")
-
+    print()
     kind, why = fence.mode()
     print(f"\nFence:    {kind}: {why}")
     if kind == "systemd":

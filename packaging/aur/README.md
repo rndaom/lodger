@@ -10,7 +10,7 @@ systemctl --user enable --now lodger
 
 (`lodger service install` does the same: it sees the packaged unit and only enables it.)
 
-`python-gguf` comes from the AUR too. A plain `lodger` package (from release tarballs) follows the first tagged
+It needs only Python: lodger reads model files itself. A plain `lodger` package (from release tarballs) follows the first tagged
 release.
 
 ## Publishing (maintainer)

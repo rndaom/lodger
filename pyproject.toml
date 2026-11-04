@@ -11,7 +11,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Random" }]
 requires-python = ">=3.11"
-dependencies = ["gguf"]
+dependencies = []
 keywords = ["llm", "llama.cpp", "gpu", "vram", "local-ai", "linux"]
 classifiers = [
     "Development Status :: 3 - Alpha",

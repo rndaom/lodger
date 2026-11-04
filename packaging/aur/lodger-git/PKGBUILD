@@ -7,7 +7,7 @@ pkgdesc="Local AI that lives on your PC as a guest: it steps aside when your app
 arch=(any)
 url="https://github.com/rndaom/lodger"
 license=(MIT)
-depends=(python python-gguf)
+depends=(python)
 makedepends=(git python-build python-installer python-setuptools python-wheel)
 optdepends=(
   'llama.cpp: the engine (or `lodger setup` downloads a release build into ~/.local/share/lodger)'

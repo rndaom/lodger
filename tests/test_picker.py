@@ -2,7 +2,6 @@
 import contextlib
 import hashlib
 import http.server
-import importlib.util
 import io
 import json
 import mmap
@@ -19,7 +18,6 @@ from unittest import mock
 from lodger import catalog, cli, picker
 
 MiB, GiB = 1 << 20, 1 << 30
-HAVE_GGUF = importlib.util.find_spec("gguf") is not None
 
 
 def _s(t):
@@ -191,7 +189,6 @@ class HeaderTest(ServerBase):
         with self.assertRaises(ValueError):
             self.stub_of(b"<html>not found</html>" * 10)
 
-    @unittest.skipUnless(HAVE_GGUF, "needs the gguf package")
     def test_the_model_reader_reads_a_stub_like_the_real_file(self):
         from lodger.model import Model
         head, end, data = gguf_bytes(layers=3)

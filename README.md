@@ -100,8 +100,7 @@ uv tool install git+https://github.com/rndaom/lodger
 ```
 
 On Arch Linux (and Omarchy, Manjaro, EndeavourOS): an AUR package, [`lodger-git`](packaging/aur/lodger-git/PKGBUILD),
-is ready and checked in CI, but not on the AUR yet. Until it is, `makepkg -si` in that folder builds and installs it
-(install `python-gguf` from the AUR first).
+is ready and checked in CI, but not on the AUR yet. Until it is, `makepkg -si` in that folder builds and installs it.
 
 lodger serves every model it finds in the folders listed in `~/.config/lodger/models.toml`, or, without that
 file, the models `lodger models get` downloaded. Already have models? Copy

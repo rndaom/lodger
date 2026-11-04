@@ -5,8 +5,7 @@ from other hardware are as valuable as code. Please read the [Code of Conduct](C
 
 ## Dev setup
 
-lodger needs Python 3.11 or newer and has one dependency (`gguf`, to read model files). Everything else is the
-standard library.
+lodger needs Python 3.11 or newer and nothing else: only the standard library (it reads model files itself).
 
 ```bash
 git clone https://github.com/rndaom/lodger
