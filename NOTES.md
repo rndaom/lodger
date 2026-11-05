@@ -516,3 +516,14 @@ on a PC with two cards of the same vendor:device id; the cgroup/none fences on o
     the cost of context or layers); live through serve: 2048 MiB chosen, 58.7 words/s.
   - Same day: serve skips `launch.settle()` (>= 4.5 s) when its monitor has just watched the card calm that long
     (`Lodger.card_settled`); live: the engine started in the second the waking request came.
+  - 2026-11-05, does a model on the card cost a game frames (RX 7800 XT, ROCm, cwsr off)? Game stand-in: headless
+    vkmark effect2d at 16384x8192 (~300 FPS uncapped, 2 GiB), measured in 0.5 s windows beside a scratch serve with
+    `LODGER_BUSY_FRAC=100` so it stayed. Uncapped game: it kept 94-99% of its frames (worst window -8%, while a
+    prompt was read), and the model nearly stopped: 35B 1 word/s writing (54 alone), dense 9B 4 (72 alone).
+    Game drawing half the time (SIGSTOP/SIGCONT, a frame cap): no loss at all (the model kept the clocks up, so the
+    game drew more), and the model kept 30-60% of its speed. Freezing the engine's cgroup to pace it (50% / 25% of
+    each 100 ms) gave the game nothing measurable and cost the model most of what it had left. So graphics already
+    comes first on this card: priority, CU masks and pacing were dropped (the CU mask also goes through the MES
+    path that hung before). What a busy game costs is the model's speed: on the processor it writes far faster than
+    on a card a game is using, which is why stepping aside while a game is busy stays right. Not measured: single
+    frame spikes shorter than a window, NVIDIA and Intel cards.
